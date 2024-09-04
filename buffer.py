@@ -19,7 +19,7 @@ class ActivationBuffer:
     def __init__(self, 
                  data, # generator which yields text data
                  model : LanguageModel, # LanguageModel from which to extract activations
-                 submodule, # submodule of the model from which to extract activations
+                 submodule_list, # list of submodule of the model from which to concatenate activations
                  d_submodule=None, # submodule dimension; if None, try to detect automatically
                  io='out', # can be 'in' or 'out'; whether to extract input or output activations
                  n_ctxs=3e4, # approximate number of contexts to store in the buffer
@@ -35,25 +35,26 @@ class ActivationBuffer:
         if d_submodule is None:
             try:
                 if io == 'in':
-                    d_submodule = submodule.in_features
+                    d_submodule = submodule_list[0].in_features
                 else:
-                    d_submodule = submodule.out_features
+                    d_submodule = submodule_list[0].out_features
             except:
                 raise ValueError("d_submodule cannot be inferred and must be specified directly")
-        self.activations = t.empty(0, d_submodule, device=device)
-        self.read = t.zeros(0).bool()
-
         self.data = data
         self.model = model
-        self.submodule = submodule
+        self.submodule_list = submodule_list
         self.d_submodule = d_submodule
+        self.concat_activation_dim = d_submodule * len(submodule_list)
         self.io = io
         self.n_ctxs = n_ctxs
         self.ctx_len = ctx_len
-        self.activation_buffer_size = n_ctxs * ctx_len
+        self.activation_buffer_size = int(n_ctxs * ctx_len)
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device
+
+        self.activations = t.empty(0, self.concat_activation_dim, device=device)
+        self.read = t.zeros(0).bool()
     
     def __iter__(self):
         return self
@@ -100,12 +101,13 @@ class ActivationBuffer:
         )
 
     def refresh(self):
+        print("refresh")
         gc.collect()
         t.cuda.empty_cache()
         self.activations = self.activations[~self.read]
 
         current_idx = len(self.activations)
-        new_activations = t.empty(self.activation_buffer_size, self.d_submodule, device=self.device)
+        new_activations = t.empty(self.activation_buffer_size, self.concat_activation_dim, device=self.device)
 
         new_activations[: len(self.activations)] = self.activations
         self.activations = new_activations
@@ -119,17 +121,35 @@ class ActivationBuffer:
                     self.text_batch(),
                     **tracer_kwargs,
                     invoker_args={"truncation": True, "max_length": self.ctx_len},
-                ):
-                    if self.io == "in":
-                        hidden_states = self.submodule.input[0].save()
-                    else:
-                        hidden_states = self.submodule.output.save()
-                    input = self.model.input.save()
-            attn_mask = input.value[1]["attention_mask"]
-            hidden_states = hidden_states.value
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
-            hidden_states = hidden_states[attn_mask != 0]
+                ):  
+                    hidden_states_per_submodule_list = []
+                    # for submodule in self.submodule_list:
+                    #     if self.io == "in":
+                    #         #hidden_states_per_submodule_list.append(submodule.input[0].save())
+                    #         blah = 0#submodule.input.save()
+                    #     else:
+                    #         #hidden_states_per_submodule_list.append(submodule.output.save())
+                    #         blah = 0#submodule.output.save()
+                    input = self.model.input.save() # Save input for attention mask
+            
+            
+            # attn_mask = input.value[1]["attention_mask"]
+            # print("attn mask", attn_mask.shape)
+
+            # Process the hidden states if needed
+            # TODO do this without a for-loop
+            for hidden_states in hidden_states_per_submodule_list:
+                print("hidden states", hidden_states.shape)
+                hidden_states = hidden_states.value
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
+                hidden_states = hidden_states[attn_mask != 0]
+                
+
+            # Concatenate activations from all submodules
+            hidden_states = t.cat(hidden_states_per_submodule_list, dim=1)
+
+            print("concat hidden states", hidden_states.shape)
 
             remaining_space = self.activation_buffer_size - current_idx
             assert remaining_space > 0
@@ -208,6 +228,7 @@ class HeadActivationBuffer:
         """
         Return a batch of activations
         """
+        print("next")
         with t.no_grad():
             # if buffer is less than half full, refresh
             if (~self.read).sum() < self.n_ctxs * self.ctx_len // 2:

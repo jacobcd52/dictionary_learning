@@ -165,3 +165,5 @@ def trainSAE(
             queue.put("DONE")
         for process in wandb_processes:
             process.join()
+
+    return trainers

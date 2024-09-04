@@ -146,17 +146,15 @@ class TrainerTopK(SAETrainer):
         steps=30000,  # when when does training end
         seed=None,
         device=None,
-        layer=None,
         lm_name=None,
         wandb_name="AutoEncoderTopK",
-        submodule_name=None,
+        submodule_list=None,
     ):
         super().__init__(seed)
 
-        assert layer is not None and lm_name is not None
-        self.layer = layer
+        assert lm_name is not None and submodule_list is not None
         self.lm_name = lm_name
-        self.submodule_name = submodule_name
+        self.submodule_name = submodule_list
 
         self.wandb_name = wandb_name
         self.steps = steps
@@ -165,8 +163,10 @@ class TrainerTopK(SAETrainer):
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
 
+        concat_activation_dim = activation_dim * len(submodule_list)
+
         # Initialise autoencoder
-        self.ae = dict_class(activation_dim, dict_size, k)
+        self.ae = dict_class(concat_activation_dim, dict_size, k)
         if device is None:
             self.device = "cuda" if t.cuda.is_available() else "cpu"
         else:
@@ -302,8 +302,8 @@ class TrainerTopK(SAETrainer):
             "dict_size": self.ae.dict_size,
             "k": self.ae.k,
             "device": self.device,
-            "layer": self.layer,
+            # "layer": self.layer,
             "lm_name": self.lm_name,
             "wandb_name": self.wandb_name,
-            "submodule_name": self.submodule_name,
+            "submodule_list": str(self.submodule_list),
         }
