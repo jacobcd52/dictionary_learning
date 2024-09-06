@@ -476,7 +476,8 @@ class ConcatActivationBuffer:
                  ctx_len=128, # length of each context
                  refresh_batch_size=512, # size of batches in which to process the data when adding to buffer
                  out_batch_size=8192, # size of batches in which to yield activations
-                 device='cpu' # device on which to store the activations
+                 device='cpu', # device on which to store the activations
+                 normalize=True  #normalize activations of all submodules
                  ):
         
         if io not in ['in', 'out']:
@@ -502,6 +503,7 @@ class ConcatActivationBuffer:
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device
+        self.normalize = normalize
 
         self.activations = t.empty(0, self.concat_activation_dim, device=device)
         self.read = t.zeros(0).bool()
@@ -590,9 +592,10 @@ class ConcatActivationBuffer:
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
                 hidden_states = hidden_states[attn_mask != 0]
+                if self.normalize:
+                    hidden_states = self.normalize_state(hidden_states)
                 processed_hidden_states_per_submodule_list.append(hidden_states)
                 
-
             # Concatenate activations from all submodules along the d_model dimension
             # resulting hidden_states has shape [batch seq d_model*n_submodules]
             concat_hidden_states = t.cat(processed_hidden_states_per_submodule_list, dim=-1)
@@ -610,6 +613,10 @@ class ConcatActivationBuffer:
 
         # pbar.close()
         self.read = t.zeros(len(self.activations), dtype=t.bool, device=self.device)
+
+    def normalize_state(self, hidden_state):
+        #set rms = 1 for each element, to play nicely with kaiming initialization of encoder
+        return hidden_state / hidden_state.pow(2).mean(dim=-1, keepdims=True).sqrt()
 
     @property
     def config(self):
