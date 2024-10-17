@@ -153,9 +153,9 @@ class TrainerTopK(SAETrainer):
     ):
         super().__init__(seed)
 
-        assert layer is not None and lm_name is not None
-        self.layer = layer
-        self.lm_name = lm_name
+        # assert layer is not None and lm_name is not None
+        # self.layer = layer
+        # self.lm_name = lm_name
         self.submodule_name = submodule_name
 
         self.wandb_name = wandb_name
@@ -302,8 +302,8 @@ class TrainerTopK(SAETrainer):
             "dict_size": self.ae.dict_size,
             "k": self.ae.k,
             "device": self.device,
-            "layer": self.layer,
-            "lm_name": self.lm_name,
+            # "layer": self.layer,
+            # "lm_name": self.lm_name,
             "wandb_name": self.wandb_name,
             "submodule_name": self.submodule_name,
         }

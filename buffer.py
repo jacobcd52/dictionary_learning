@@ -26,8 +26,13 @@ class ActivationBuffer:
                  ctx_len=128, # length of each context
                  refresh_batch_size=512, # size of batches in which to process the data when adding to buffer
                  out_batch_size=8192, # size of batches in which to yield activations
-                 device='cpu' # device on which to store the activations
+                 device='cpu', # device on which to store the activations
+                 token_mean_window = None,
+                 token_stride = None
                  ):
+        if token_mean_window is not None:
+            if token_stride is None:
+                raise ValueError("token_stride must be specified if token_mean_window is specified")
         
         if io not in ['in', 'out']:
             raise ValueError("io must be either 'in' or 'out'")
@@ -54,6 +59,8 @@ class ActivationBuffer:
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device
+        self.token_mean_window = token_mean_window
+        self.token_stride = token_stride
     
     def __iter__(self):
         return self
@@ -114,7 +121,7 @@ class ActivationBuffer:
         self.activations = new_activations
 
         # Optional progress bar when filling buffer. At larger models / buffer sizes (e.g. gemma-2-2b, 1M tokens on a 4090) this can take a couple minutes.
-        # pbar = tqdm(total=self.activation_buffer_size, initial=current_idx, desc="Refreshing activations")
+        pbar = tqdm(total=self.activation_buffer_size, initial=current_idx, desc="Refreshing activations")
 
         while current_idx < self.activation_buffer_size:
             with t.no_grad():
@@ -130,13 +137,48 @@ class ActivationBuffer:
                         hidden_states = self.submodule.output.save()
                     input = self.model.input.save()
             attn_mask = input.value[1]["attention_mask"]
-            print("attn mask", attn_mask.shape)
-            print("hidden states", hidden_states.shape)
             hidden_states = hidden_states.value
+
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
 
-            hidden_states = hidden_states[attn_mask != 0]
+
+            if self.token_mean_window is not None:
+                # Apply the attention mask before the sliding window mean
+                hidden_states = hidden_states * attn_mask.unsqueeze(-1)  # Broadcast mask to all hidden dimensions
+
+                batch_size, num_tokens, d = hidden_states.shape
+                
+                # Calculate the number of windows
+                num_windows = (num_tokens - self.token_mean_window) // self.token_stride + 1
+                
+                # Create a tensor of indices for the start of each window
+                start_indices = t.arange(0, num_windows * self.token_stride, self.token_stride)
+                
+                # Use unfold to create sliding windows
+                windows = hidden_states.unfold(dimension=1, size=self.token_mean_window, step=self.token_stride)
+                
+                # Calculate the sum over each window
+                hidden_states_sum = windows.sum(dim=-1)
+                
+                # Calculate the count of non-zero elements in each window
+                attn_mask_windows = attn_mask.unfold(dimension=1, size=self.token_mean_window, step=self.token_stride)
+                attn_count = attn_mask_windows.sum(dim=-1, keepdim=True)
+                
+                # Calculate the mean, avoiding division by zero
+                hidden_states = hidden_states_sum / (attn_count + 1e-10)
+
+                # Create a mask for windows with full attention
+                full_attention_mask = (attn_count.squeeze(-1) == self.token_mean_window)
+
+                # Apply the full attention mask
+                hidden_states = hidden_states[full_attention_mask]
+
+            else:
+                hidden_states = hidden_states[attn_mask != 0]
+
+            # If self.token_mean_window is None, we don't need to do anything 
+            # as the attention mask was already applied at the beginning
 
             remaining_space = self.activation_buffer_size - current_idx
             assert remaining_space > 0
