@@ -214,12 +214,13 @@ class JumpReluAutoEncoder(Dictionary, nn.Module):
         self.b_dec = nn.Parameter(t.zeros(activation_dim, device=device))
         self.threshold = nn.Parameter(t.zeros(dict_size, device=device))
 
-        self.apply_b_dec_to_input = False
+        self.apply_b_dec_to_input = True # Jacob changed this
 
         # rows of decoder weight matrix are initialized to unit vectors
         self.W_enc.data = t.randn_like(self.W_enc)
         self.W_enc.data = self.W_enc / self.W_enc.norm(dim=0, keepdim=True)
         self.W_dec.data = self.W_enc.data.clone().T
+        self.W_enc.data = self.W_enc.data / dict_size**0.5
 
     def encode(self, x, output_pre_jump=False):
         if self.apply_b_dec_to_input:
