@@ -3,7 +3,8 @@ from nnsight import LanguageModel
 import gc
 from tqdm import tqdm
 
-from .config import DEBUG
+
+from dictionary_learning.config import DEBUG
 
 if DEBUG:
     tracer_kwargs = {'scan' : True, 'validate' : True}
@@ -100,6 +101,7 @@ class ActivationBuffer:
         )
 
     def refresh(self):
+
         gc.collect()
         t.cuda.empty_cache()
         self.activations = self.activations[~self.read]
@@ -448,3 +450,206 @@ class NNsightActivationBuffer:
         Close the text stream and the underlying compressed file.
         """
         self.text_stream.close()
+
+
+class AllActivationBuffer:
+    """
+    Implements a buffer of activations for multiple submodules. The buffer stores activations from a model,
+    yields them in batches, and refreshes them when the buffer is less than half full.
+    """
+
+    def __init__(
+        self,
+        data,  # generator which yields text or token data
+        model: LanguageModel,  # LanguageModel from which to extract activations
+        submodules,  # list of submodules from which to extract activations
+        d_submodule=None,  # submodule dimension; if None, try to detect automatically
+        io="out",  # can be 'in', 'out', or 'in_and_out'
+        n_ctxs=3e4,  # approximate number of contexts to store in the buffer
+        ctx_len=128,  # length of each context
+        refresh_batch_size=512,  # size of batches in which to process the data when adding to buffer
+        out_batch_size=8192,  # size of batches in which to yield activations
+        device="cpu",  # device on which to store the activations
+    ):
+        if io not in ["in", "out", "in_and_out"]:
+            raise ValueError("io must be either 'in' or 'out' or 'in_and_out'")
+
+        # Store the configuration
+        self.data = data
+        self.model = model
+        self.submodules = submodules
+        self.io = io
+        self.n_ctxs = int(n_ctxs)
+        self.ctx_len = ctx_len
+        self.refresh_batch_size = refresh_batch_size
+        self.out_batch_size = out_batch_size
+        self.device = device
+        
+        # Check input type with first element
+        try:
+            first_item = next(iter(data))
+            self.needs_tokenization = isinstance(first_item, str)
+            # Reset iterator by recreating it
+            self.data = iter(data)
+        except StopIteration:
+            raise ValueError("Empty data iterator provided")
+        
+        # Detect d_submodule if not provided
+        if d_submodule is None:
+            d_submodule = {}
+            for submodule in submodules:
+                try:
+                    if io == "in":
+                        d_submodule[submodule] = submodule.in_features
+                    else:
+                        d_submodule[submodule] = submodule.out_features
+                except:
+                    raise ValueError(f"d_submodule cannot be inferred for {submodule} and must be specified directly")
+        elif isinstance(d_submodule, int):
+            d_submodule = {submodule: d_submodule for submodule in submodules}
+            
+        self.d_submodule = d_submodule
+
+        # Initialize activations dictionary for each submodule
+        self.activations = {}
+        for submodule in submodules:
+            # Always initialize with shape [batch, 2, d] regardless of mode
+            self.activations[submodule] = t.empty(0, 2, d_submodule[submodule], device=device)
+
+        # Initialize read flag with proper size
+        self.read = t.zeros(0, dtype=t.bool, device=device)
+        
+        # Initial refresh to populate the buffer
+        self.refresh()
+
+    def process_batch(self, batch, batch_size=None):
+        """Process a batch of inputs, handling both tokenized and untokenized data."""
+        if batch_size is None:
+            batch_size = self.refresh_batch_size
+
+        if self.needs_tokenization:
+            return self.model.tokenizer(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=self.ctx_len
+            ).input_ids.to(self.device)
+        else:
+            tokens = t.tensor(batch, device=self.device)
+            if len(tokens.shape) == 1:
+                tokens = tokens.unsqueeze(0)
+            return tokens
+
+    def token_batch(self, batch_size=None):
+        """Return a batch of tokens, automatically handling tokenization if needed"""
+        if batch_size is None:
+            batch_size = self.refresh_batch_size
+        try:
+            batch = [next(self.data) for _ in range(batch_size)]
+            return self.process_batch(batch, batch_size)
+        except StopIteration:
+            raise StopIteration("End of data stream reached")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Return a batch of activations for all submodules"""
+        with t.no_grad():
+            # Check if we need to refresh based on number of unread samples
+            n_unread = (~self.read).sum().item()
+            if n_unread < self.out_batch_size:
+                self.refresh()
+
+            # return a batch
+            unreads = (~self.read).nonzero().squeeze()
+            idxs = unreads[t.randperm(len(unreads), device=unreads.device)[: self.out_batch_size]]
+            self.read[idxs] = True
+            
+            return {
+                submodule: self.activations[submodule][idxs]
+                for submodule in self.submodules
+            }
+
+    def _process_states(self, states):
+        """Process states to handle tuples and get the main activation tensor"""
+        if hasattr(states, "value"):
+            states = states.value
+        
+        if isinstance(states, tuple):
+            for item in states:
+                if item is not None and hasattr(item, 'shape'):
+                    states = item
+                    break
+        
+        return states
+
+    def refresh(self):
+        """Refresh the buffer with new activations"""
+        # Remove read activations for all submodules
+        if len(self.read) > 0:
+            for submodule in self.submodules:
+                self.activations[submodule] = self.activations[submodule][~self.read]
+
+        target_size = self.n_ctxs * self.ctx_len
+        while any(len(acts) < target_size for acts in self.activations.values()):
+            try:
+                tokens = self.token_batch()
+                hidden_states_dict = {}
+                
+                with t.no_grad():
+                    trace = self.model.trace(tokens)
+                    with trace:
+                        for submodule in self.submodules:
+                            if self.io in ["in", "in_and_out"]:
+                                hidden_states_dict[f"{submodule}_in"] = submodule.input.save()
+                            if self.io in ["out", "in_and_out"]:
+                                hidden_states_dict[f"{submodule}_out"] = submodule.output.save()
+                        
+                        output = trace.output
+
+                    for submodule in self.submodules:
+                        if self.io == "in":
+                            raw_states = self._process_states(hidden_states_dict[f"{submodule}_in"])
+                            hidden_states = raw_states.view(-1, raw_states.shape[-1])
+                            # Duplicate along second dimension
+                            hidden_states = hidden_states.unsqueeze(1).expand(-1, 2, -1)
+                        
+                        elif self.io == "out":
+                            raw_states = self._process_states(hidden_states_dict[f"{submodule}_out"])
+                            hidden_states = raw_states.view(-1, raw_states.shape[-1])
+                            # Duplicate along second dimension
+                            hidden_states = hidden_states.unsqueeze(1).expand(-1, 2, -1)
+                        
+                        elif self.io == "in_and_out":
+                            raw_in = self._process_states(hidden_states_dict[f"{submodule}_in"])
+                            raw_out = self._process_states(hidden_states_dict[f"{submodule}_out"])
+                            hidden_states_in = raw_in.view(-1, raw_in.shape[-1]).unsqueeze(1)
+                            hidden_states_out = raw_out.view(-1, raw_out.shape[-1]).unsqueeze(1)
+                            hidden_states = t.cat([hidden_states_in, hidden_states_out], dim=1)
+                        
+                        self.activations[submodule] = t.cat(
+                            [self.activations[submodule], hidden_states.to(self.device)], 
+                            dim=0
+                        )
+
+                self.read = t.zeros(len(next(iter(self.activations.values()))), dtype=t.bool, device=self.device)
+            
+            except StopIteration:
+                if all(len(acts) == 0 for acts in self.activations.values()):
+                    raise StopIteration("No data available to process")
+                break
+
+    @property
+    def config(self):
+        return {
+            "d_submodule": self.d_submodule,
+            "io": self.io,
+            "n_ctxs": self.n_ctxs,
+            "ctx_len": self.ctx_len,
+            "refresh_batch_size": self.refresh_batch_size,
+            "out_batch_size": self.out_batch_size,
+            "device": self.device,
+            "needs_tokenization": self.needs_tokenization
+        }
