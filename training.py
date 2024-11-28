@@ -165,3 +165,100 @@ def trainSAE(
             queue.put("DONE")
         for process in wandb_processes:
             process.join()
+
+
+def trainSCAE(
+    buffer,
+    trainer_cfg,
+    steps=None,
+    save_steps=None,
+    save_dir=None,
+    log_steps=None,
+    use_wandb=False,
+):
+    # Initialize trainer
+    trainer_class = trainer_cfg.pop("trainer")
+    trainer = trainer_class(**trainer_cfg)
+    
+    # Create save directory if needed
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        # Save simplified config
+        simple_config = {
+            "activation_dims": trainer_cfg["activation_dims"],
+            "dict_sizes": trainer_cfg["dict_sizes"],
+            "ks": trainer_cfg["ks"],
+            "layers": trainer_cfg["layers"],
+            "lm_name": trainer_cfg["lm_name"],
+            "submodule_names": trainer_cfg["submodule_names"],
+            "buffer_config": {
+                "ctx_len": buffer.ctx_len,
+                "refresh_batch_size": buffer.refresh_batch_size,
+                "out_batch_size": buffer.out_batch_size,
+            }
+        }
+        with open(os.path.join(save_dir, "config.json"), "w") as f:
+            json.dump(simple_config, f, indent=4)
+    
+    # Initialize wandb if requested
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project="sae_training",
+            config=simple_config,
+        )
+    
+    # Training loop
+    for step, activations_list in enumerate(tqdm(buffer, total=steps)):
+        if steps is not None and step >= steps:
+            break
+            
+        # Log statistics
+        if log_steps is not None and step % log_steps == 0:
+            loss_log = trainer.loss(activations_list, step=step, logging=True)
+            log_dict = loss_log.losses
+            
+            # Add additional metrics
+            log_dict.update({
+                f"effective_l0_{i}": l0 
+                for i, l0 in enumerate(trainer.effective_l0s)
+            })
+            log_dict.update({
+                f"dead_features_{i}": dead 
+                for i, dead in enumerate(trainer.dead_features)
+            })
+            
+            if use_wandb:
+                wandb.log(log_dict, step=step)
+            
+            print(f"Step {step}: Loss = {log_dict['total_loss']:.4f}")
+        
+        # Save checkpoint
+        if save_steps is not None and step % save_steps == 0 and save_dir is not None:
+            checkpoint_dir = os.path.join(save_dir, f"step_{step}")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            
+            # Save individual AEs
+            for i, ae in enumerate(trainer.aes):
+                t.save(
+                    ae.state_dict(),
+                    os.path.join(checkpoint_dir, f"ae_{i}.pt")
+                )
+        
+        # Training step
+        loss = trainer.update(step, activations_list)
+    
+    # Save final models
+    if save_dir is not None:
+        final_dir = os.path.join(save_dir, "final")
+        os.makedirs(final_dir, exist_ok=True)
+        for i, ae in enumerate(trainer.aes):
+            t.save(
+                ae.state_dict(),
+                os.path.join(final_dir, f"ae_{i}.pt")
+            )
+    
+    if use_wandb:
+        wandb.finish()
+    
+    return trainer

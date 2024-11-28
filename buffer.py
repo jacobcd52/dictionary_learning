@@ -555,7 +555,10 @@ class AllActivationBuffer:
         return self
 
     def __next__(self):
-        """Return a batch of activations for all submodules in the same order as the input list"""
+        """
+        Return two lists of activations, one for inputs and one for targets.
+        Each activation tensor has shape [batch, d].
+        """
         with t.no_grad():
             # Check if we need to refresh based on number of unread samples
             n_unread = (~self.read).sum().item()
@@ -572,8 +575,16 @@ class AllActivationBuffer:
             idxs = unreads[perm[: self.out_batch_size]]
             self.read[idxs] = True
             
-            # Return list of activations in same order as submodules
-            return [self.activations[submodule][idxs] for submodule, _ in self.submodules]
+            # Split activations into inputs and targets
+            input_acts = []
+            target_acts = []
+            
+            for submodule, _ in self.submodules:
+                acts = self.activations[submodule][idxs]  # [batch, 2, d]
+                input_acts.append(acts[:, 0])  # [batch, d]
+                target_acts.append(acts[:, 1])  # [batch, d]
+            
+            return input_acts, target_acts
 
     def _process_states(self, states):
         """Process states to handle tuples and get the main activation tensor"""
