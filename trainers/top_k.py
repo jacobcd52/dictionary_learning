@@ -409,6 +409,7 @@ class TrainerSCAE(SAETrainer):
         self.effective_l0s = [-1] * self.n_autoencoders
         self.dead_features = [-1] * self.n_autoencoders
 
+
     def run_forward_vanilla(
             self, 
             xs : List[t.Tensor],
@@ -484,6 +485,7 @@ class TrainerSCAE(SAETrainer):
     def get_approx_inputs(
             self, 
             xs : List[t.Tensor],
+            vanilla_feature_acts : List[t.Tensor],
             ):
         return xs # TODO
         # returns a list of tensors of shape [batch, feature, d]
@@ -536,7 +538,7 @@ class TrainerSCAE(SAETrainer):
         vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = self.run_forward_vanilla(xs)
 
         # Use the vanilla feature_acts to get the approximate inputs
-        approx_inputs = self.get_approx_inputs(xs)
+        approx_inputs = self.get_approx_inputs(xs, vanilla_feature_acts)
 
         # Second pass: compute the sparsity loss
         approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = self.run_forward_approx(approx_inputs, vanilla_feature_acts)
