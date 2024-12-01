@@ -176,6 +176,24 @@ def trainSCAE(
     log_steps=None,
     use_wandb=False,
 ):
+    # Convert lists to dictionaries if necessary
+    if isinstance(trainer_cfg.get("submodules", []), list):
+        submodule_names = trainer_cfg["submodule_names"]
+        trainer_cfg["submodules"] = {
+            name: (module, io_type) 
+            for name, (module, io_type) in zip(submodule_names, trainer_cfg["submodules"])
+        }
+    
+    # Ensure all dictionary keys match
+    required_keys = ["activation_dims", "dict_sizes", "ks", "submodules"]
+    dicts = {key: trainer_cfg.get(key, {}) for key in required_keys}
+    
+    # Validate all dictionaries have the same keys
+    all_keys = set(dicts["submodules"].keys())
+    for key, d in dicts.items():
+        if set(d.keys()) != all_keys:
+            raise ValueError(f"Mismatched keys in {key}. Expected {all_keys}, got {set(d.keys())}")
+    
     # Initialize trainer
     trainer_class = trainer_cfg.pop("trainer")
     trainer = trainer_class(**trainer_cfg)
@@ -188,9 +206,9 @@ def trainSCAE(
             "activation_dims": trainer_cfg["activation_dims"],
             "dict_sizes": trainer_cfg["dict_sizes"],
             "ks": trainer_cfg["ks"],
-            "layers": trainer_cfg["layers"],
-            "lm_name": trainer_cfg["lm_name"],
-            "submodule_names": trainer_cfg["submodule_names"],
+            "layers": trainer_cfg.get("layers", []),
+            "lm_name": trainer_cfg.get("lm_name", ""),
+            "submodule_names": list(trainer_cfg["submodules"].keys()),
             "buffer_config": {
                 "ctx_len": buffer.ctx_len,
                 "refresh_batch_size": buffer.refresh_batch_size,
@@ -209,29 +227,37 @@ def trainSCAE(
         )
     
     # Training loop
-    for step, activations_list in enumerate(tqdm(buffer, total=steps)):
+    pbar = tqdm(buffer, total=steps) if steps is not None else tqdm(buffer)
+    for step, (input_acts, target_acts) in enumerate(pbar):
         if steps is not None and step >= steps:
             break
             
+        # # Combine input and target activations
+        # activations = {}
+        # for name in input_acts:
+        #     # Stack input and target activations along a new dimension
+        #     activations[name] = t.stack([input_acts[name], target_acts[name]], dim=1)
+        # TODO unstack
+        
         # Log statistics
         if log_steps is not None and step % log_steps == 0:
-            loss_log = trainer.loss(activations_list, step=step, logging=True)
-            log_dict = loss_log.losses
+            loss_log = trainer.loss(activations, step=step, logging=True)
             
-            # Add additional metrics
-            log_dict.update({
-                f"effective_l0_{i}": l0 
-                for i, l0 in enumerate(trainer.effective_l0s)
-            })
-            log_dict.update({
-                f"dead_features_{i}": dead 
-                for i, dead in enumerate(trainer.dead_features)
-            })
+            # Create log dictionary
+            log_dict = {}
+            for key, value in loss_log.items():
+                if isinstance(value, dict):
+                    # Handle nested dictionaries (like effective_l0s and dead_features)
+                    for subkey, subvalue in value.items():
+                        log_dict[f"{key}_{subkey}"] = subvalue
+                else:
+                    log_dict[key] = value
             
             if use_wandb:
                 wandb.log(log_dict, step=step)
             
-            print(f"Step {step}: Loss = {log_dict['total_loss']:.4f}")
+            # Update progress bar
+            pbar.set_description(f"Loss: {log_dict.get('total_loss', 0):.4f}")
         
         # Save checkpoint
         if save_steps is not None and step % save_steps == 0 and save_dir is not None:
@@ -239,23 +265,23 @@ def trainSCAE(
             os.makedirs(checkpoint_dir, exist_ok=True)
             
             # Save individual AEs
-            for i, ae in enumerate(trainer.aes):
+            for name, ae in trainer.aes.items():
                 t.save(
                     ae.state_dict(),
-                    os.path.join(checkpoint_dir, f"ae_{i}.pt")
+                    os.path.join(checkpoint_dir, f"ae_{name}.pt")
                 )
         
         # Training step
-        loss = trainer.update(step, activations_list)
+        loss = trainer.update(step, activations)
     
     # Save final models
     if save_dir is not None:
         final_dir = os.path.join(save_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
-        for i, ae in enumerate(trainer.aes):
+        for name, ae in trainer.aes.items():
             t.save(
                 ae.state_dict(),
-                os.path.join(final_dir, f"ae_{i}.pt")
+                os.path.join(final_dir, f"ae_{name}.pt")
             )
     
     if use_wandb:

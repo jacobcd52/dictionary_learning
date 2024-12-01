@@ -453,6 +453,41 @@ class NNsightActivationBuffer:
 
 
 class AllActivationBuffer:
+    # [Previous __init__ and other methods remain the same until __next__]
+
+    def __next__(self):
+        """
+        Return two dictionaries of activations, one for inputs and one for targets.
+        Each activation tensor has shape [batch, d].
+        """
+        with t.no_grad():
+            # Check if we need to refresh based on number of unread samples
+            n_unread = (~self.read).sum().item()
+            if n_unread < self.out_batch_size:
+                self.refresh()
+
+            # Set seed for reproducible randomness
+            g = t.Generator(device=self.device)
+            g.manual_seed(42)
+            
+            # Get random unread indices using seeded generator
+            unreads = (~self.read).nonzero().squeeze()
+            perm = t.randperm(len(unreads), device=unreads.device, generator=g)
+            idxs = unreads[perm[: self.out_batch_size]]
+            self.read[idxs] = True
+            
+            # Split activations into inputs and targets using dictionaries
+            input_acts = {}
+            target_acts = {}
+            
+            for name in self.submodules.keys():
+                acts = self.activations[name][idxs]  # [batch, 2, d]
+                input_acts[name] = acts[:, 0]  # [batch, d]
+                target_acts[name] = acts[:, 1]  # [batch, d]
+            
+            return input_acts, target_acts
+
+class AllActivationBuffer:
     """
     Implements a buffer of activations for multiple submodules. The buffer stores activations from a model,
     yields them in batches, and refreshes them when the buffer is less than half full.
@@ -462,7 +497,7 @@ class AllActivationBuffer:
         self,
         data,  # generator which yields text data
         model: LanguageModel,  # LanguageModel from which to extract activations
-        submodules,  # list of tuples (submodule, io_value) where io_value is "in"/"out"/"in_and_out"
+        submodules,  # dictionary mapping submodule names to (submodule, io) tuples where io is "in"/"out"/"in_and_out"
         d_submodule=None,  # submodule dimension; if None, try to detect automatically
         n_ctxs=3e4,  # approximate number of contexts to store in the buffer
         ctx_len=128,  # length of each context
@@ -471,14 +506,14 @@ class AllActivationBuffer:
         device="cpu",  # device on which to store the activations
     ):
         # Validate io values
-        for submodule, io in submodules:
+        for name, (submodule, io) in submodules.items():
             if io not in ["in", "out", "in_and_out"]:
                 raise ValueError(f"io must be either 'in' or 'out' or 'in_and_out', got {io}")
 
         # Store the configuration
         self.data = data
         self.model = model
-        self.submodules = submodules  # List of (submodule, io) tuples
+        self.submodules = submodules
         self.n_ctxs = int(n_ctxs)
         self.ctx_len = ctx_len
         self.refresh_batch_size = refresh_batch_size
@@ -497,24 +532,24 @@ class AllActivationBuffer:
         # Detect d_submodule if not provided
         if d_submodule is None:
             d_submodule = {}
-            for submodule, io in submodules:
+            for name, (submodule, io) in submodules.items():
                 try:
                     if io == "in":
-                        d_submodule[submodule] = submodule.in_features
+                        d_submodule[name] = submodule.in_features
                     else:
-                        d_submodule[submodule] = submodule.out_features
+                        d_submodule[name] = submodule.out_features
                 except:
-                    raise ValueError(f"d_submodule cannot be inferred for {submodule} and must be specified directly")
+                    raise ValueError(f"d_submodule cannot be inferred for {name} and must be specified directly")
         elif isinstance(d_submodule, int):
-            d_submodule = {submodule: d_submodule for submodule, _ in submodules}
+            d_submodule = {name: d_submodule for name in submodules.keys()}
             
         self.d_submodule = d_submodule
 
         # Initialize activations dictionary for each submodule
         self.activations = {}
-        for submodule, _ in submodules:
+        for name, (submodule, _) in submodules.items():
             # Always initialize with shape [batch, 2, d]
-            self.activations[submodule] = t.empty(0, 2, d_submodule[submodule], device=device)
+            self.activations[name] = t.empty(0, 2, d_submodule[name], device=device)
 
         # Initialize read flag with proper size
         self.read = t.zeros(0, dtype=t.bool, device=device)
@@ -556,7 +591,7 @@ class AllActivationBuffer:
 
     def __next__(self):
         """
-        Return two lists of activations, one for inputs and one for targets.
+        Return two dictionaries of activations, one for inputs and one for targets.
         Each activation tensor has shape [batch, d].
         """
         with t.no_grad():
@@ -576,13 +611,13 @@ class AllActivationBuffer:
             self.read[idxs] = True
             
             # Split activations into inputs and targets
-            input_acts = []
-            target_acts = []
+            input_acts = {}
+            target_acts = {}
             
-            for submodule, _ in self.submodules:
-                acts = self.activations[submodule][idxs]  # [batch, 2, d]
-                input_acts.append(acts[:, 0])  # [batch, d]
-                target_acts.append(acts[:, 1])  # [batch, d]
+            for name in self.submodules.keys():
+                acts = self.activations[name][idxs]  # [batch, 2, d]
+                input_acts[name] = acts[:, 0]  # [batch, d]
+                target_acts[name] = acts[:, 1]  # [batch, d]
             
             return input_acts, target_acts
 
@@ -602,8 +637,8 @@ class AllActivationBuffer:
     def refresh(self):
         """Refresh the buffer with new activations"""
         if len(self.read) > 0:
-            for submodule, _ in self.submodules:
-                self.activations[submodule] = self.activations[submodule][~self.read]
+            for name in self.submodules.keys():
+                self.activations[name] = self.activations[name][~self.read]
 
         target_size = self.n_ctxs * self.ctx_len
         while any(len(acts) < target_size for acts in self.activations.values()):
@@ -618,16 +653,16 @@ class AllActivationBuffer:
                         # Save all states first
                         saved_inputs = {}
                         saved_outputs = {}
-                        for submodule, _ in self.submodules:
-                            saved_inputs[submodule] = submodule.input.save()
-                            saved_outputs[submodule] = submodule.output.save()
+                        for name, (submodule, _) in self.submodules.items():
+                            saved_inputs[name] = submodule.input.save()
+                            saved_outputs[name] = submodule.output.save()
                         output = trace.output
 
                     # Then process states
-                    for submodule, io in self.submodules:
+                    for name, (submodule, io) in self.submodules.items():
                         # Get the raw states
-                        raw_in = self._process_states(saved_inputs[submodule])
-                        raw_out = self._process_states(saved_outputs[submodule])
+                        raw_in = self._process_states(saved_inputs[name])
+                        raw_out = self._process_states(saved_outputs[name])
                         
                         # Process them consistently
                         batch_size = raw_in.shape[0]
@@ -648,8 +683,8 @@ class AllActivationBuffer:
                             # Stack input then output
                             hidden_states = t.stack([flat_in, flat_out], dim=1)
                                                 
-                        self.activations[submodule] = t.cat(
-                            [self.activations[submodule], hidden_states.to(self.device)], 
+                        self.activations[name] = t.cat(
+                            [self.activations[name], hidden_states.to(self.device)], 
                             dim=0
                         )
 
