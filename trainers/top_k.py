@@ -472,7 +472,7 @@ class TrainerSCAE(SAETrainer):
                 
         return TimerCtx(self, func_name)
 
-    def run_forward_vanilla(self, xs: dict):
+    def run_forward_vanilla(self, input_acts: dict, target_acts: dict):
         with self._time_function("vanilla_forward"):
             vanilla_l2_loss = 0
             vanilla_auxk_loss = 0
@@ -482,7 +482,8 @@ class TrainerSCAE(SAETrainer):
 
             for name in self.submodule_names:
                 with self._time_function(f"vanilla_forward_{name}"):
-                    x = xs[name]
+                    x = input_acts[name]
+                    tgt = target_acts[name]
                     ae = self.aes[name]
                     
                     with self._time_function(f"vanilla_encode_{name}"):
@@ -494,9 +495,8 @@ class TrainerSCAE(SAETrainer):
                     vanilla_feature_acts[name] = f
                     vanilla_reconstructions[name] = x_hat
 
-                    # Rest of the computation...
-                    e = x_hat - x
-                    total_variance = (x - x.mean(0)).pow(2).sum(0)
+                    e = x_hat - tgt
+                    total_variance = (tgt - tgt.mean(0)).pow(2).sum(0)
 
                     self.effective_l0s[name] = top_acts.size(1)
 
@@ -544,11 +544,11 @@ class TrainerSCAE(SAETrainer):
         return vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses
 
 
-    def get_approx_inputs(self, xs: dict, vanilla_feature_acts: dict):
+    def get_approx_inputs(self, input_acts: dict, vanilla_feature_acts: dict):
         with self._time_function("get_approx_inputs"):
             approx_inputs = {}
             
-            for name, x in xs.items():
+            for name, x in input_acts.items():
                 with self._time_function(f"get_approx_inputs_{name}"):
                     if name.startswith('attn'):
                         approx_inputs[name] = x
@@ -585,7 +585,7 @@ class TrainerSCAE(SAETrainer):
                     
         return approx_inputs
 
-    def run_forward_approx(self, approx_inputs: dict, vanilla_feature_acts: dict):
+    def run_forward_approx(self, approx_inputs: dict, vanilla_feature_acts: dict, target_acts: dict):
         with self._time_function("approx_forward"):
             approx_l2_loss = 0
             connection_loss = 0
@@ -596,6 +596,7 @@ class TrainerSCAE(SAETrainer):
             for name in self.submodule_names:
                 with self._time_function(f"approx_forward_{name}"):
                     x = approx_inputs[name]
+                    tgt = target_acts[name]
                     f = vanilla_feature_acts[name]
                     ae = self.aes[name]
                     
@@ -608,7 +609,7 @@ class TrainerSCAE(SAETrainer):
                     approx_feature_acts[name] = f_approx
                     approx_reconstructions[name] = x_hat
 
-                    e = x_hat - x
+                    e = x_hat - tgt
                     l2_loss = e.pow(2).sum(dim=-1).mean()
                     curr_connection_loss = (f_approx - f).pow(2).sum(dim=-1).mean()
 
@@ -620,7 +621,7 @@ class TrainerSCAE(SAETrainer):
 
         return approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses
 
-    def loss(self, xs: dict, step=None, logging=False):
+    def loss(self, input_acts: dict, target_acts: dict, step=None, logging=False):
         """
         Compute the total loss for all autoencoders.
         
@@ -633,9 +634,9 @@ class TrainerSCAE(SAETrainer):
             total_loss if not logging, otherwise returns logging dict
         """
         with self._time_function("total_loss"):
-            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = self.run_forward_vanilla(xs)
-            approx_inputs = self.get_approx_inputs(xs, vanilla_feature_acts)
-            approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = self.run_forward_approx(approx_inputs, vanilla_feature_acts)
+            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = self.run_forward_vanilla(input_acts, target_acts)
+            approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
+            approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = self.run_forward_approx(approx_inputs, vanilla_feature_acts, target_acts)
 
             all_individual_losses = {**vanilla_individual_losses, **approx_individual_losses}
 
@@ -665,10 +666,10 @@ class TrainerSCAE(SAETrainer):
                 'timings': avg_timings  # Add timings to logging output
             }
 
-    def update(self, step, xs: dict):
+    def update(self, step, input_acts: dict, target_acts: dict):
         # Initialize decoder biases
         if step == 0:
-            for name, x in xs.items():
+            for name, x in input_acts.items():
                 median = geometric_median(x)
                 self.aes[name].b_dec.data = median
 
@@ -677,10 +678,11 @@ class TrainerSCAE(SAETrainer):
             ae.set_decoder_norm_to_unit_norm()
 
         # Move inputs to device
-        xs = {name: x.to(self.device) for name, x in xs.items()}
+        input_acts = {name: x.to(self.device) for name, x in input_acts.items()}
+        target_acts = {name: x.to(self.device) for name, x in target_acts.items()}
         
         # Compute loss and backward pass
-        loss = self.loss(xs, step=step)
+        loss = self.loss(input_acts, target_acts, step=step)
         loss.backward()
 
         # Clip gradients and remove parallel components

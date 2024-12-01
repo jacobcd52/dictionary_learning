@@ -231,17 +231,10 @@ def trainSCAE(
     for step, (input_acts, target_acts) in enumerate(pbar):
         if steps is not None and step >= steps:
             break
-            
-        # # Combine input and target activations
-        # activations = {}
-        # for name in input_acts:
-        #     # Stack input and target activations along a new dimension
-        #     activations[name] = t.stack([input_acts[name], target_acts[name]], dim=1)
-        # TODO unstack
-        
+                    
         # Log statistics
         if log_steps is not None and step % log_steps == 0:
-            loss_log = trainer.loss(activations, step=step, logging=True)
+            loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True)
             
             # Create log dictionary
             log_dict = {}
@@ -272,7 +265,7 @@ def trainSCAE(
                 )
         
         # Training step
-        loss = trainer.update(step, activations)
+        loss = trainer.update(step, input_acts, target_acts)
     
     # Save final models
     if save_dir is not None:
