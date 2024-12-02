@@ -4,8 +4,8 @@ import torch
 import torch.autograd as autograd
 from torch import nn
 
-from ..dictionary import Dictionary, JumpReluAutoEncoder
-from .trainer import SAETrainer
+from dictionary import Dictionary, JumpReluAutoEncoder
+from trainers.trainer import SAETrainer
 
 
 class RectangleFunction(autograd.Function):

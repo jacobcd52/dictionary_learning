@@ -1,2 +1,2 @@
-from .dictionary import AutoEncoder, GatedAutoEncoder, JumpReluAutoEncoder
-from .buffer import ActivationBuffer
+from dictionary import AutoEncoder, GatedAutoEncoder, JumpReluAutoEncoder
+from buffer import ActivationBuffer

@@ -3,9 +3,9 @@ Utilities for evaluating dictionaries on a model and dataset.
 """
 
 import torch as t
-from .buffer import ActivationBuffer, NNsightActivationBuffer
+from buffer import ActivationBuffer, NNsightActivationBuffer
 from nnsight import LanguageModel
-from .config import DEBUG
+from config import DEBUG
 
 
 def loss_recovered(

@@ -12,9 +12,9 @@ from tqdm import tqdm
 
 import wandb
 
-from dictionary_learning.dictionary import AutoEncoder
-from dictionary_learning.evaluation import evaluate
-from dictionary_learning.trainers.standard import StandardTrainer
+from dictionary import AutoEncoder
+from evaluation import evaluate
+from trainers.standard import StandardTrainer
 
 
 def new_wandb_process(config, log_queue, entity, project):
@@ -175,6 +175,7 @@ def trainSCAE(
     save_dir=None,
     log_steps=None,
     use_wandb=False,
+    use_sparse_connections=True,  # Add new parameter
 ):
     # Convert lists to dictionaries if necessary
     if isinstance(trainer_cfg.get("submodules", []), list):
@@ -209,6 +210,7 @@ def trainSCAE(
             "layers": trainer_cfg.get("layers", []),
             "lm_name": trainer_cfg.get("lm_name", ""),
             "submodule_names": list(trainer_cfg["submodules"].keys()),
+            "use_sparse_connections": use_sparse_connections,  # Add to config
             "buffer_config": {
                 "ctx_len": buffer.ctx_len,
                 "refresh_batch_size": buffer.refresh_batch_size,
@@ -231,10 +233,10 @@ def trainSCAE(
     for step, (input_acts, target_acts) in enumerate(pbar):
         if steps is not None and step >= steps:
             break
-                    
+                
         # Log statistics
         if log_steps is not None and step % log_steps == 0:
-            loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True)
+            loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True, use_sparse_connections=use_sparse_connections)
             
             # Create log dictionary
             log_dict = {}
@@ -265,7 +267,7 @@ def trainSCAE(
                 )
         
         # Training step
-        loss = trainer.update(step, input_acts, target_acts)
+        loss = trainer.update(step, input_acts, target_acts, use_sparse_connections=use_sparse_connections)
     
     # Save final models
     if save_dir is not None:

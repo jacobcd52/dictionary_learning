@@ -3,9 +3,9 @@ import torch.nn as nn
 import einops
 from collections import namedtuple
 
-from ..config import DEBUG
-from ..dictionary import Dictionary
-from ..trainers.trainer import SAETrainer
+from config import DEBUG
+from dictionary import Dictionary
+from trainers.trainer import SAETrainer
 
 
 class BatchTopKSAE(Dictionary, nn.Module):

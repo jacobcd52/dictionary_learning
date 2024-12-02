@@ -4,7 +4,7 @@ import gc
 from tqdm import tqdm
 
 
-from dictionary_learning.config import DEBUG
+from config import DEBUG
 
 if DEBUG:
     tracer_kwargs = {'scan' : True, 'validate' : True}

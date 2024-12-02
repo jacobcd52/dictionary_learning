@@ -9,9 +9,9 @@ import torch.nn as nn
 from collections import namedtuple
 from typing import List
 
-from ..config import DEBUG
-from ..dictionary import Dictionary
-from ..trainers.trainer import SAETrainer
+from config import DEBUG
+from dictionary import Dictionary
+from trainers.trainer import SAETrainer
 
 
 @t.no_grad()
@@ -641,52 +641,7 @@ class TrainerSCAE(SAETrainer):
             return approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses
         
         
-    def loss(self, input_acts: dict, target_acts: dict, step=None, logging=False):
-        """
-        Compute the total loss for all autoencoders.
-        
-        Args:
-            xs: Dict mapping submodule names to input tensors
-            step: Current training step (optional)
-            logging: Whether to return logging information
-            
-        Returns:
-            total_loss if not logging, otherwise returns logging dict
-        """
-        with self._time_function("total_loss"):
-            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = self.run_forward_vanilla(input_acts, target_acts)
-            approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
-            approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = self.run_forward_approx(approx_inputs, vanilla_feature_acts, target_acts)
-
-            all_individual_losses = {**vanilla_individual_losses, **approx_individual_losses}
-
-            total_loss = vanilla_l2_loss 
-            total_loss += self.auxk_alpha * vanilla_auxk_loss 
-            total_loss += approx_l2_loss 
-            total_loss += self.connection_sparsity_coeff * connection_loss
-
-        if not logging:
-            return total_loss
-        else:
-            # Calculate average timings
-            avg_timings = {
-                name: sum(times) / len(times) 
-                for name, times in self.timings.items()
-            }
-            
-            return {
-                'total_loss': total_loss.item(),
-                'vanilla_l2_loss': vanilla_l2_loss.item(),
-                'vanilla_auxk_loss': vanilla_auxk_loss.item(),
-                'approx_l2_loss': approx_l2_loss.item(),
-                'connection_loss': connection_loss.item(),
-                **all_individual_losses,
-                'effective_l0s': self.effective_l0s,
-                'dead_features': self.dead_features,
-                'timings': avg_timings  # Add timings to logging output
-            }
-
-    def update(self, step, input_acts: dict, target_acts: dict):
+    def update(self, step, input_acts: dict, target_acts: dict, use_sparse_connections=True):
         if step == 0:
             for name, x in input_acts.items():
                 median = geometric_median(x)
@@ -698,24 +653,52 @@ class TrainerSCAE(SAETrainer):
         input_acts = {name: x.to(self.device) for name, x in input_acts.items()}
         target_acts = {name: x.to(self.device) for name, x in target_acts.items()}
         
-        # Zero gradients at the start
         self.optimizer.zero_grad()
         
-        # Run vanilla forward passes with immediate backward passes
-        vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, _ = self.run_forward_vanilla(
-            input_acts, target_acts
-        )
+        if use_sparse_connections:
+            # Original implementation with sparse connections
+            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, _ = self.run_forward_vanilla(
+                input_acts, target_acts
+            )
+            
+            approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
+            
+            _, approx_l2_loss, connection_loss, _ = self.run_forward_approx(
+                approx_inputs, vanilla_feature_acts, target_acts
+            )
+            
+            total_loss = vanilla_l2_loss + vanilla_auxk_loss + approx_l2_loss + connection_loss
         
-        # Compute approximate inputs using the detached features
-        approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
-        
-        # Run approximate forward passes with immediate backward passes
-        _, approx_l2_loss, connection_loss, _ = self.run_forward_approx(
-            approx_inputs, vanilla_feature_acts, target_acts
-        )
+        else:
+            # Simple version without sparse connections
+            with self._time_function("vanilla_forward"):
+                vanilla_l2_loss = 0
+                vanilla_auxk_loss = 0
+                
+                with self._time_function("vanilla_backward"):
+                    for name in self.submodule_names:
+                        with self._time_function(f"vanilla_forward_{name}"):
+                            x = input_acts[name]
+                            tgt = target_acts[name]
+                            ae = self.aes[name]
+                            
+                            with self._time_function(f"vanilla_encode_{name}"):
+                                f, top_acts, top_indices = ae.encode(x, return_topk=True)
+                            
+                            with self._time_function(f"vanilla_decode_{name}"):
+                                x_hat = ae.decode(f)
+                            
+                            e = x_hat - tgt
+                            l2_loss = e.pow(2).sum(dim=-1).mean()
+                            
+                            with self._time_function(f"vanilla_backward_{name}"):
+                                l2_loss.backward()
+                            
+                            vanilla_l2_loss += l2_loss.detach()
+            
+            total_loss = vanilla_l2_loss
 
         with self._time_function("gradient_processing"):
-            # Clip gradients and remove parallel components
             for ae in self.aes.values():
                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
                 ae.remove_gradient_parallel_to_decoder_directions()
@@ -724,8 +707,61 @@ class TrainerSCAE(SAETrainer):
             self.optimizer.zero_grad()
             self.scheduler.step()
         
-        total_loss = vanilla_l2_loss + vanilla_auxk_loss + approx_l2_loss + connection_loss
         return total_loss.item()
+
+    def loss(self, input_acts: dict, target_acts: dict, step=None, logging=False, use_sparse_connections=True):
+        """Modified to handle both sparse and non-sparse modes"""
+        with self._time_function("total_loss"):
+            if use_sparse_connections:
+                # Original sparse connections implementation
+                vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
+                    self.run_forward_vanilla(input_acts, target_acts)
+                )
+                
+                approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
+                
+                approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = (
+                    self.run_forward_approx(approx_inputs, vanilla_feature_acts, target_acts)
+                )
+
+                all_individual_losses = {**vanilla_individual_losses, **approx_individual_losses}
+                total_loss = (vanilla_l2_loss + 
+                            self.auxk_alpha * vanilla_auxk_loss + 
+                            approx_l2_loss + 
+                            self.connection_sparsity_coeff * connection_loss)
+            else:
+                # Simple version without sparse connections
+                vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
+                    self.run_forward_vanilla(input_acts, target_acts)
+                )
+                all_individual_losses = vanilla_individual_losses
+                total_loss = vanilla_l2_loss
+
+        if not logging:
+            return total_loss
+        else:
+            avg_timings = {
+                name: sum(times) / len(times) 
+                for name, times in self.timings.items()
+            }
+            
+            log_dict = {
+                'total_loss': total_loss.item(),
+                'vanilla_l2_loss': vanilla_l2_loss.item(),
+                **all_individual_losses,
+                'effective_l0s': self.effective_l0s,
+                'dead_features': self.dead_features,
+                'timings': avg_timings
+            }
+            
+            if use_sparse_connections:
+                log_dict.update({
+                    'vanilla_auxk_loss': vanilla_auxk_loss.item(),
+                    'approx_l2_loss': approx_l2_loss.item(),
+                    'connection_loss': connection_loss.item(),
+                })
+                
+            return log_dict
 
     @property
     def config(self):
