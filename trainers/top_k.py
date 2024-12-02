@@ -556,6 +556,7 @@ class TrainerSCAE(SAETrainer):
                         current_layer = int(name.split('_')[1])
                         batch_size = x.shape[0]
                         
+                        # Initialize accumulator
                         approx_input = t.zeros_like(x)
                         
                         for upstream_name, upstream_features in self.important_features.items():
@@ -566,24 +567,34 @@ class TrainerSCAE(SAETrainer):
                             if upstream_layer >= current_layer:
                                 continue
                             
-                            upstream_acts = vanilla_feature_acts[upstream_name]
+                            upstream_acts = vanilla_feature_acts[upstream_name]  # [batch_size, dict_size]
+                            decoder = self.important_decoders[upstream_name]     # [activation_dim, dict_size]
                             
-                            batch_indices = t.arange(batch_size, device=upstream_acts.device)[:, None, None]
-                            feature_indices = upstream_features[None, :, :]
+                            # Process in chunks to reduce memory usage
+                            chunk_size = 2048  # Adjust based on available memory
+                            num_groups = upstream_features.shape[0]
                             
-                            batch_indices = batch_indices.expand(-1, upstream_features.shape[0], upstream_features.shape[1])
-                            feature_indices = feature_indices.expand(batch_size, -1, -1)
-                            
-                            important_feature_acts = upstream_acts[batch_indices, feature_indices]
-                            summed_acts = important_feature_acts.sum(dim=-1)
-                            
-                            approx_input += t.einsum('bn,dn->bd', summed_acts, self.important_decoders[upstream_name])
+                            for chunk_start in range(0, num_groups, chunk_size):
+                                chunk_end = min(chunk_start + chunk_size, num_groups)
+                                chunk_features = upstream_features[chunk_start:chunk_end]
+                                
+                                # Efficient gather and sum for this chunk
+                                # [batch_size, chunk_size, features_per_group] -> [batch_size, chunk_size]
+                                chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
+                                
+                                # Get relevant decoder weights for this chunk
+                                # Use the first feature index per group as they're tied together
+                                chunk_decoder = decoder[:, chunk_features[:, 0]]  # [activation_dim, chunk_size]
+                                
+                                # Accumulate contribution from this chunk
+                                # [batch_size, chunk_size] @ [chunk_size, activation_dim] = [batch_size, activation_dim]
+                                approx_input += t.matmul(chunk_acts, chunk_decoder.t())
                         
                         approx_inputs[name] = approx_input
                     else:
                         raise ValueError(f"Unknown submodule type: {name}")
-                    
-        return approx_inputs
+                        
+            return approx_inputs
 
     def run_forward_approx(self, approx_inputs: dict, vanilla_feature_acts: dict, target_acts: dict):
         with self._time_function("approx_forward"):
