@@ -175,7 +175,7 @@ def trainSCAE(
     save_dir=None,
     log_steps=None,
     use_wandb=False,
-    use_sparse_connections=True,  # Add new parameter
+    hf_repo_id=None,  # New parameter for HuggingFace repo ID
 ):
     # Convert lists to dictionaries if necessary
     if isinstance(trainer_cfg.get("submodules", []), list):
@@ -184,25 +184,24 @@ def trainSCAE(
             name: (module, io_type) 
             for name, (module, io_type) in zip(submodule_names, trainer_cfg["submodules"])
         }
-    
+
     # Ensure all dictionary keys match
     required_keys = ["activation_dims", "dict_sizes", "ks", "submodules"]
     dicts = {key: trainer_cfg.get(key, {}) for key in required_keys}
-    
-    # Validate all dictionaries have the same keys
+
+    # Validate all keys are the same
     all_keys = set(dicts["submodules"].keys())
     for key, d in dicts.items():
         if set(d.keys()) != all_keys:
             raise ValueError(f"Mismatched keys in {key}. Expected {all_keys}, got {set(d.keys())}")
-    
+
     # Initialize trainer
     trainer_class = trainer_cfg.pop("trainer")
     trainer = trainer_class(**trainer_cfg)
-    
+
     # Create save directory if needed
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
-        # Save simplified config
         simple_config = {
             "activation_dims": trainer_cfg["activation_dims"],
             "dict_sizes": trainer_cfg["dict_sizes"],
@@ -210,7 +209,8 @@ def trainSCAE(
             "layers": trainer_cfg.get("layers", []),
             "lm_name": trainer_cfg.get("lm_name", ""),
             "submodule_names": list(trainer_cfg["submodules"].keys()),
-            "use_sparse_connections": use_sparse_connections,  # Add to config
+            "connection_sparsity_coeff": trainer_cfg.get("connection_sparsity_coeff", 0),
+            "use_sparse_connections": trainer_cfg.get("use_sparse_connections", True),
             "buffer_config": {
                 "ctx_len": buffer.ctx_len,
                 "refresh_batch_size": buffer.refresh_batch_size,
@@ -219,7 +219,7 @@ def trainSCAE(
         }
         with open(os.path.join(save_dir, "config.json"), "w") as f:
             json.dump(simple_config, f, indent=4)
-    
+
     # Initialize wandb if requested
     if use_wandb:
         import wandb
@@ -227,7 +227,7 @@ def trainSCAE(
             project="sae_training",
             config=simple_config,
         )
-    
+
     # Training loop
     pbar = tqdm(buffer, total=steps) if steps is not None else tqdm(buffer)
     for step, (input_acts, target_acts) in enumerate(pbar):
@@ -236,13 +236,12 @@ def trainSCAE(
                 
         # Log statistics
         if log_steps is not None and step % log_steps == 0:
-            loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True, use_sparse_connections=use_sparse_connections)
+            loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True)
             
             # Create log dictionary
             log_dict = {}
             for key, value in loss_log.items():
                 if isinstance(value, dict):
-                    # Handle nested dictionaries (like effective_l0s and dead_features)
                     for subkey, subvalue in value.items():
                         log_dict[f"{key}_{subkey}"] = subvalue
                 else:
@@ -259,7 +258,6 @@ def trainSCAE(
             checkpoint_dir = os.path.join(save_dir, f"step_{step}")
             os.makedirs(checkpoint_dir, exist_ok=True)
             
-            # Save individual AEs
             for name, ae in trainer.aes.items():
                 t.save(
                     ae.state_dict(),
@@ -267,8 +265,8 @@ def trainSCAE(
                 )
         
         # Training step
-        loss = trainer.update(step, input_acts, target_acts, use_sparse_connections=use_sparse_connections)
-    
+        loss = trainer.update(step, input_acts, target_acts)
+
     # Save final models
     if save_dir is not None:
         final_dir = os.path.join(save_dir, "final")
@@ -278,8 +276,50 @@ def trainSCAE(
                 ae.state_dict(),
                 os.path.join(final_dir, f"ae_{name}.pt")
             )
-    
+
+    # Upload to HuggingFace if repo_id is provided
+    if hf_repo_id is not None:
+        try:
+            from huggingface_hub import HfApi, upload_file
+            import tempfile
+            
+            print(f"\nUploading models to HuggingFace repo: {hf_repo_id}")
+            
+            # Create HuggingFace API client
+            api = HfApi()
+            
+            # Upload configuration
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
+                json.dump(simple_config, f, indent=4)
+                f.flush()
+                api.upload_file(
+                    path_or_fileobj=f.name,
+                    path_in_repo="config.json",
+                    repo_id=hf_repo_id,
+                    repo_type="model",
+                )
+            
+            # Upload each autoencoder
+            for name, ae in trainer.aes.items():
+                with tempfile.NamedTemporaryFile(suffix='.pt') as f:
+                    t.save(ae.state_dict(), f.name)
+                    api.upload_file(
+                        path_or_fileobj=f.name,
+                        path_in_repo=f"ae_{name}.pt",
+                        repo_id=hf_repo_id,
+                        repo_type="model",
+                    )
+                print(f"Uploaded ae_{name}.pt")
+            
+            print("Successfully uploaded all models to HuggingFace!")
+            
+        except ImportError:
+            print("Warning: huggingface_hub package not found. Skipping HuggingFace upload.")
+            print("To upload to HuggingFace, install with: pip install huggingface_hub")
+        except Exception as e:
+            print(f"Error uploading to HuggingFace: {str(e)}")
+
     if use_wandb:
         wandb.finish()
-    
+
     return trainer

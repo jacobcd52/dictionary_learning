@@ -328,23 +328,24 @@ class TrainerTopK(SAETrainer):
 
 class TrainerSCAE(SAETrainer):
     def __init__(
-        self,
-        dict_class=AutoEncoderTopK,
-        activation_dims={},  # Dict mapping submodule names to dimensions
-        dict_sizes={},      # Dict mapping submodule names to dictionary sizes
-        ks={},             # Dict mapping submodule names to k values
-        submodules={},      # Dict mapping submodule names to (submodule, io) tuples
-        important_features = {},
-        pretrained_info=None,  # Dict mapping submodule names to HF repo/filename info
-        model_config=None,     # Required if using pretrained_info
-        auxk_alpha=0,
-        connection_sparsity_coeff=0,
-        decay_start=24000,
-        steps=30000,
-        seed=None,
-        device=None,
-        wandb_name="SCAE",
-    ):
+            self,
+            dict_class=AutoEncoderTopK,
+            activation_dims={},  # Dict mapping submodule names to dimensions
+            dict_sizes={},      # Dict mapping submodule names to dictionary sizes
+            ks={},             # Dict mapping submodule names to k values
+            submodules={},      # Dict mapping submodule names to (submodule, io) tuples
+            important_features = {},
+            pretrained_info=None,  # Dict mapping submodule names to HF repo/filename info
+            model_config=None,     # Required if using pretrained_info
+            auxk_alpha=0,
+            connection_sparsity_coeff=0,
+            use_sparse_connections=True,  # Added this parameter
+            decay_start=24000,
+            steps=30000,
+            seed=None,
+            device=None,
+            wandb_name="SCAE",
+        ):
         super().__init__(seed)
         
         # Validate inputs
@@ -352,7 +353,7 @@ class TrainerSCAE(SAETrainer):
         self.submodule_names = list(submodules.keys())
         self.submodules = submodules
         self.n_autoencoders = len(submodules)
-        self.timings = {}  # Store timing information
+        self.use_sparse_connections = use_sparse_connections  # Store the parameter
 
         # Validate pretrained info if provided
         if pretrained_info is not None:
@@ -444,204 +445,157 @@ class TrainerSCAE(SAETrainer):
         self.logging_parameters = ["effective_l0s", "dead_features"]
         self.effective_l0s = {name: -1 for name in self.submodule_names}
         self.dead_features = {name: -1 for name in self.submodule_names}
-    
-    def reset_timings(self):
-        """Reset all timing measurements"""
-        self.timings = {}
-    
-    def _time_function(self, func_name):
-        """Context manager to measure execution time of a function"""
-        class TimerCtx:
-            def __init__(self, trainer, name):
-                self.trainer = trainer
-                self.name = name
-                
-            def __enter__(self):
-                self.start = t.cuda.Event(enable_timing=True)
-                self.end = t.cuda.Event(enable_timing=True)
-                self.start.record()
-                
-            def __exit__(self, exc_type, exc_val, exc_tb):
-                self.end.record()
-                t.cuda.synchronize()
-                elapsed_time = self.start.elapsed_time(self.end)  # in milliseconds
-                
-                if self.name not in self.trainer.timings:
-                    self.trainer.timings[self.name] = []
-                self.trainer.timings[self.name].append(elapsed_time)
-                
-        return TimerCtx(self, func_name)
 
     def run_forward_vanilla(self, input_acts: dict, target_acts: dict):
-        with self._time_function("vanilla_forward"):
-            vanilla_l2_loss = 0
-            vanilla_auxk_loss = 0
-            vanilla_individual_losses = {}
-            vanilla_feature_acts = {}
+        vanilla_l2_loss = 0
+        vanilla_auxk_loss = 0
+        vanilla_individual_losses = {}
+        vanilla_feature_acts = {}
 
-            with self._time_function("vanilla_backward"):  # Add high-level backward timing
-                for name in self.submodule_names:
-                    with self._time_function(f"vanilla_forward_{name}"):
-                        x = input_acts[name]
-                        tgt = target_acts[name]
-                        ae = self.aes[name]
-                        
-                        with self._time_function(f"vanilla_encode_{name}"):
-                            f, top_acts, top_indices = ae.encode(x, return_topk=True)
-                        
-                        with self._time_function(f"vanilla_decode_{name}"):
-                            x_hat = ae.decode(f)
-                            
-                        vanilla_feature_acts[name] = f.detach()
+        for name in self.submodule_names:
+            x = input_acts[name]
+            tgt = target_acts[name]
+            ae = self.aes[name]
+            
+            f, top_acts, top_indices = ae.encode(x, return_topk=True)
+            x_hat = ae.decode(f)
+                
+            vanilla_feature_acts[name] = f.detach()
 
-                        e = x_hat - tgt
-                        total_variance = (tgt - tgt.mean(0)).pow(2).sum(0)
+            e = x_hat - tgt
+            total_variance = (tgt - tgt.mean(0)).pow(2).sum(0)
 
-                        self.effective_l0s[name] = top_acts.size(1)
+            self.effective_l0s[name] = top_acts.size(1)
 
-                        num_tokens_in_step = x.size(0)
-                        did_fire = t.zeros_like(self.num_tokens_since_fired[name], dtype=t.bool)
-                        did_fire[top_indices.flatten()] = True
-                        self.num_tokens_since_fired[name] += num_tokens_in_step
-                        self.num_tokens_since_fired[name][did_fire] = 0
+            num_tokens_in_step = x.size(0)
+            did_fire = t.zeros_like(self.num_tokens_since_fired[name], dtype=t.bool)
+            did_fire[top_indices.flatten()] = True
+            self.num_tokens_since_fired[name] += num_tokens_in_step
+            self.num_tokens_since_fired[name][did_fire] = 0
 
-                        dead_mask = (
-                            self.num_tokens_since_fired[name] > self.dead_feature_threshold
-                            if self.auxk_alpha > 0
-                            else None
-                        )
-                        if dead_mask is not None:
-                            dead_mask = dead_mask.to(f.device)
-                            self.dead_features[name] = int(dead_mask.sum())
+            dead_mask = (
+                self.num_tokens_since_fired[name] > self.dead_feature_threshold
+                if self.auxk_alpha > 0
+                else None
+            )
+            if dead_mask is not None:
+                dead_mask = dead_mask.to(f.device)
+                self.dead_features[name] = int(dead_mask.sum())
 
-                        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-                            k_aux = x.shape[-1] // 2
-                            scale = min(num_dead / k_aux, 1.0)
-                            k_aux = min(k_aux, num_dead)
+            if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+                k_aux = x.shape[-1] // 2
+                scale = min(num_dead / k_aux, 1.0)
+                k_aux = min(k_aux, num_dead)
 
-                            auxk_latents = t.where(dead_mask[None], f, -t.inf)
-                            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+                auxk_latents = t.where(dead_mask[None], f, -t.inf)
+                auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-                            auxk_buffer_BF = t.zeros_like(f)
-                            auxk_acts_BF = auxk_buffer_BF.scatter_(dim=-1, index=auxk_indices, src=auxk_acts)
+                auxk_buffer_BF = t.zeros_like(f)
+                auxk_acts_BF = auxk_buffer_BF.scatter_(dim=-1, index=auxk_indices, src=auxk_acts)
 
-                            e_hat = ae.decode(auxk_acts_BF)
-                            auxk_loss = (e_hat - e).pow(2)
-                            auxk_loss = scale * t.mean(auxk_loss / total_variance)
-                        else:
-                            auxk_loss = x_hat.new_tensor(0.0)
+                e_hat = ae.decode(auxk_acts_BF)
+                auxk_loss = (e_hat - e).pow(2)
+                auxk_loss = scale * t.mean(auxk_loss / total_variance)
+            else:
+                auxk_loss = x_hat.new_tensor(0.0)
 
-                        l2_loss = e.pow(2).sum(dim=-1).mean()
-                        auxk_loss = auxk_loss.sum(dim=-1).mean()
+            l2_loss = e.pow(2).sum(dim=-1).mean()
+            auxk_loss = auxk_loss.sum(dim=-1).mean()
 
-                        # Immediate backward pass for this autoencoder
-                        with self._time_function(f"vanilla_backward_{name}"):
-                            total_loss = l2_loss + self.auxk_alpha * auxk_loss
-                            total_loss.backward()
+            total_loss = l2_loss + self.auxk_alpha * auxk_loss
+            total_loss.backward()
 
-                        vanilla_l2_loss += l2_loss.detach()
-                        vanilla_auxk_loss += auxk_loss.detach()
+            vanilla_l2_loss += l2_loss.detach()
+            vanilla_auxk_loss += auxk_loss.detach()
 
-                        vanilla_individual_losses[f"{name}_l2_loss"] = l2_loss.item()
-                        vanilla_individual_losses[f"{name}_auxk_loss"] = auxk_loss.item()
+            vanilla_individual_losses[f"{name}_l2_loss"] = l2_loss.item()
+            vanilla_individual_losses[f"{name}_auxk_loss"] = auxk_loss.item()
 
-            return vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses
-
+        return vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses
 
     def get_approx_inputs(self, input_acts: dict, vanilla_feature_acts: dict):
-        with self._time_function("get_approx_inputs"):
-            approx_inputs = {}
-            
-            for name, x in input_acts.items():
-                with self._time_function(f"get_approx_inputs_{name}"):
-                    if name.startswith('attn'):
-                        approx_inputs[name] = x
-                    elif name.startswith('mlp'):
-                        current_layer = int(name.split('_')[1])
-                        batch_size = x.shape[0]
-                        
-                        # Initialize accumulator
-                        approx_input = t.zeros_like(x)
-                        
-                        for upstream_name, upstream_features in self.important_features.items():
-                            if not upstream_name.startswith('mlp'):
-                                continue
-                                
-                            upstream_layer = int(upstream_name.split('_')[1])
-                            if upstream_layer >= current_layer:
-                                continue
+        approx_inputs = {}
+        
+        for name, x in input_acts.items():
+            if name.startswith('attn'):
+                approx_inputs[name] = x
+            elif name.startswith('mlp'):
+                current_layer = int(name.split('_')[1])
+                batch_size = x.shape[0]
+                
+                # Initialize accumulator
+                approx_input = t.zeros_like(x)
+                
+                for upstream_name, upstream_features in self.important_features.items():
+                    if not upstream_name.startswith('mlp'):
+                        continue
                             
-                            upstream_acts = vanilla_feature_acts[upstream_name]  # [batch_size, dict_size]
-                            decoder = self.important_decoders[upstream_name]     # [activation_dim, dict_size]
-                            
-                            # Process in chunks to reduce memory usage
-                            chunk_size = 2048  # Adjust based on available memory
-                            num_groups = upstream_features.shape[0]
-                            
-                            for chunk_start in range(0, num_groups, chunk_size):
-                                chunk_end = min(chunk_start + chunk_size, num_groups)
-                                chunk_features = upstream_features[chunk_start:chunk_end]
-                                
-                                # Efficient gather and sum for this chunk
-                                # [batch_size, chunk_size, features_per_group] -> [batch_size, chunk_size]
-                                chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
-                                
-                                # Get relevant decoder weights for this chunk
-                                # Use the first feature index per group as they're tied together
-                                chunk_decoder = decoder[:, chunk_features[:, 0]]  # [activation_dim, chunk_size]
-                                
-                                # Accumulate contribution from this chunk
-                                # [batch_size, chunk_size] @ [chunk_size, activation_dim] = [batch_size, activation_dim]
-                                approx_input += t.matmul(chunk_acts, chunk_decoder.t())
+                    upstream_layer = int(upstream_name.split('_')[1])
+                    if upstream_layer >= current_layer:
+                        continue
+                    
+                    upstream_acts = vanilla_feature_acts[upstream_name]  # [batch_size, dict_size]
+                    decoder = self.important_decoders[upstream_name]     # [activation_dim, dict_size]
+                    
+                    # Process in chunks to reduce memory usage
+                    chunk_size = 2048  # Adjust based on available memory
+                    num_groups = upstream_features.shape[0]
+                    
+                    for chunk_start in range(0, num_groups, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, num_groups)
+                        chunk_features = upstream_features[chunk_start:chunk_end]
                         
-                        approx_inputs[name] = approx_input
-                    else:
-                        raise ValueError(f"Unknown submodule type: {name}")
+                        # Efficient gather and sum for this chunk
+                        # [batch_size, chunk_size, features_per_group] -> [batch_size, chunk_size]
+                        chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
                         
-            return approx_inputs
+                        # Get relevant decoder weights for this chunk
+                        # Use the first feature index per group as they're tied together
+                        chunk_decoder = decoder[:, chunk_features[:, 0]]  # [activation_dim, chunk_size]
+                        
+                        # Accumulate contribution from this chunk
+                        # [batch_size, chunk_size] @ [chunk_size, activation_dim] = [batch_size, activation_dim]
+                        approx_input += t.matmul(chunk_acts, chunk_decoder.t())
+                
+                approx_inputs[name] = approx_input
+            else:
+                raise ValueError(f"Unknown submodule type: {name}")
+                    
+        return approx_inputs
 
     def run_forward_approx(self, approx_inputs: dict, vanilla_feature_acts: dict, target_acts: dict):
-        with self._time_function("approx_forward"):
-            approx_l2_loss = 0
-            connection_loss = 0
-            approx_individual_losses = {}
-            approx_feature_acts = {}        
+        approx_l2_loss = 0
+        connection_loss = 0
+        approx_individual_losses = {}
+        approx_feature_acts = {}        
 
-            with self._time_function("approx_backward"):  # Add high-level backward timing
-                for name in self.submodule_names:
-                    with self._time_function(f"approx_forward_{name}"):
-                        x = approx_inputs[name]
-                        tgt = target_acts[name]
-                        f = vanilla_feature_acts[name]
-                        ae = self.aes[name]
-                        
-                        with self._time_function(f"approx_encode_{name}"):
-                            f_approx, top_acts, top_indices = ae.encode(x, return_topk=True)
-                        
-                        with self._time_function(f"approx_decode_{name}"):
-                            x_hat = ae.decode(f_approx)
-                            
-                        approx_feature_acts[name] = f_approx
+        for name in self.submodule_names:
+            x = approx_inputs[name]
+            tgt = target_acts[name]
+            f = vanilla_feature_acts[name]
+            ae = self.aes[name]
+            
+            f_approx, top_acts, top_indices = ae.encode(x, return_topk=True)
+            x_hat = ae.decode(f_approx)
+                
+            approx_feature_acts[name] = f_approx
 
-                        e = x_hat - tgt
-                        l2_loss = e.pow(2).sum(dim=-1).mean()
-                        curr_connection_loss = (f_approx - f).pow(2).sum(dim=-1).mean()
+            e = x_hat - tgt
+            l2_loss = e.pow(2).sum(dim=-1).mean()
+            curr_connection_loss = (f_approx - f).pow(2).sum(dim=-1).mean()
 
-                        # Immediate backward pass for this autoencoder
-                        with self._time_function(f"approx_backward_{name}"):
-                            total_loss = l2_loss + self.connection_sparsity_coeff * curr_connection_loss
-                            total_loss.backward()
+            total_loss = l2_loss + self.connection_sparsity_coeff * curr_connection_loss
+            total_loss.backward()
 
-                        approx_l2_loss += l2_loss.detach()
-                        connection_loss += curr_connection_loss.detach()
+            approx_l2_loss += l2_loss.detach()
+            connection_loss += curr_connection_loss.detach()
 
-                        approx_individual_losses[f"{name}_approx_l2_loss"] = l2_loss.item()
-                        approx_individual_losses[f"{name}_connection_loss"] = curr_connection_loss.item()
+            approx_individual_losses[f"{name}_approx_l2_loss"] = l2_loss.item()
+            approx_individual_losses[f"{name}_connection_loss"] = curr_connection_loss.item()
 
-            return approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses
-        
-        
-    def update(self, step, input_acts: dict, target_acts: dict, use_sparse_connections=True):
+        return approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses
+
+    def update(self, step, input_acts: dict, target_acts: dict):
         if step == 0:
             for name, x in input_acts.items():
                 median = geometric_median(x)
@@ -655,7 +609,7 @@ class TrainerSCAE(SAETrainer):
         
         self.optimizer.zero_grad()
         
-        if use_sparse_connections:
+        if self.use_sparse_connections:
             # Original implementation with sparse connections
             vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, _ = self.run_forward_vanilla(
                 input_acts, target_acts
@@ -671,90 +625,73 @@ class TrainerSCAE(SAETrainer):
         
         else:
             # Simple version without sparse connections
-            with self._time_function("vanilla_forward"):
-                vanilla_l2_loss = 0
-                vanilla_auxk_loss = 0
-                
-                with self._time_function("vanilla_backward"):
-                    for name in self.submodule_names:
-                        with self._time_function(f"vanilla_forward_{name}"):
-                            x = input_acts[name]
-                            tgt = target_acts[name]
-                            ae = self.aes[name]
-                            
-                            with self._time_function(f"vanilla_encode_{name}"):
-                                f, top_acts, top_indices = ae.encode(x, return_topk=True)
-                            
-                            with self._time_function(f"vanilla_decode_{name}"):
-                                x_hat = ae.decode(f)
-                            
-                            e = x_hat - tgt
-                            l2_loss = e.pow(2).sum(dim=-1).mean()
-                            
-                            with self._time_function(f"vanilla_backward_{name}"):
-                                l2_loss.backward()
-                            
-                            vanilla_l2_loss += l2_loss.detach()
+            vanilla_l2_loss = 0
             
+            for name in self.submodule_names:
+                x = input_acts[name]
+                tgt = target_acts[name]
+                ae = self.aes[name]
+                
+                f, top_acts, top_indices = ae.encode(x, return_topk=True)
+                x_hat = ae.decode(f)
+                
+                e = x_hat - tgt
+                l2_loss = e.pow(2).sum(dim=-1).mean()
+                l2_loss.backward()
+                
+                vanilla_l2_loss += l2_loss.detach()
+        
             total_loss = vanilla_l2_loss
 
-        with self._time_function("gradient_processing"):
-            for ae in self.aes.values():
-                t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
-                ae.remove_gradient_parallel_to_decoder_directions()
+        # Gradient processing
+        for ae in self.aes.values():
+            t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
+            ae.remove_gradient_parallel_to_decoder_directions()
 
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            self.scheduler.step()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+        self.scheduler.step()
         
         return total_loss.item()
 
-    def loss(self, input_acts: dict, target_acts: dict, step=None, logging=False, use_sparse_connections=True):
-        """Modified to handle both sparse and non-sparse modes"""
-        with self._time_function("total_loss"):
-            if use_sparse_connections:
-                # Original sparse connections implementation
-                vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
-                    self.run_forward_vanilla(input_acts, target_acts)
-                )
-                
-                approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
-                
-                approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = (
-                    self.run_forward_approx(approx_inputs, vanilla_feature_acts, target_acts)
-                )
+    def loss(self, input_acts: dict, target_acts: dict, step=None, logging=False):
+        if self.use_sparse_connections:
+            # Original sparse connections implementation
+            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
+                self.run_forward_vanilla(input_acts, target_acts)
+            )
+            
+            approx_inputs = self.get_approx_inputs(input_acts, vanilla_feature_acts)
+            
+            approx_feature_acts, approx_l2_loss, connection_loss, approx_individual_losses = (
+                self.run_forward_approx(approx_inputs, vanilla_feature_acts, target_acts)
+            )
 
-                all_individual_losses = {**vanilla_individual_losses, **approx_individual_losses}
-                total_loss = (vanilla_l2_loss + 
-                            self.auxk_alpha * vanilla_auxk_loss + 
-                            approx_l2_loss + 
-                            self.connection_sparsity_coeff * connection_loss)
-            else:
-                # Simple version without sparse connections
-                vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
-                    self.run_forward_vanilla(input_acts, target_acts)
-                )
-                all_individual_losses = vanilla_individual_losses
-                total_loss = vanilla_l2_loss
+            all_individual_losses = {**vanilla_individual_losses, **approx_individual_losses}
+            total_loss = (vanilla_l2_loss + 
+                        self.auxk_alpha * vanilla_auxk_loss + 
+                        approx_l2_loss + 
+                        self.connection_sparsity_coeff * connection_loss)
+        else:
+            # Simple version without sparse connections
+            vanilla_feature_acts, vanilla_l2_loss, vanilla_auxk_loss, vanilla_individual_losses = (
+                self.run_forward_vanilla(input_acts, target_acts)
+            )
+            all_individual_losses = vanilla_individual_losses
+            total_loss = vanilla_l2_loss
 
         if not logging:
             return total_loss
         else:
-            avg_timings = {
-                name: sum(times) / len(times) 
-                for name, times in self.timings.items()
-            }
-            
             log_dict = {
                 'total_loss': total_loss.item(),
                 'vanilla_l2_loss': vanilla_l2_loss.item(),
                 **all_individual_losses,
                 'effective_l0s': self.effective_l0s,
                 'dead_features': self.dead_features,
-                'timings': avg_timings
             }
             
-            if use_sparse_connections:
+            if self.use_sparse_connections:
                 log_dict.update({
                     'vanilla_auxk_loss': vanilla_auxk_loss.item(),
                     'approx_l2_loss': approx_l2_loss.item(),
