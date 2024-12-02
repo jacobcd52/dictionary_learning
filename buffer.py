@@ -453,64 +453,23 @@ class NNsightActivationBuffer:
 
 
 class AllActivationBuffer:
-    # [Previous __init__ and other methods remain the same until __next__]
-
-    def __next__(self):
-        """
-        Return two dictionaries of activations, one for inputs and one for targets.
-        Each activation tensor has shape [batch, d].
-        """
-        with t.no_grad():
-            # Check if we need to refresh based on number of unread samples
-            n_unread = (~self.read).sum().item()
-            if n_unread < self.out_batch_size:
-                self.refresh()
-
-            # Set seed for reproducible randomness
-            g = t.Generator(device=self.device)
-            g.manual_seed(42)
-            
-            # Get random unread indices using seeded generator
-            unreads = (~self.read).nonzero().squeeze()
-            perm = t.randperm(len(unreads), device=unreads.device, generator=g)
-            idxs = unreads[perm[: self.out_batch_size]]
-            self.read[idxs] = True
-            
-            # Split activations into inputs and targets using dictionaries
-            input_acts = {}
-            target_acts = {}
-            
-            for name in self.submodules.keys():
-                acts = self.activations[name][idxs]  # [batch, 2, d]
-                input_acts[name] = acts[:, 0]  # [batch, d]
-                target_acts[name] = acts[:, 1]  # [batch, d]
-            
-            return input_acts, target_acts
-
-class AllActivationBuffer:
-    """
-    Implements a buffer of activations for multiple submodules. The buffer stores activations from a model,
-    yields them in batches, and refreshes them when the buffer is less than half full.
-    """
-
     def __init__(
-        self,
-        data,  # generator which yields text data
-        model: LanguageModel,  # LanguageModel from which to extract activations
-        submodules,  # dictionary mapping submodule names to (submodule, io) tuples where io is "in"/"out"/"in_and_out"
-        d_submodule=None,  # submodule dimension; if None, try to detect automatically
-        n_ctxs=3e4,  # approximate number of contexts to store in the buffer
-        ctx_len=128,  # length of each context
-        refresh_batch_size=512,  # size of batches in which to process the data when adding to buffer
-        out_batch_size=8192,  # size of batches in which to yield activations
-        device="cpu",  # device on which to store the activations
-    ):
-        # Validate io values
+            self,
+            data,
+            model: LanguageModel,
+            submodules,
+            d_submodule=None,
+            n_ctxs=3e4,
+            ctx_len=128,
+            refresh_batch_size=512,
+            out_batch_size=8192,
+            device="cpu",
+            dtype=t.float32,  # Add dtype parameter
+        ):
         for name, (submodule, io) in submodules.items():
             if io not in ["in", "out", "in_and_out"]:
                 raise ValueError(f"io must be either 'in' or 'out' or 'in_and_out', got {io}")
 
-        # Store the configuration
         self.data = data
         self.model = model
         self.submodules = submodules
@@ -519,17 +478,15 @@ class AllActivationBuffer:
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device
+        self.dtype = dtype
         
-        # Check input type with first element
         try:
             first_item = next(iter(data))
             self.needs_tokenization = isinstance(first_item, str)
-            # Reset iterator by recreating it
             self.data = iter(data)
         except StopIteration:
             raise ValueError("Empty data iterator provided")
         
-        # Detect d_submodule if not provided
         if d_submodule is None:
             d_submodule = {}
             for name, (submodule, io) in submodules.items():
@@ -545,16 +502,12 @@ class AllActivationBuffer:
             
         self.d_submodule = d_submodule
 
-        # Initialize activations dictionary for each submodule
+        # Initialize activations with specified dtype
         self.activations = {}
         for name, (submodule, _) in submodules.items():
-            # Always initialize with shape [batch, 2, d]
-            self.activations[name] = t.empty(0, 2, d_submodule[name], device=device)
+            self.activations[name] = t.empty(0, 2, d_submodule[name], device=device, dtype=dtype)
 
-        # Initialize read flag with proper size
         self.read = t.zeros(0, dtype=t.bool, device=device)
-        
-        # Initial refresh to populate the buffer
         self.refresh()
 
     def process_batch(self, batch, batch_size=None):
@@ -635,7 +588,6 @@ class AllActivationBuffer:
         return states
 
     def refresh(self):
-        """Refresh the buffer with new activations"""
         if len(self.read) > 0:
             for name in self.submodules.keys():
                 self.activations[name] = self.activations[name][~self.read]
@@ -647,44 +599,51 @@ class AllActivationBuffer:
                 hidden_states_dict = {}
                 
                 with t.no_grad():
-                    # First, collect all states in a single forward pass
-                    trace = self.model.trace(tokens)
-                    with trace:
-                        # Save all states first
-                        saved_inputs = {}
-                        saved_outputs = {}
-                        for name, (submodule, _) in self.submodules.items():
-                            saved_inputs[name] = submodule.input.save()
-                            saved_outputs[name] = submodule.output.save()
-                        output = trace.output
+                    # Use autocast for mixed precision if using float16 or bfloat16
+                    if self.dtype in [t.float16, t.bfloat16]:
+                        with t.cuda.amp.autocast(dtype=self.dtype):
+                            trace = self.model.trace(tokens)
+                            with trace:
+                                saved_inputs = {}
+                                saved_outputs = {}
+                                for name, (submodule, _) in self.submodules.items():
+                                    saved_inputs[name] = submodule.input.save()
+                                    saved_outputs[name] = submodule.output.save()
+                                output = trace.output
+                    else:
+                        trace = self.model.trace(tokens)
+                        with trace:
+                            saved_inputs = {}
+                            saved_outputs = {}
+                            for name, (submodule, _) in self.submodules.items():
+                                saved_inputs[name] = submodule.input.save()
+                                saved_outputs[name] = submodule.output.save()
+                            output = trace.output
 
-                    # Then process states
                     for name, (submodule, io) in self.submodules.items():
-                        # Get the raw states
                         raw_in = self._process_states(saved_inputs[name])
                         raw_out = self._process_states(saved_outputs[name])
                         
-                        # Process them consistently
+                        # Convert to specified dtype
+                        raw_in = raw_in.to(dtype=self.dtype)
+                        raw_out = raw_out.to(dtype=self.dtype)
+                        
                         batch_size = raw_in.shape[0]
                         seq_len = raw_in.shape[1]
                         hidden_dim = raw_in.shape[2]
                         
-                        # Reshape to [batch*seq, hidden]
                         flat_in = raw_in.reshape(batch_size * seq_len, hidden_dim)
                         flat_out = raw_out.reshape(batch_size * seq_len, hidden_dim)
                         
                         if io == "in":
-                            # Stack input twice
                             hidden_states = t.stack([flat_in, flat_in], dim=1)
                         elif io == "out":
-                            # Stack output twice
                             hidden_states = t.stack([flat_out, flat_out], dim=1)
-                        elif io == "in_and_out":
-                            # Stack input then output
+                        else:  # io == "in_and_out"
                             hidden_states = t.stack([flat_in, flat_out], dim=1)
                                                 
                         self.activations[name] = t.cat(
-                            [self.activations[name], hidden_states.to(self.device)], 
+                            [self.activations[name], hidden_states.to(device=self.device, dtype=self.dtype)], 
                             dim=0
                         )
 

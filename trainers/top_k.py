@@ -330,42 +330,41 @@ class TrainerSCAE(SAETrainer):
     def __init__(
             self,
             dict_class=AutoEncoderTopK,
-            activation_dims={},  # Dict mapping submodule names to dimensions
-            dict_sizes={},      # Dict mapping submodule names to dictionary sizes
-            ks={},             # Dict mapping submodule names to k values
-            submodules={},      # Dict mapping submodule names to (submodule, io) tuples
-            important_features = {},
-            pretrained_info=None,  # Dict mapping submodule names to HF repo/filename info
-            model_config=None,     # Required if using pretrained_info
+            activation_dims={},
+            dict_sizes={},
+            ks={},
+            submodules={},
+            important_features={},
+            pretrained_info=None,
+            model_config=None,
             auxk_alpha=0,
             connection_sparsity_coeff=0,
-            use_sparse_connections=True,  # Added this parameter
+            use_sparse_connections=True,
             decay_start=24000,
             steps=30000,
             seed=None,
             device=None,
             wandb_name="SCAE",
+            dtype=t.float32,  # Add dtype parameter
         ):
         super().__init__(seed)
         
-        # Validate inputs
+        # Store dtype
+        self.dtype = dtype
+        
         assert set(activation_dims.keys()) == set(dict_sizes.keys()) == set(ks.keys()) == set(submodules.keys())
         self.submodule_names = list(submodules.keys())
         self.submodules = submodules
         self.n_autoencoders = len(submodules)
-        self.use_sparse_connections = use_sparse_connections  # Store the parameter
+        self.use_sparse_connections = use_sparse_connections
 
-        # Validate pretrained info if provided
         if pretrained_info is not None:
             assert model_config is not None, "model_config must be provided when using pretrained SAEs"
             expected_modules = set()
             for layer in range(model_config.n_layer):
                 expected_modules.add(f"mlp_{layer}")
                 expected_modules.add(f"attn_{layer}")
-            assert set(pretrained_info.keys()) == expected_modules, (
-                "When using pretrained SAEs, must provide info for all MLPs and attention layers. "
-                f"Expected modules: {expected_modules}, got: {set(pretrained_info.keys())}"
-            )
+            assert set(pretrained_info.keys()) == expected_modules
 
         self.wandb_name = wandb_name
         self.steps = steps
@@ -375,23 +374,23 @@ class TrainerSCAE(SAETrainer):
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
 
-        # Initialize autoencoders as a ModuleDict
-        self.aes = t.nn.ModuleDict()
-        
+        # Initialize autoencoders with specified dtype
         if pretrained_info is not None:
-            # Load pretrained SAEs
+            self.aes = t.nn.ModuleDict()
             for name in self.submodule_names:
                 repo_info = pretrained_info[name]
-                self.aes[name] = self._load_pretrained_sae(
+                ae = self._load_pretrained_sae(
                     repo_info,
                     activation_dims[name],
                     dict_sizes[name],
                     ks[name]
                 )
+                # Convert pretrained SAE to specified dtype
+                ae = ae.to(dtype=self.dtype)
+                self.aes[name] = ae
         else:
-            # Initialize new SAEs
             self.aes = t.nn.ModuleDict({
-                name: dict_class(activation_dims[name], dict_sizes[name], ks[name])
+                name: dict_class(activation_dims[name], dict_sizes[name], ks[name]).to(dtype=self.dtype)
                 for name in self.submodule_names
             })
         
@@ -402,26 +401,24 @@ class TrainerSCAE(SAETrainer):
             
         self.aes.to(self.device)
         
-        # Move important_features to the correct device
+        # Move important_features to correct device and dtype
         self.important_features = {
-            name: features.to(self.device) 
+            name: features.to(device=self.device, dtype=self.dtype)
             for name, features in important_features.items()
         }
         
-        # Precompute important decoder weights
+        # Precompute important decoder weights (will inherit dtype from self.aes)
         self.important_decoders = {}
         for name, features in self.important_features.items():
             if name.startswith('mlp'):
-                decoder = self.aes[name].decoder.weight  # [activation_dim, num_features]
-                self.important_decoders[name] = decoder  # [activation_dim, num_features]
+                decoder = self.aes[name].decoder.weight
+                self.important_decoders[name] = decoder
 
-        # Auto-select LRs using 1/sqrt(d) scaling law
         self.lrs = {name: 2e-4 / (size / 2**14)**0.5 for name, size in dict_sizes.items()}
         self.auxk_alpha = auxk_alpha
         self.connection_sparsity_coeff = connection_sparsity_coeff
         self.dead_feature_threshold = 10_000_000
 
-        # Optimizer and scheduler
         self.optimizer = t.optim.Adam([
             {'params': ae.parameters(), 'lr': self.lrs[name]}
             for name, ae in self.aes.items()
@@ -435,13 +432,12 @@ class TrainerSCAE(SAETrainer):
 
         self.scheduler = t.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_fn)
 
-        # Training parameters for each autoencoder
+        # Training parameters (keep as long dtype for counting)
         self.num_tokens_since_fired = {
             name: t.zeros(size, dtype=t.long, device=device)
             for name, size in dict_sizes.items()
         }
 
-        # Logging parameters
         self.logging_parameters = ["effective_l0s", "dead_features"]
         self.effective_l0s = {name: -1 for name in self.submodule_names}
         self.dead_features = {name: -1 for name in self.submodule_names}

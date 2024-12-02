@@ -175,9 +175,12 @@ def trainSCAE(
     save_dir=None,
     log_steps=None,
     use_wandb=False,
-    hf_repo_id=None,  # New parameter for HuggingFace repo ID
+    hf_repo_id=None,
+    dtype=t.float32,  # Add dtype parameter
 ):
-    # Convert lists to dictionaries if necessary
+    # Add dtype to config
+    trainer_cfg['dtype'] = dtype
+    
     if isinstance(trainer_cfg.get("submodules", []), list):
         submodule_names = trainer_cfg["submodule_names"]
         trainer_cfg["submodules"] = {
@@ -185,21 +188,17 @@ def trainSCAE(
             for name, (module, io_type) in zip(submodule_names, trainer_cfg["submodules"])
         }
 
-    # Ensure all dictionary keys match
     required_keys = ["activation_dims", "dict_sizes", "ks", "submodules"]
     dicts = {key: trainer_cfg.get(key, {}) for key in required_keys}
 
-    # Validate all keys are the same
     all_keys = set(dicts["submodules"].keys())
     for key, d in dicts.items():
         if set(d.keys()) != all_keys:
             raise ValueError(f"Mismatched keys in {key}. Expected {all_keys}, got {set(d.keys())}")
 
-    # Initialize trainer
     trainer_class = trainer_cfg.pop("trainer")
     trainer = trainer_class(**trainer_cfg)
 
-    # Create save directory if needed
     if save_dir is not None:
         os.makedirs(save_dir, exist_ok=True)
         simple_config = {
@@ -211,6 +210,7 @@ def trainSCAE(
             "submodule_names": list(trainer_cfg["submodules"].keys()),
             "connection_sparsity_coeff": trainer_cfg.get("connection_sparsity_coeff", 0),
             "use_sparse_connections": trainer_cfg.get("use_sparse_connections", True),
+            "dtype": str(dtype),  # Add dtype to saved config
             "buffer_config": {
                 "ctx_len": buffer.ctx_len,
                 "refresh_batch_size": buffer.refresh_batch_size,
@@ -220,7 +220,6 @@ def trainSCAE(
         with open(os.path.join(save_dir, "config.json"), "w") as f:
             json.dump(simple_config, f, indent=4)
 
-    # Initialize wandb if requested
     if use_wandb:
         import wandb
         wandb.init(
@@ -228,17 +227,14 @@ def trainSCAE(
             config=simple_config,
         )
 
-    # Training loop
     pbar = tqdm(buffer, total=steps) if steps is not None else tqdm(buffer)
     for step, (input_acts, target_acts) in enumerate(pbar):
         if steps is not None and step >= steps:
             break
-                
-        # Log statistics
+
         if log_steps is not None and step % log_steps == 0:
             loss_log = trainer.loss(input_acts, target_acts, step=step, logging=True)
             
-            # Create log dictionary
             log_dict = {}
             for key, value in loss_log.items():
                 if isinstance(value, dict):
@@ -250,10 +246,8 @@ def trainSCAE(
             if use_wandb:
                 wandb.log(log_dict, step=step)
             
-            # Update progress bar
             pbar.set_description(f"Loss: {log_dict.get('total_loss', 0):.4f}")
         
-        # Save checkpoint
         if save_steps is not None and step % save_steps == 0 and save_dir is not None:
             checkpoint_dir = os.path.join(save_dir, f"step_{step}")
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -264,10 +258,8 @@ def trainSCAE(
                     os.path.join(checkpoint_dir, f"ae_{name}.pt")
                 )
         
-        # Training step
         loss = trainer.update(step, input_acts, target_acts)
 
-    # Save final models
     if save_dir is not None:
         final_dir = os.path.join(save_dir, "final")
         os.makedirs(final_dir, exist_ok=True)

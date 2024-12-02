@@ -10,6 +10,7 @@ from nnsight import LanguageModel
 from huggingface_hub import login
 login("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")
 
+
 #%%
 device = "cuda:0" if t.cuda.is_available() else "cpu"
 model = LanguageModel("gpt2", device_map=device)
@@ -38,11 +39,11 @@ data = CustomData(dataset)
 
 #%%
 C = 10
-expansion = 8
+expansion = 16
 k = 128 # TODO
 
-out_batch_size = 1024
-num_tokens = int(2e8)
+out_batch_size = 4096
+num_tokens = int(1e8)
 
 num_features = model.config.n_embd * expansion
 n_layer = model.config.n_layer
@@ -61,7 +62,7 @@ buffer = AllActivationBuffer(
     model=model,
     submodules=submodules,
     d_submodule=model.config.n_embd, # output dimension of the model component
-    n_ctxs=10_000,  # you can set this higher or lower depending on your available memory
+    n_ctxs=1024,  # you can set this higher or lower depending on your available memory
     device="cuda",
     out_batch_size = out_batch_size,
     refresh_batch_size = 256,
@@ -69,8 +70,7 @@ buffer = AllActivationBuffer(
 
 
 #%%
-important_features = {f"mlp_{layer}": t.randint(0, num_features, (num_features, C))
-                        for layer in range(n_layer)}
+important_features = {} #{f"mlp_{layer}": t.randint(0, num_features, (num_features, C)) for layer in range(n_layer)}
 
 #%%
 
@@ -85,6 +85,7 @@ trainer_cfg = {
     "important_features": important_features,
     "connection_sparsity_coeff": 0.01,
     "use_sparse_connections": False,
+    "dtype": t.bfloat16
 }
 
 # Run the training
@@ -98,6 +99,5 @@ trainer = trainSCAE(
     use_wandb=True,  # Set to False if you don't want to use wandb
     hf_repo_id="jacobcd52/scae"
 )
-
 
 # %%
