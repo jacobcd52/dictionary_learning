@@ -205,6 +205,7 @@ def trainSCAE(
             "activation_dims": trainer_cfg["activation_dims"],
             "dict_sizes": trainer_cfg["dict_sizes"],
             "ks": trainer_cfg["ks"],
+            "auxk_alpha": trainer_cfg.get("auxk_alpha", 0),
             "layers": trainer_cfg.get("layers", []),
             "lm_name": trainer_cfg.get("lm_name", ""),
             "submodule_names": list(trainer_cfg["submodules"].keys()),

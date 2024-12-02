@@ -335,7 +335,7 @@ class TrainerSCAE(SAETrainer):
             ks={},
             submodules={},
             important_features={},
-            pretrained_info=None,
+            pretrained_info=None, # e.g. pretrained_info = { 'mlp_0': {'repo_id': 'jacobcd52/scae','filename': 'ae_mlp_0.pt'} , ... }
             model_config=None,
             auxk_alpha=0,
             connection_sparsity_coeff=0,
@@ -695,6 +695,79 @@ class TrainerSCAE(SAETrainer):
                 })
                 
             return log_dict
+        
+
+    def _load_pretrained_sae(self, repo_info, activation_dim, dict_size, k):
+        """
+        Load a pretrained Sparse Autoencoder from a Hugging Face repository.
+        
+        Args:
+            repo_info (dict): Dictionary containing:
+                - repo_id (str): Hugging Face repo ID (e.g. "organization/repo-name")
+                - filename (str): Name of the .pt file containing the SAE weights
+            activation_dim (int): Expected dimension of the activation space
+            dict_size (int): Expected size of the learned dictionary
+            k (int): Number of features to use for reconstruction
+            
+        Returns:
+            AutoEncoderTopK: Loaded autoencoder with pretrained weights
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise ImportError(
+                "The huggingface_hub package is required to load pretrained SAEs. "
+                "Please install it with `pip install huggingface_hub`."
+            )
+        
+        # Validate repo_info format
+        if not isinstance(repo_info, dict) or 'repo_id' not in repo_info or 'filename' not in repo_info:
+            raise ValueError(
+                "repo_info must be a dictionary containing 'repo_id' and 'filename' keys. "
+                f"Got: {repo_info}"
+            )
+        
+        # Download the weights file from Hugging Face
+        try:
+            weights_path = hf_hub_download(
+                repo_id=repo_info['repo_id'],
+                filename=repo_info['filename'],
+                repo_type="model"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download weights from Hugging Face repo {repo_info['repo_id']}: {str(e)}"
+            )
+        
+        # Load the state dict
+        try:
+            state_dict = t.load(weights_path, map_location='cpu')
+        except Exception as e:
+            raise RuntimeError(f"Failed to load weights file {weights_path}: {str(e)}")
+        
+        # Validate the loaded weights
+        expected_shapes = {
+            'encoder.weight': (dict_size, activation_dim),
+            'decoder.weight': (activation_dim, dict_size),
+            'b_dec': (activation_dim,)
+        }
+        
+        for key, expected_shape in expected_shapes.items():
+            if key not in state_dict:
+                raise ValueError(f"Missing key {key} in loaded state dict")
+            if state_dict[key].shape != expected_shape:
+                raise ValueError(
+                    f"Shape mismatch for {key}. "
+                    f"Expected {expected_shape}, got {state_dict[key].shape}"
+                )
+        
+        # Initialize a new autoencoder with the correct dimensions
+        ae = AutoEncoderTopK(activation_dim, dict_size, k)
+        
+        # Load the weights
+        ae.load_state_dict(state_dict)
+        
+        return ae
 
     @property
     def config(self):

@@ -62,7 +62,7 @@ buffer = AllActivationBuffer(
     model=model,
     submodules=submodules,
     d_submodule=model.config.n_embd, # output dimension of the model component
-    n_ctxs=1024,  # you can set this higher or lower depending on your available memory
+    n_ctxs=2048,  # you can set this higher or lower depending on your available memory
     device="cuda",
     out_batch_size = out_batch_size,
     refresh_batch_size = 256,
@@ -99,5 +99,4 @@ trainer = trainSCAE(
     use_wandb=True,  # Set to False if you don't want to use wandb
     hf_repo_id="jacobcd52/scae"
 )
-
 # %%

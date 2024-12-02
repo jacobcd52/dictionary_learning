@@ -59,6 +59,7 @@ def loss_recovered(
         x = x.save()
 
     # pull this out so dictionary can be written without FakeTensor (top_k needs this)
+    # TODO: add option to run approx forward pass, for SCAE.
     x_hat = dictionary(x.view(-1, x.shape[-1])).view(x.shape).to(model.dtype)
 
     # intervene with `x_hat`
