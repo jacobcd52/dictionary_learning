@@ -441,36 +441,42 @@ class TrainerSCAE(SAETrainer):
         self.effective_l0s = {name: -1 for name in self.submodule_names}
         self.dead_features = {name: -1 for name in self.submodule_names}
 
-    def get_approx_input(self, name, x, feature_acts, batch_size):
+    def get_approx_input(self, name, input_acts, vanilla_feature_acts):
         """Compute approximated input for a single autoencoder."""
-        if not name.startswith('mlp'):
-            return x
+        if name.startswith('attn'):
+            # Currently we don't approximate the attention input
+            return einops.repeat(input_acts, "... d -> ... f d", f=self.vanilla_feature_acts.shape[-2])
+        
+        elif name.startswith('mlp'):
+            current_layer = int(name.split('_')[1])
+            approx_input = t.zeros_like(input_acts)
+            
+            for upstream_name, upstream_features in self.important_features.items():                  
+                upstream_layer = int(upstream_name.split('_')[1])
+                if upstream_layer >= current_layer:
+                    continue
+                
+                upstream_acts = vanilla_feature_acts[upstream_name]
+                decoder = self.important_decoders[upstream_name]
 
-        current_layer = int(name.split('_')[1])
-        approx_input = t.zeros_like(x)
-        
-        for upstream_name, upstream_features in self.important_features.items():
-            if not upstream_name.startswith('mlp'):
-                continue
-                    
-            upstream_layer = int(upstream_name.split('_')[1])
-            if upstream_layer >= current_layer:
-                continue
+                print("upstream_acts", upstream_acts.shape)
+                print("upstream_features", upstream_features.shape)
+                
+                chunk_size = 2048  # TODO: make this a parameter
+                num_groups = upstream_features.shape[0]
+                
+                for chunk_start in range(0, num_groups, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, num_groups)
+                    chunk_features = upstream_features[chunk_start:chunk_end]
+                    chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
+                    chunk_decoder = decoder[:, chunk_features[:, 0]]
+                    approx_input += t.matmul(chunk_acts, chunk_decoder.t())
+                    print("chunk_acts", chunk_acts.shape)
+                    print("chunk_decoder", chunk_decoder.shape)
+                    print("chunk_decoder.t()", chunk_decoder.t().shape)
+                    print("chunk_features", chunk_features.shape)
             
-            upstream_acts = feature_acts[upstream_name]
-            decoder = self.important_decoders[upstream_name]
-            
-            chunk_size = 2048
-            num_groups = upstream_features.shape[0]
-            
-            for chunk_start in range(0, num_groups, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, num_groups)
-                chunk_features = upstream_features[chunk_start:chunk_end]
-                chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
-                chunk_decoder = decoder[:, chunk_features[:, 0]]
-                approx_input += t.matmul(chunk_acts, chunk_decoder.t())
-        
-        return approx_input
+            return approx_input
 
     def update(self, step, input_acts: dict, target_acts: dict):
         if step == 0:
@@ -576,7 +582,7 @@ class TrainerSCAE(SAETrainer):
         
         return total_loss.item()
         
-    def evaluate_varexp(
+    def evaluate_varexp_batch(
         self,
         input_acts: dict,
         target_acts: dict,
@@ -594,19 +600,7 @@ class TrainerSCAE(SAETrainer):
         target_acts = {name: x.to(device) for name, x in target_acts.items()}
         
         with t.no_grad():
-            metrics = {
-                'submodule_metrics': {},
-                'total_metrics': {
-                    'l2_loss': 0.0,
-                    'l1_loss': 0.0,
-                    'l0': 0.0,
-                    'frac_alive': 0.0,
-                    'frac_variance_explained': 0.0,
-                    'cossim': 0.0,
-                    'l2_ratio': 0.0,
-                    'relative_reconstruction_bias': 0.0
-                }
-            }
+            metrics = {}
 
             # First get vanilla features
             feature_acts = {}
@@ -660,7 +654,7 @@ class TrainerSCAE(SAETrainer):
                 x_dot_x_hat = (tgt * x_hat).sum(dim=-1)
                 relative_reconstruction_bias = x_hat_norm_squared.mean() / x_dot_x_hat.mean()
                 
-                metrics['submodule_metrics'][name] = {
+                metrics[name] = {
                     'l2_loss': l2_loss.item(),
                     'l1_loss': l1_loss.item(),
                     'l0': l0.item(),
@@ -670,20 +664,10 @@ class TrainerSCAE(SAETrainer):
                     'l2_ratio': l2_ratio.item(),
                     'relative_reconstruction_bias': relative_reconstruction_bias.item()
                 }
-                
-                for metric_name in metrics['total_metrics'].keys():
-                    metrics['total_metrics'][metric_name] += metrics['submodule_metrics'][name][metric_name]
-
-            # Average metrics
-            num_submodules = len(self.submodule_names)
-            metrics['total_metrics'] = {
-                k: v / num_submodules 
-                for k, v in metrics['total_metrics'].items()
-            }
             
             return metrics
 
-    def evaluate_patched_ce(
+    def evaluate_ce_batch(
             self,
             model,
             text,
@@ -693,108 +677,176 @@ class TrainerSCAE(SAETrainer):
             device: str = None,
             tracer_args={'use_cache': False, 'output_attentions': False}
         ) -> dict:
-            if max_len is None:
-                invoker_args = {}
+        """
+        Evaluate cross entropy loss when patching in reconstructed activations for all submodules.
+        Returns per-submodule statistics.
+        """
+        if device is None:
+            device = self.device
+        if use_sparse_connections is None:
+            use_sparse_connections = self.use_sparse_connections
+
+        if max_len is None:
+            invoker_args = {}
+        else:
+            invoker_args = {"truncation": True, "max_length": max_len}
+
+        # First get unmodified logits
+        with model.trace(text, invoker_args=invoker_args):
+            logits_original = model.output.save()
+        logits_original = logits_original.value
+
+        # Get all activations in one pass
+        saved_activations = {}
+        with model.trace(text, **tracer_args, invoker_args=invoker_args):
+            for name, (submodule, io) in self.submodules.items():
+                if io in ['in', 'in_and_out']:
+                    x = submodule.input
+                elif io == 'out':
+                    x = submodule.output
+                else:
+                    raise ValueError(f"Invalid value for io: {io}")
+                
+                if normalize_batch:
+                    scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
+                    x = x * scale
+                
+                saved_activations[name] = {
+                    'x': x.save(),
+                    'io': io,
+                    'scale': scale if normalize_batch else 1.0
+                }
+
+        # Handle tuples outside trace context
+        for name, saved in saved_activations.items():
+            if type(saved['x'].value) == tuple:
+                saved['x'] = saved['x'].value[0]
+            saved_activations[name] = saved
+
+        # If using sparse connections, first get vanilla features
+        vanilla_feature_acts = {}
+        if use_sparse_connections:
+            for name, saved in saved_activations.items():
+                x = saved['x'].to(device)
+                f, _, _ = self.aes[name].encode(x.view(-1, x.shape[-1]), return_topk=True)
+                vanilla_feature_acts[name] = f.view(x.shape[:-1] + (-1,))
+
+        # Get reconstructions
+        reconstructions = {}
+        for name, saved in saved_activations.items():
+            x = saved['x'].to(device)
+            
+            if use_sparse_connections:
+                # Get approximated input using vanilla features
+                approx_x = self.get_approx_input(name, x, vanilla_feature_acts, x.size(0))
+                f, _, _ = self.aes[name].encode(approx_x, return_topk=True, use_sparse_connections=True)
+                x_hat = self.aes[name].decode(f)
             else:
-                invoker_args = {"truncation": True, "max_length": max_len}
+                x_hat = self.aes[name](x.view(-1, x.shape[-1])).view(x.shape)
+            
+            if normalize_batch:
+                x_hat = x_hat / saved['scale']
+            
+            reconstructions[name] = x_hat.to(model.dtype)
 
-            # Initialize dictionaries
-            feature_acts = {}
-            saved_acts = {}
-            reconstructions = {}  # For demonstration only in this debug version
+        # Format logits consistently
+        try:
+            logits_original = logits_original.logits
+        except:
+            pass
 
-            with t.no_grad():
-                print("\n=== First Trace ===")
+        # Get tokens for loss computation
+        if isinstance(text, t.Tensor):
+            tokens = text
+        else:
+            try:
                 with model.trace(text, **tracer_args, invoker_args=invoker_args):
-                    print("Inside trace - before saving:")
-                    print(f"model.output type: {type(model.output)}")
-                    
-                    logits_original = model.output.save()
-                    print("\nSaved full output")
-                    
-                    for name, (submod, io) in self.submodules.items():
-                        print(f"\nProcessing module {name} with io {io}")
-                        if io == 'in':
-                            saved_acts[name] = submod.input[0].save()
-                        elif io == 'out':
-                            saved_acts[name] = submod.output.save()
-                        elif io == 'in_and_out':
-                            saved_acts[name] = submod.input[0].save()
-                
-                print("\nCreating dummy reconstructions...")
-                for name in saved_acts:
-                    x = saved_acts[name].value
-                    if isinstance(x, tuple):
-                        x = x[0]
-                    reconstructions[name] = t.zeros_like(x)
-                
-                print("\n=== Reconstruction Trace ===")
-                # intervene with x_hat
-                with model.trace(text, **tracer_args, invoker_args=invoker_args):
-                    for name, (submod, io) in self.submodules.items():
-                        x_hat = reconstructions[name]
-                        print(f"\nProcessing {name} with io={io}")
-                        
-                        if io == 'in':
-                            x = submod.input[0]
-                            print(f"Input x type: {type(x)}")
-                            x_saved = x.save()
-                            x = x_saved.value
-                            print(f"Input value type: {type(x)}")
-                            
-                            if normalize_batch:
-                                scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
-                                x_hat = x_hat / scale
-                                
-                            if type(x) == tuple:
-                                print("Setting input with [:]")
-                                submod.input[0][:] = x_hat
-                            else:
-                                print("Setting input directly")
-                                submod.input = x_hat
-                                
-                        elif io == 'out':
-                            x = submod.output
-                            print(f"Output x type: {type(x)}")
-                            x_saved = x.save()
-                            x = x_saved.value
-                            print(f"Output value type: {type(x)}")
-                            
-                            if normalize_batch:
-                                scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
-                                x_hat = x_hat / scale
-                                
-                            if type(x) == tuple:
-                                print("Setting output as tuple")
-                                submod.output = (x_hat,)
-                            else:
-                                print("Setting output directly")
-                                submod.output = x_hat
-                                
-                        elif io == 'in_and_out':
-                            x = submod.input[0]
-                            print(f"Input x type: {type(x)}")
-                            x_saved = x.save()
-                            x = x_saved.value
-                            print(f"Input value type: {type(x)}")
-                            
-                            if normalize_batch:
-                                scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
-                                x_hat = x_hat / scale
-                                
-                            print("Setting output directly")
-                            submod.output = x_hat
-                            
-                        else:
-                            raise ValueError(f"Invalid value for io: {io}")
-                    
-                    print("\nSaving reconstructed output")
-                    logits_reconstructed = model.output.save()
-                
-                print("\nOutside reconstruction trace:")
-                print(f"logits_reconstructed.value type: {type(logits_reconstructed.value)}")
+                    input = model.input.save()
+                tokens = input.value[1]['input_ids']
+            except:
+                tokens = input.value[1]['input']
 
-                return {}
+        # Set up loss function
+        if hasattr(model, 'tokenizer') and model.tokenizer is not None:
+            loss_kwargs = {'ignore_index': model.tokenizer.pad_token_id}
+        else:
+            loss_kwargs = {}
+
+        # Compute original loss once
+        loss_original = t.nn.CrossEntropyLoss(**loss_kwargs)(
+            logits_original[:, :-1, :].reshape(-1, logits_original.shape[-1]),
+            tokens[:, 1:].reshape(-1)
+        ).item()
+
+        # Compute per-submodule metrics
+        results = {}
+
+        for name, (submodule, io) in self.submodules.items():
+            # Run model with just this reconstruction patched in
+            with model.trace(text, **tracer_args, invoker_args=invoker_args):
+                x_hat = reconstructions[name]
+                submodule.input = x_hat
+                
+                if io in ['out', 'in_and_out']:
+                    if "attn" in name:
+                        submodule.output = (x_hat,)
+                    elif "mlp" in name:
+                        submodule.output = x_hat
+                    else:
+                        raise ValueError(f"Invalid submodule name: {name}")
+                elif io == 'in':
+                    submodule.input = x_hat
+                
+                logits_reconstructed = model.output.save()
+            
+            # Run model with just this submodule zeroed
+            with model.trace(text, **tracer_args, invoker_args=invoker_args):
+                if io in ['in', 'in_and_out']:
+                    x = submodule.input
+                    submodule.input = t.zeros_like(x)
+                if io in ['out', 'in_and_out']:
+                    x = submodule.output
+                    if "attn" in name:
+                        submodule.output = (t.zeros_like(x[0]),)
+                    elif "mlp" in name:
+                        submodule.output = t.zeros_like(x)
+                    else:
+                        raise ValueError(f"Invalid submodule name: {name}")
+
+                logits_zero = model.output.save()
+
+            # Format logits
+            try:
+                logits_reconstructed = logits_reconstructed.value.logits
+                logits_zero = logits_zero.value.logits
+            except:
+                logits_reconstructed = logits_reconstructed.value
+                logits_zero = logits_zero.value
+
+            # Compute losses for this submodule
+            loss_reconstructed = t.nn.CrossEntropyLoss(**loss_kwargs)(
+                logits_reconstructed[:, :-1, :].reshape(-1, logits_reconstructed.shape[-1]),
+                tokens[:, 1:].reshape(-1)
+            ).item()
+            
+            loss_zero = t.nn.CrossEntropyLoss(**loss_kwargs)(
+                logits_zero[:, :-1, :].reshape(-1, logits_zero.shape[-1]),
+                tokens[:, 1:].reshape(-1)
+            ).item()
+
+            if loss_original - loss_zero != 0:
+                frac_recovered = (loss_reconstructed - loss_zero) / (loss_original - loss_zero)
+            else:
+                frac_recovered = 0.0
+            
+            results[name] = {
+                'loss_original': loss_original,
+                'loss_reconstructed': loss_reconstructed,
+                'loss_zero': loss_zero,
+                'frac_recovered': frac_recovered
+            }
+
+        return results
         
         
     def _load_pretrained_sae(self, repo_info, activation_dim, dict_size, k):
