@@ -75,7 +75,6 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         if use_sparse_connections:
             # split forward pass per feature
             # x has shape [batch, feature, d]
-            print("x", x.shape)
             assert x.shape[-2] == self.dict_size
             preact_BF = einops.einsum(
                 x - self.b_dec,
@@ -401,18 +400,12 @@ class TrainerSCAE(SAETrainer):
         self.aes.to(self.device)
         
         # Move important_features to correct device and dtype
+        move_dict_to_device = lambda d: {k: v.to(device=self.device, dtype=t.long) for k, v in d.items()}
         self.important_features = {
-            down_name: {up_name : features.to(device=self.device, dtype=self.dtype)
-                        for up_name, features in important_features.items()}
-            for down_name, # TODO
+            down_name: move_dict_to_device(important_features[down_name])
+            for down_name in important_features.keys()
         }
         
-        # Precompute important decoder weights
-        self.important_decoders = {}
-        for name, features in self.important_features.items():
-            if name.startswith('mlp'):
-                decoder = self.aes[name].decoder.weight
-                self.important_decoders[name] = decoder
 
         self.lrs = {name: 2e-4 / (size / 2**14)**0.5 for name, size in dict_sizes.items()}
         self.auxk_alpha = auxk_alpha
@@ -444,42 +437,52 @@ class TrainerSCAE(SAETrainer):
 
     def get_approx_input(self, name, input_acts, vanilla_feature_acts):
         """Compute approximated input for a single autoencoder."""
-        print(vanilla_feature_acts[name].shape)
         input_acts_rep = einops.repeat(input_acts, "... d -> ... f d", f=vanilla_feature_acts[name].shape[-1])
-        print(input_acts_rep.shape)
         if name.startswith('attn'):
             # Currently we don't approximate the attention input
             return input_acts_rep
         
         elif name.startswith('mlp'):
-            print("blah")
             current_layer = int(name.split('_')[1])
-            approx_input = t.zeros_like(input_acts_rep)
+            approx_input = t.zeros_like(input_acts_rep) # shape [batch, f_down, d]
             
-            for upstream_name, upstream_features in self.important_features.items():                  
-                upstream_layer = int(upstream_name.split('_')[1])
-                if upstream_layer >= current_layer:
+            for up_name, up_feature_ids in self.important_features[name].items():   
+                # upstream_feature_ids has shape [f_down, C]               
+                upstream_layer = int(up_name.split('_')[1])
+                
+                if upstream_layer >= current_layer: # TODO attn -> mlp same layer
                     continue
-                
-                upstream_acts = vanilla_feature_acts[upstream_name]
-                decoder = self.important_decoders[upstream_name]
 
-                print("upstream_acts", upstream_acts.shape)
-                print("upstream_features", upstream_features.shape)
+                print("up_name", up_name, "current_name", name)
+                up_feature_acts = vanilla_feature_acts[up_name] # shape [batch, f_up]
+                decoder = self.important_decoders[up_name] # shape [f_down, C, d]
                 
-                chunk_size = 4  # TODO: make this a parameter
-                num_groups = upstream_features.shape[0]
+                chunk_size = 4096  # TODO: make this a parameter
+                num_groups = up_feature_ids.shape[0]
                 
+                # chunk the downstream feature IDs to reduce memory usage
                 for chunk_start in range(0, num_groups, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, num_groups)
-                    chunk_features = upstream_features[chunk_start:chunk_end]
-                    chunk_acts = upstream_acts[:, chunk_features].sum(dim=-1)
-                    chunk_decoder = decoder[:, chunk_features[:, 0]]
-                    approx_input += t.matmul(chunk_acts, chunk_decoder.t())
-                    print("chunk_acts", chunk_acts.shape)
-                    print("chunk_decoder", chunk_decoder.shape)
-                    print("chunk_decoder.t()", chunk_decoder.t().shape)
-                    print("chunk_features", chunk_features.shape)
+                    up_feature_ids_chunk = up_feature_ids[chunk_start:chunk_end] # shape [chunk_size, C]
+                    expanded_indices = up_feature_ids_chunk.unsqueeze(0).expand(up_feature_acts.shape[0], -1, -1)
+                    up_feature_acts_chunk = t.gather(up_feature_acts.unsqueeze(1).expand(-1, up_feature_ids_chunk.shape[0], -1), 
+                                        dim=2, 
+                                        index=expanded_indices) # shape [batch, chunk_size, C]
+                    decoder_chunk = decoder[chunk_start:chunk_end] # shape [chunk_size, C, d]
+
+                    print("1")
+                    approx_input_chunk = einops.einsum(
+                        up_feature_acts_chunk,
+                        decoder_chunk,
+                        "batch chunk C, chunk C d -> batch chunk d"
+                        )
+                    print("2")
+                    approx_input = approx_input.clone()
+                    print("3")
+                    approx_input[:, chunk_start:chunk_end] = approx_input[:, chunk_start:chunk_end] + approx_input_chunk
+                    print("4")
+                    
+
         else:
             raise ValueError(f"Invalid submodule name: {name}")
             
@@ -493,6 +496,22 @@ class TrainerSCAE(SAETrainer):
 
         for ae in self.aes.values():
             ae.set_decoder_norm_to_unit_norm()
+
+        # Precompute important decoder weights
+        self.important_decoders = {}
+        for down_name, features in self.important_features.items():
+            if down_name.startswith('mlp'):
+                for up_name, up_features in self.important_features[down_name].items():
+                    # up_features has shape [f_down, C]
+                    f_down, C = up_features.shape
+                    up_full_decoder = self.aes[up_name].decoder.weight # shape [d, f_up]
+                    d, f_up = up_full_decoder.shape
+                    up_features_expanded = up_features.unsqueeze(-1)
+                    up_full_decoder_expanded = up_full_decoder.unsqueeze(0).unsqueeze(0)
+                    result = t.gather(up_full_decoder_expanded.expand(f_down, C, -1, -1), 
+                                        dim=-1,
+                                        index=up_features_expanded.unsqueeze(-2).expand(-1, -1, d, -1))
+                    self.important_decoders[up_name] = result.squeeze(-1) # shape [f_down, C, d]
 
         input_acts = {name: x.to(self.device) for name, x in input_acts.items()}
         target_acts = {name: x.to(self.device) for name, x in target_acts.items()}
@@ -546,6 +565,7 @@ class TrainerSCAE(SAETrainer):
 
             # Vanilla backward pass
             total_loss_ae = l2_loss + self.auxk_alpha * auxk_loss
+            print("calling backward on vanilla FP, name=", name)
             total_loss_ae.backward()
             
             # Process gradients before next forward pass
@@ -563,7 +583,6 @@ class TrainerSCAE(SAETrainer):
                 
                 # Get approximated input
                 approx_x = self.get_approx_input(name, x, feature_acts)
-                print("approx_x ", approx_x.shape)
                 
                 # Approx forward pass
                 f_approx, _, _ = ae.encode(approx_x, return_topk=True, use_sparse_connections=True)
@@ -576,6 +595,7 @@ class TrainerSCAE(SAETrainer):
                 
                 # Approx backward pass
                 total_loss_ae = l2_loss + self.connection_sparsity_coeff * connection_loss
+                print("calling backward on approx FP, name=", name)
                 total_loss_ae.backward()
                 
                 # Process gradients
