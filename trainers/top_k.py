@@ -436,57 +436,68 @@ class TrainerSCAE(SAETrainer):
         self.dead_features = {name: -1 for name in self.submodule_names}
 
     def get_approx_input(self, name, input_acts, vanilla_feature_acts):
-        """Compute approximated input for a single autoencoder."""
-        input_acts_rep = einops.repeat(input_acts, "... d -> ... f d", f=vanilla_feature_acts[name].shape[-1])
+        """Compute approximated input for a single autoencoder with optimized memory usage."""
         if name.startswith('attn'):
             # Currently we don't approximate the attention input
-            return input_acts_rep
+            input_acts_rep = einops.repeat(input_acts, "... d -> ... f d", f=vanilla_feature_acts[name].shape[-1])
+            return input_acts_rep #.detach()
         
         elif name.startswith('mlp'):
             current_layer = int(name.split('_')[1])
-            approx_input = t.zeros_like(input_acts_rep) # shape [batch, f_down, d]
+            batch_size = input_acts.shape[0]
+            feat_dim = vanilla_feature_acts[name].shape[-1]
+            d_model = input_acts.shape[-1]
             
-            for up_name, up_feature_ids in self.important_features[name].items():   
-                # upstream_feature_ids has shape [f_down, C]               
+            # Initialize output tensor without requiring gradients initially
+            approx_input = t.zeros((batch_size, feat_dim, d_model), 
+                                device=input_acts.device, 
+                                dtype=input_acts.dtype)
+            
+            for up_name, up_feature_ids in self.important_features[name].items():               
                 upstream_layer = int(up_name.split('_')[1])
                 
-                if upstream_layer >= current_layer: # TODO attn -> mlp same layer
+                if upstream_layer >= current_layer:
                     continue
 
-                print("up_name", up_name, "current_name", name)
-                up_feature_acts = vanilla_feature_acts[up_name] # shape [batch, f_up]
-                decoder = self.important_decoders[up_name] # shape [f_down, C, d]
+                up_feature_acts = vanilla_feature_acts[up_name]  # shape [batch, f_up]
+                decoder = self.important_decoders[up_name]  # shape [f_down, C, d]
                 
-                chunk_size = 4096  # TODO: make this a parameter
+                chunk_size = 16
                 num_groups = up_feature_ids.shape[0]
                 
-                # chunk the downstream feature IDs to reduce memory usage
                 for chunk_start in range(0, num_groups, chunk_size):
                     chunk_end = min(chunk_start + chunk_size, num_groups)
-                    up_feature_ids_chunk = up_feature_ids[chunk_start:chunk_end] # shape [chunk_size, C]
-                    expanded_indices = up_feature_ids_chunk.unsqueeze(0).expand(up_feature_acts.shape[0], -1, -1)
-                    up_feature_acts_chunk = t.gather(up_feature_acts.unsqueeze(1).expand(-1, up_feature_ids_chunk.shape[0], -1), 
-                                        dim=2, 
-                                        index=expanded_indices) # shape [batch, chunk_size, C]
-                    decoder_chunk = decoder[chunk_start:chunk_end] # shape [chunk_size, C, d]
-
-                    print("1")
-                    approx_input_chunk = einops.einsum(
+                    up_feature_ids_chunk = up_feature_ids[chunk_start:chunk_end]  # shape [chunk_size, C]
+                    
+                    # Expand dims correctly for gathering
+                    up_feature_acts_expanded = up_feature_acts.unsqueeze(1).expand(-1, up_feature_ids_chunk.shape[0], -1)
+                    # shape [batch, chunk_size, f_up]
+                    
+                    expanded_indices = up_feature_ids_chunk.unsqueeze(0).expand(batch_size, -1, -1)
+                    # shape [batch, chunk_size, C]
+                    
+                    up_feature_acts_chunk = t.gather(up_feature_acts_expanded, 
+                                                dim=2, 
+                                                index=expanded_indices)
+                    # shape [batch, chunk_size, C]
+                    
+                    decoder_chunk = decoder[chunk_start:chunk_end]  # shape [chunk_size, C, d]
+                    
+                    # Compute chunk contribution
+                    # wrapping inside with t.no_grad() fixes memory issues
+                    chunk_contribution = einops.einsum(
                         up_feature_acts_chunk,
                         decoder_chunk,
                         "batch chunk C, chunk C d -> batch chunk d"
-                        )
-                    print("2")
-                    approx_input = approx_input.clone()
-                    print("3")
-                    approx_input[:, chunk_start:chunk_end] = approx_input[:, chunk_start:chunk_end] + approx_input_chunk
-                    print("4")
-                    
-
+                    )
+                    approx_input[:, chunk_start:chunk_end] += chunk_contribution
+            
+            # Calling .detach().requires_grad_(True) on output fixes memory issues
+            return approx_input 
+        
+        
         else:
             raise ValueError(f"Invalid submodule name: {name}")
-            
-        return approx_input
 
     def update(self, step, input_acts: dict, target_acts: dict):
         if step == 0:
@@ -529,7 +540,7 @@ class TrainerSCAE(SAETrainer):
             # Vanilla forward pass
             f, top_acts, top_indices = ae.encode(x, return_topk=True)
             x_hat = ae.decode(f)
-            feature_acts[name] = f.detach()  # Store for approx inputs
+            feature_acts[name] = f #.detach()  # Store for approx inputs
 
             # Update tracking stats
             self.effective_l0s[name] = top_acts.size(1)
@@ -566,7 +577,7 @@ class TrainerSCAE(SAETrainer):
             # Vanilla backward pass
             total_loss_ae = l2_loss + self.auxk_alpha * auxk_loss
             print("calling backward on vanilla FP, name=", name)
-            total_loss_ae.backward()
+            total_loss_ae.backward(retain_graph=False)
             
             # Process gradients before next forward pass
             t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
@@ -581,34 +592,50 @@ class TrainerSCAE(SAETrainer):
                 tgt = target_acts[name]
                 ae = self.aes[name]
                 
-                # Get approximated input
+                # Get approximated input with controlled memory usage
                 approx_x = self.get_approx_input(name, x, feature_acts)
                 
-                # Approx forward pass
+                # Compute loss on approximated input
                 f_approx, _, _ = ae.encode(approx_x, return_topk=True, use_sparse_connections=True)
-                x_hat = ae.decode(f_approx)
+                x_hat_approx = ae.decode(f_approx)
                 
-                # Compute approx losses
-                e = x_hat - tgt
-                l2_loss = e.pow(2).sum(dim=-1).mean()
-                connection_loss = (f_approx - feature_acts[name]).pow(2).sum(dim=-1).mean()
+                # Compute connection sparsity loss
+                sparsity_loss = self.connection_sparsity_coeff * (x_hat_approx - tgt).pow(2).sum(dim=-1).mean()
                 
-                # Approx backward pass
-                total_loss_ae = l2_loss + self.connection_sparsity_coeff * connection_loss
+                # Backward pass with gradient clipping
                 print("calling backward on approx FP, name=", name)
-                total_loss_ae.backward()
-                
-                # Process gradients
+                sparsity_loss.backward()
                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
-                ae.remove_gradient_parallel_to_decoder_directions()
                 
-                total_loss += total_loss_ae.detach()
+                # # Approx forward pass
+                # f_approx, _, _ = ae.encode(approx_x, return_topk=True, use_sparse_connections=True)
+                # # x_hat = ae.decode(f_approx)
+                
+                # # Compute approx losses
+                # # e = x_hat - tgt
+                # # l2_loss = e.pow(2).sum(dim=-1).mean()
+                # print("f_approx.shape=", f_approx.shape)
+                # f_approx_chunk = f_approx[:, :1]
+                # feature_acts_chunk = feature_acts[name][:, :1]
+                # print("f_approx_chunk.shape=", f_approx_chunk.shape)
+                # connection_loss = (f_approx_chunk - feature_acts_chunk).pow(2).sum(dim=-1).mean()
+                
+                # # Approx backward pass
+                # total_loss_ae = self.connection_sparsity_coeff * connection_loss # + l2_loss
+                # print("calling backward on approx FP, name=", name)
+                # total_loss_ae.backward()
+                
+                # # Process gradients
+                # t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
+                # ae.remove_gradient_parallel_to_decoder_directions()
+                
+                # total_loss += total_loss_ae.detach()
 
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        self.scheduler.step()
+        # self.optimizer.step()
+        # self.optimizer.zero_grad()
+        # self.scheduler.step()
         
-        return total_loss.item()
+        # return total_loss.item()
         
     def evaluate_varexp_batch(
         self,
