@@ -402,8 +402,9 @@ class TrainerSCAE(SAETrainer):
         
         # Move important_features to correct device and dtype
         self.important_features = {
-            name: features.to(device=self.device, dtype=self.dtype)
-            for name, features in important_features.items()
+            down_name: {up_name : features.to(device=self.device, dtype=self.dtype)
+                        for up_name, features in important_features.items()}
+            for down_name, # TODO
         }
         
         # Precompute important decoder weights
@@ -443,13 +444,17 @@ class TrainerSCAE(SAETrainer):
 
     def get_approx_input(self, name, input_acts, vanilla_feature_acts):
         """Compute approximated input for a single autoencoder."""
+        print(vanilla_feature_acts[name].shape)
+        input_acts_rep = einops.repeat(input_acts, "... d -> ... f d", f=vanilla_feature_acts[name].shape[-1])
+        print(input_acts_rep.shape)
         if name.startswith('attn'):
             # Currently we don't approximate the attention input
-            return einops.repeat(input_acts, "... d -> ... f d", f=self.vanilla_feature_acts.shape[-2])
+            return input_acts_rep
         
         elif name.startswith('mlp'):
+            print("blah")
             current_layer = int(name.split('_')[1])
-            approx_input = t.zeros_like(input_acts)
+            approx_input = t.zeros_like(input_acts_rep)
             
             for upstream_name, upstream_features in self.important_features.items():                  
                 upstream_layer = int(upstream_name.split('_')[1])
@@ -462,7 +467,7 @@ class TrainerSCAE(SAETrainer):
                 print("upstream_acts", upstream_acts.shape)
                 print("upstream_features", upstream_features.shape)
                 
-                chunk_size = 2048  # TODO: make this a parameter
+                chunk_size = 4  # TODO: make this a parameter
                 num_groups = upstream_features.shape[0]
                 
                 for chunk_start in range(0, num_groups, chunk_size):
@@ -475,8 +480,10 @@ class TrainerSCAE(SAETrainer):
                     print("chunk_decoder", chunk_decoder.shape)
                     print("chunk_decoder.t()", chunk_decoder.t().shape)
                     print("chunk_features", chunk_features.shape)
+        else:
+            raise ValueError(f"Invalid submodule name: {name}")
             
-            return approx_input
+        return approx_input
 
     def update(self, step, input_acts: dict, target_acts: dict):
         if step == 0:
@@ -555,7 +562,8 @@ class TrainerSCAE(SAETrainer):
                 ae = self.aes[name]
                 
                 # Get approximated input
-                approx_x = self.get_approx_input(name, x, feature_acts, x.size(0))
+                approx_x = self.get_approx_input(name, x, feature_acts)
+                print("approx_x ", approx_x.shape)
                 
                 # Approx forward pass
                 f_approx, _, _ = ae.encode(approx_x, return_topk=True, use_sparse_connections=True)
@@ -847,8 +855,7 @@ class TrainerSCAE(SAETrainer):
             }
 
         return results
-        
-        
+          
     def _load_pretrained_sae(self, repo_info, activation_dim, dict_size, k):
         """
         Load a pretrained Sparse Autoencoder from a Hugging Face repository.
