@@ -505,6 +505,8 @@ class AllActivationBuffer:
         # Initialize activations with specified dtype
         self.activations = {}
         for name, (submodule, _) in submodules.items():
+            # TODO: there's no point storing input and output acts in the same [batch, 2, d] tensor,
+            # since we just split them into input_acts and output_acts in __next__.
             self.activations[name] = t.empty(0, 2, d_submodule[name], device=device, dtype=dtype)
 
         self.read = t.zeros(0, dtype=t.bool, device=device)

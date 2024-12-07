@@ -8,6 +8,7 @@ import wandb
 
 from trainers.top_k import AutoEncoderTopK
 
+
 @dataclass
 class SubmoduleConfig:
     """Configuration for a single submodule in the SCAE suite"""
@@ -74,16 +75,20 @@ class SCAESuite(nn.Module):
 
     def get_virtual_weights(
         self,
-        up_name: str,
-        down_name: str,
+        up_name: str, # e.g. 'mlp_0'
+        down_name: str, # e.g. 'mlp_5' currently must be mlp
         up_indices: t.Tensor,  # [batch, k_up]
         down_indices: t.Tensor,  # [batch, k_down]
         up_vals: t.Tensor,  # [batch, k_up]
     ) -> t.Tensor:  # [batch, k_down]
         """
-        Vectorized computation of contributions from upstream features to downstream features.
-        Only computes contributions between connected feature pairs.
+        Computes the approximate direct-path contribution from upstream SAE to downstream SAE,
+        only using the nonzero connections between active features.
+        Returns shape [batch, k_down].
+        TODO: RENAME THIS!! Virtual weights should refer to just down_encoder @ up_decoder
+        Should be called get_pruned_contributions or something
         """
+        # pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
         batch_size = up_indices.shape[0]
         k_up = up_indices.shape[1]
         k_down = down_indices.shape[1]
@@ -105,6 +110,7 @@ class SCAESuite(nn.Module):
         allowed_up = connections[down_indices]
         
         # Create a mask for valid (non-padding) connections
+        # -1 is used as a padding value in the supplied connections
         # [batch, k_down, C]
         valid_mask = (allowed_up != -1)
         
@@ -205,6 +211,10 @@ class SCAESuite(nn.Module):
             
         Returns:
             Dictionary of reconstructions for each submodule
+
+        E.g. mlp_3 SHOULD get contributions from embed, attn_0, mlp_0,...,mlp_2, attn_3
+        But currently, only have attn_0,...,mlp_2.
+        i.e. missing embed and attn_3
         """
         # First get vanilla features and topk info
         results, features, topk_info = self.vanilla_forward(
@@ -770,6 +780,10 @@ class TrainerSCAESuite:
                 approx_loss = (x_hat_approx - tgt).pow(2).sum(dim=-1).mean()
                 total_loss = total_loss + self.config.connection_sparsity_coeff * approx_loss
                 losses['connection'][down_name] = approx_loss.item()
+
+                # l2_loss_vanilla
+                # l2_loss_pruned
+                # approximation_loss = (feature_acts_pruned - feature_acts_vanilla).pow(2).sum(dim=-1).mean()
         
         # Backward pass and optimization
         total_loss.backward()
