@@ -256,6 +256,262 @@ class SCAESuite(nn.Module):
             results[down_name] = self.aes[down_name].decode(approx_features)
         
         return results
+    
+    @t.no_grad()
+    def evaluate_varexp_batch(
+        self,
+        input_acts: Dict[str, t.Tensor],
+        target_acts: Dict[str, t.Tensor],
+        use_sparse_connections: bool = False,
+        normalize_batch: bool = False,
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Evaluate reconstruction quality metrics.
+        
+        Args:
+            input_acts: Dictionary of input activations
+            target_acts: Dictionary of target activations
+            use_sparse_connections: Whether to use approximate forward pass
+            normalize_batch: Whether to normalize inputs by their mean norm
+            
+        Returns:
+            Dictionary of metrics for each SAE
+        """
+        metrics = {}
+        
+        # Move inputs to device
+        input_acts = {
+            k: v.to(device=self.device, dtype=self.dtype) 
+            for k, v in input_acts.items()
+        }
+        target_acts = {
+            k: v.to(device=self.device, dtype=self.dtype) 
+            for k, v in target_acts.items()
+        }
+        
+        # Get reconstructions based on forward pass type
+        if use_sparse_connections:
+            results = self.approx_forward(input_acts)
+        else:
+            results = self.vanilla_forward(input_acts)
+        
+        for name, ae in self.aes.items():
+            if name not in input_acts:
+                continue
+                
+            x = input_acts[name]
+            tgt = target_acts[name]
+            
+            if normalize_batch:
+                scale = (ae.activation_dim ** 0.5) / x.norm(dim=-1).mean()
+                x = x * scale
+                tgt = tgt * scale
+            
+            x_hat = results[name]
+            if normalize_batch:
+                x_hat = x_hat / scale
+            
+            # Compute metrics
+            l2_loss = t.linalg.norm(tgt - x_hat, dim=-1).mean()
+            
+            total_variance = t.var(tgt, dim=0).sum()
+            residual_variance = t.var(tgt - x_hat, dim=0).sum()
+            frac_variance_explained = 1 - residual_variance / total_variance
+            
+            metrics[name] = {
+                'l2_loss': l2_loss.item(),
+                'frac_variance_explained': frac_variance_explained.item()
+            }
+        
+        return metrics
+
+    @t.no_grad()
+    def evaluate_ce_batch(
+        self,
+        model,
+        text: Union[str, t.Tensor],
+        submodules: Dict[str, Tuple['Module', str]],  # Maps SAE name to (submodule, io_type)
+        use_sparse_connections: bool = False,
+        max_len: Optional[int] = None,
+        normalize_batch: bool = False,
+        device: Optional[str] = None,
+        tracer_args: dict = {'use_cache': False, 'output_attentions': False}
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Evaluate cross entropy loss when patching in reconstructed activations.
+        
+        Args:
+            model: TransformerLens model to evaluate
+            text: Input text or token tensor
+            submodules: Dictionary mapping SAE names to (submodule, io_type) pairs
+                where io_type is one of ['in', 'out', 'in_and_out']
+            use_sparse_connections: Whether to use approximate forward pass
+            max_len: Optional maximum sequence length
+            normalize_batch: Whether to normalize activations by their mean norm
+            device: Device to run evaluation on
+            tracer_args: Arguments for model.trace
+            
+        Returns:
+            Dictionary mapping submodule names to metrics:
+                - loss_original: CE loss of unmodified model
+                - loss_reconstructed: CE loss with reconstructed activations
+                - loss_zero: CE loss with zeroed activations
+                - frac_recovered: Fraction of performance recovered vs zeroing
+        """
+        device = device or self.device
+        
+        # Setup invoker args for length control
+        invoker_args = {"truncation": True, "max_length": max_len} if max_len else {}
+        
+        # Get original model outputs
+        with model.trace(text, invoker_args=invoker_args):
+            logits_original = model.output.save()
+        logits_original = logits_original.value
+        
+        # Get all activations in one pass
+        saved_activations = {}
+        with model.trace(text, **tracer_args, invoker_args=invoker_args):
+            for name, (submodule, io) in submodules.items():
+                if io in ['in', 'in_and_out']:
+                    x = submodule.input
+                elif io == 'out':
+                    x = submodule.output
+                else:
+                    raise ValueError(f"Invalid io type: {io}")
+                
+                if normalize_batch:
+                    scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
+                    x = x * scale
+                else:
+                    scale = 1.0
+                
+                saved_activations[name] = {
+                    'x': x.save(),
+                    'io': io,
+                    'scale': scale
+                }
+        
+        # Process saved activations
+        for name, saved in saved_activations.items():
+            if isinstance(saved['x'].value, tuple):
+                saved['x'] = saved['x'].value[0]
+            else:
+                saved['x'] = saved['x'].value
+                
+        # Get reconstructions
+        inputs = {
+            name: saved['x'].to(device).view(-1, saved['x'].shape[-1])
+            for name, saved in saved_activations.items()
+        }
+        
+        # Choose forward pass based on use_sparse_connections
+        if use_sparse_connections:
+            reconstructions = self.approx_forward(inputs)
+        else:
+            reconstructions = self.vanilla_forward(inputs)
+        
+        # Reshape reconstructions back to original shapes and apply scaling
+        for name, saved in saved_activations.items():
+            x_shape = saved['x'].shape
+            x_hat = reconstructions[name]
+            x_hat = x_hat.view(x_shape)
+            if normalize_batch:
+                x_hat = x_hat / saved['scale']
+            reconstructions[name] = x_hat.to(model.dtype)
+        
+        # Get tokens for loss computation
+        if isinstance(text, t.Tensor):
+            tokens = text
+        else:
+            with model.trace(text, **tracer_args, invoker_args=invoker_args):
+                model_input = model.input.save()
+            try:
+                tokens = model_input.value[1]['input_ids']
+            except:
+                tokens = model_input.value[1]['input']
+        
+        # Setup loss function
+        if hasattr(model, 'tokenizer') and model.tokenizer is not None:
+            loss_kwargs = {'ignore_index': model.tokenizer.pad_token_id}
+        else:
+            loss_kwargs = {}
+        
+        # Compute original loss
+        try:
+            logits = logits_original.logits
+        except:
+            logits = logits_original
+            
+        loss_original = t.nn.CrossEntropyLoss(**loss_kwargs)(
+            logits[:, :-1, :].reshape(-1, logits.shape[-1]),
+            tokens[:, 1:].reshape(-1)
+        ).item()
+        
+        # Compute per-submodule metrics
+        results = {}
+        
+        for name, (submodule, io) in submodules.items():
+            # Test with reconstructed activations
+            with model.trace(text, **tracer_args, invoker_args=invoker_args):
+                x_hat = reconstructions[name]
+                # Patch reconstructions
+                submodule.input = x_hat
+                if io in ['out', 'in_and_out']:
+                    if "attn" in name:
+                        submodule.output = (x_hat,)
+                    elif "mlp" in name:
+                        submodule.output = x_hat
+                    else:
+                        raise ValueError(f"Invalid submodule name: {name}")
+                
+                logits_reconstructed = model.output.save()
+            
+            # Test with zeroed activations
+            with model.trace(text, **tracer_args, invoker_args=invoker_args):
+                if io in ['in', 'in_and_out']:
+                    x = submodule.input
+                    submodule.input = t.zeros_like(x)
+                if io in ['out', 'in_and_out']:
+                    x = submodule.output
+                    if "attn" in name:
+                        submodule.output = (t.zeros_like(x[0]),)
+                    elif "mlp" in name:
+                        submodule.output = t.zeros_like(x)
+                
+                logits_zero = model.output.save()
+            
+            # Format logits and compute losses
+            try:
+                logits_reconstructed = logits_reconstructed.value.logits
+                logits_zero = logits_zero.value.logits
+            except:
+                logits_reconstructed = logits_reconstructed.value
+                logits_zero = logits_zero.value
+            
+            loss_reconstructed = t.nn.CrossEntropyLoss(**loss_kwargs)(
+                logits_reconstructed[:, :-1, :].reshape(-1, logits_reconstructed.shape[-1]),
+                tokens[:, 1:].reshape(-1)
+            ).item()
+            
+            loss_zero = t.nn.CrossEntropyLoss(**loss_kwargs)(
+                logits_zero[:, :-1, :].reshape(-1, logits_zero.shape[-1]),
+                tokens[:, 1:].reshape(-1)
+            ).item()
+            
+            # Compute recovery fraction
+            if loss_original - loss_zero != 0:
+                frac_recovered = (loss_reconstructed - loss_zero) / (loss_original - loss_zero)
+            else:
+                frac_recovered = 0.0
+            
+            results[name] = {
+                'loss_original': loss_original,
+                'loss_reconstructed': loss_reconstructed,
+                'loss_zero': loss_zero,
+                'frac_recovered': frac_recovered
+            }
+        
+        return results
 
     @classmethod
     def from_pretrained(
@@ -548,262 +804,6 @@ class TrainerSCAESuite:
         
         return total_loss.item()
 
-    @t.no_grad()
-    def evaluate_varexp_batch(
-        self,
-        input_acts: Dict[str, t.Tensor],
-        target_acts: Dict[str, t.Tensor],
-        use_sparse_connections: bool = False,
-        normalize_batch: bool = False,
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Evaluate reconstruction quality metrics.
-        
-        Args:
-            input_acts: Dictionary of input activations
-            target_acts: Dictionary of target activations
-            use_sparse_connections: Whether to use approximate forward pass
-            normalize_batch: Whether to normalize inputs by their mean norm
-            
-        Returns:
-            Dictionary of metrics for each SAE
-        """
-        metrics = {}
-        
-        # Move inputs to device
-        input_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-            for k, v in input_acts.items()
-        }
-        target_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-            for k, v in target_acts.items()
-        }
-        
-        # Get reconstructions based on forward pass type
-        if use_sparse_connections:
-            results = self.suite.approx_forward(input_acts)
-        else:
-            results = self.suite.vanilla_forward(input_acts)
-        
-        for name, ae in self.suite.aes.items():
-            if name not in input_acts:
-                continue
-                
-            x = input_acts[name]
-            tgt = target_acts[name]
-            
-            if normalize_batch:
-                scale = (ae.activation_dim ** 0.5) / x.norm(dim=-1).mean()
-                x = x * scale
-                tgt = tgt * scale
-            
-            # Get reconstructions
-            x_hat = results[name]
-            if normalize_batch:
-                x_hat = x_hat / scale
-            
-            # Compute metrics
-            l2_loss = t.linalg.norm(tgt - x_hat, dim=-1).mean()
-            
-            total_variance = t.var(tgt, dim=0).sum()
-            residual_variance = t.var(tgt - x_hat, dim=0).sum()
-            frac_variance_explained = 1 - residual_variance / total_variance
-            
-            metrics[name] = {
-                'l2_loss': l2_loss.item(),
-                'frac_variance_explained': frac_variance_explained.item()
-            }
-        
-        return metrics
-
-    @t.no_grad()
-    def evaluate_ce_batch(
-        self,
-        model,
-        text: Union[str, t.Tensor],
-        submodules: Dict[str, Tuple['Module', str]],  # Maps SAE name to (submodule, io_type)
-        use_sparse_connections: bool = False,
-        max_len: Optional[int] = None,
-        normalize_batch: bool = False,
-        device: Optional[str] = None,
-        tracer_args: dict = {'use_cache': False, 'output_attentions': False}
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Evaluate cross entropy loss when patching in reconstructed activations.
-        
-        Args:
-            model: TransformerLens model to evaluate
-            text: Input text or token tensor
-            submodules: Dictionary mapping SAE names to (submodule, io_type) pairs
-                where io_type is one of ['in', 'out', 'in_and_out']
-            use_sparse_connections: Whether to use approximate forward pass
-            max_len: Optional maximum sequence length
-            normalize_batch: Whether to normalize activations by their mean norm
-            device: Device to run evaluation on
-            tracer_args: Arguments for model.trace
-            
-        Returns:
-            Dictionary mapping submodule names to metrics:
-                - loss_original: CE loss of unmodified model
-                - loss_reconstructed: CE loss with reconstructed activations
-                - loss_zero: CE loss with zeroed activations
-                - frac_recovered: Fraction of performance recovered vs zeroing
-        """
-        device = device or self.suite.device
-        
-        # Setup invoker args for length control
-        invoker_args = {"truncation": True, "max_length": max_len} if max_len else {}
-        
-        # Get original model outputs
-        with model.trace(text, invoker_args=invoker_args):
-            logits_original = model.output.save()
-        logits_original = logits_original.value
-        
-        # Get all activations in one pass
-        saved_activations = {}
-        with model.trace(text, **tracer_args, invoker_args=invoker_args):
-            for name, (submodule, io) in submodules.items():
-                if io in ['in', 'in_and_out']:
-                    x = submodule.input
-                elif io == 'out':
-                    x = submodule.output
-                else:
-                    raise ValueError(f"Invalid io type: {io}")
-                
-                if normalize_batch:
-                    scale = (self.suite.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
-                    x = x * scale
-                else:
-                    scale = 1.0
-                
-                saved_activations[name] = {
-                    'x': x.save(),
-                    'io': io,
-                    'scale': scale
-                }
-        
-        # Process saved activations
-        for name, saved in saved_activations.items():
-            if isinstance(saved['x'].value, tuple):
-                saved['x'] = saved['x'].value[0]
-            else:
-                saved['x'] = saved['x'].value
-                
-        # Get reconstructions
-        inputs = {
-            name: saved['x'].to(device).view(-1, saved['x'].shape[-1])
-            for name, saved in saved_activations.items()
-        }
-        
-        # Choose forward pass based on use_sparse_connections
-        if use_sparse_connections:
-            reconstructions = self.suite.approx_forward(inputs)
-        else:
-            reconstructions = self.suite.vanilla_forward(inputs)
-        
-        # Reshape reconstructions back to original shapes and apply scaling
-        for name, saved in saved_activations.items():
-            x_shape = saved['x'].shape
-            x_hat = reconstructions[name]
-            x_hat = x_hat.view(x_shape)
-            if normalize_batch:
-                x_hat = x_hat / saved['scale']
-            reconstructions[name] = x_hat.to(model.dtype)
-        
-        # Get tokens for loss computation
-        if isinstance(text, t.Tensor):
-            tokens = text
-        else:
-            with model.trace(text, **tracer_args, invoker_args=invoker_args):
-                model_input = model.input.save()
-            try:
-                tokens = model_input.value[1]['input_ids']
-            except:
-                tokens = model_input.value[1]['input']
-        
-        # Setup loss function
-        if hasattr(model, 'tokenizer') and model.tokenizer is not None:
-            loss_kwargs = {'ignore_index': model.tokenizer.pad_token_id}
-        else:
-            loss_kwargs = {}
-        
-        # Compute original loss
-        try:
-            logits = logits_original.logits
-        except:
-            logits = logits_original
-            
-        loss_original = t.nn.CrossEntropyLoss(**loss_kwargs)(
-            logits[:, :-1, :].reshape(-1, logits.shape[-1]),
-            tokens[:, 1:].reshape(-1)
-        ).item()
-        
-        # Compute per-submodule metrics
-        results = {}
-        
-        for name, (submodule, io) in submodules.items():
-            # Test with reconstructed activations
-            with model.trace(text, **tracer_args, invoker_args=invoker_args):
-                x_hat = reconstructions[name]
-                # Patch reconstructions
-                submodule.input = x_hat
-                if io in ['out', 'in_and_out']:
-                    if "attn" in name:
-                        submodule.output = (x_hat,)
-                    elif "mlp" in name:
-                        submodule.output = x_hat
-                    else:
-                        raise ValueError(f"Invalid submodule name: {name}")
-                
-                logits_reconstructed = model.output.save()
-            
-            # Test with zeroed activations
-            with model.trace(text, **tracer_args, invoker_args=invoker_args):
-                if io in ['in', 'in_and_out']:
-                    x = submodule.input
-                    submodule.input = t.zeros_like(x)
-                if io in ['out', 'in_and_out']:
-                    x = submodule.output
-                    if "attn" in name:
-                        submodule.output = (t.zeros_like(x[0]),)
-                    elif "mlp" in name:
-                        submodule.output = t.zeros_like(x)
-                
-                logits_zero = model.output.save()
-            
-            # Format logits and compute losses
-            try:
-                logits_reconstructed = logits_reconstructed.value.logits
-                logits_zero = logits_zero.value.logits
-            except:
-                logits_reconstructed = logits_reconstructed.value
-                logits_zero = logits_zero.value
-            
-            loss_reconstructed = t.nn.CrossEntropyLoss(**loss_kwargs)(
-                logits_reconstructed[:, :-1, :].reshape(-1, logits_reconstructed.shape[-1]),
-                tokens[:, 1:].reshape(-1)
-            ).item()
-            
-            loss_zero = t.nn.CrossEntropyLoss(**loss_kwargs)(
-                logits_zero[:, :-1, :].reshape(-1, logits_zero.shape[-1]),
-                tokens[:, 1:].reshape(-1)
-            ).item()
-            
-            # Compute recovery fraction
-            if loss_original - loss_zero != 0:
-                frac_recovered = (loss_reconstructed - loss_zero) / (loss_original - loss_zero)
-            else:
-                frac_recovered = 0.0
-            
-            results[name] = {
-                'loss_original': loss_original,
-                'loss_reconstructed': loss_reconstructed,
-                'loss_zero': loss_zero,
-                'frac_recovered': frac_recovered
-            }
-        
-        return results
 
 def geometric_median(x: t.Tensor, num_iterations: int = 20) -> t.Tensor:
     """Compute geometric median of points."""
