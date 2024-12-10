@@ -4,3 +4,10 @@
 - Make it so that e.g. mlp_3 sees attn_3
 - Worry about layernorm
 - Decide on 3 losses
+- Account for biases!
+
+contributions = down_encoder @ up_decoder @ up_feature_acts
+[batch, n_up, n_down]
+
+upstream_features = contributions[:,:,69].mean(0).topk(5).indices  # is a list of 5 upstream features
+
