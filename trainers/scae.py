@@ -232,7 +232,10 @@ class SCAESuite(nn.Module):
             down_idxs = topk_info[down_name][0]  # [batch, k_down]
             batch_size = down_idxs.shape[0]
             
-            # Add contribution from initial node TODO: add option to start at arbitrary layer
+            # Initialise approx_acts as just the contribution from initial node 
+            # E.g. if the earliest node is "attn_0", then we initialise as the input to "attn_0"
+            # ah ffs we actually need the input to the layernorm that preceded attn_0
+            # TODO: add option to start at arbitrary layer
             _, approx_acts, _ = self.aes[down_name].encode(
                 inputs['attn_0'],
                 return_topk=True
@@ -251,7 +254,9 @@ class SCAESuite(nn.Module):
                 
                 approx_acts = approx_acts + contributions
             
-            # # divide by layernorm scale
+            # divide by layernorm scale
+            # TODO: layernorm also has a bias arghhhh
+            # gotta be a cleaner way of doing this
             d_model = list(inputs.values())[0].shape[-1]
             scale = approx_acts.norm(dim=-1, keepdim=True) / d_model ** 0.5
 
