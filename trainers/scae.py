@@ -15,7 +15,9 @@ class SubmoduleConfig:
     activation_dim: int
     dict_size: int
     k: int
+    layernorm_gamma : float # layernorm gamma value
     upstream_connections: List[str] = None  # Names of upstream modules to connect to
+    
 
 class SCAESuite(nn.Module):
     """A suite of Sparsely-Connected TopK Autoencoders"""
@@ -73,9 +75,9 @@ class SCAESuite(nn.Module):
                     
                     self.connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
 
-    def get_virtual_weights(
+    def get_pruned_contributions(
         self,
-        up_name: str, # e.g. 'mlp_0'
+        up_name: str, # e.g. 'attn_0'
         down_name: str, # e.g. 'mlp_5' currently must be mlp
         up_indices: t.Tensor,  # [batch, k_up]
         down_indices: t.Tensor,  # [batch, k_down]
@@ -85,8 +87,6 @@ class SCAESuite(nn.Module):
         Computes the approximate direct-path contribution from upstream SAE to downstream SAE,
         only using the nonzero connections between active features.
         Returns shape [batch, k_down].
-        TODO: RENAME THIS!! Virtual weights should refer to just down_encoder @ up_decoder
-        Should be called get_pruned_contributions or something
         """
         # pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
         batch_size = up_indices.shape[0]
@@ -145,6 +145,9 @@ class SCAESuite(nn.Module):
         
         # Apply connection mask and sum contributions
         contributions = (virtual_weights * connected_vals).sum(dim=(-1, -2))  # [batch, k_down]
+
+        b_dec_contrib =  self.aes[up_name].encoder.weight @ self.aes[up_name].b_dec
+        contributions = contributions + b_dec_contrib[up_indices]
         
         return contributions
 
@@ -198,7 +201,7 @@ class SCAESuite(nn.Module):
 
     def approx_forward(
         self,
-        inputs: Dict[str, t.Tensor]
+        inputs: Dict[str, t.Tensor],
     ) -> Dict[str, t.Tensor]:
         """
         Run approximate forward pass using virtual weights.
@@ -212,9 +215,6 @@ class SCAESuite(nn.Module):
         Returns:
             Dictionary of reconstructions for each submodule
 
-        E.g. mlp_3 SHOULD get contributions from embed, attn_0, mlp_0,...,mlp_2, attn_3
-        But currently, only have attn_0,...,mlp_2.
-        i.e. missing embed and attn_3
         """
         # First get vanilla features and topk info
         results, features, topk_info = self.vanilla_forward(
@@ -232,12 +232,11 @@ class SCAESuite(nn.Module):
             down_idxs = topk_info[down_name][0]  # [batch, k_down]
             batch_size = down_idxs.shape[0]
             
-            # Aggregate contributions from connected upstream modules
-            approx_acts = t.zeros(
-                (batch_size, config.k),
-                device=self.device,
-                dtype=self.dtype
-            )
+            # Add contribution from initial node TODO: add option to start at arbitrary layer
+            _, approx_acts, _ = self.aes[down_name].encode(
+                inputs['attn_0'],
+                return_topk=True
+                )
             
             for up_name in self.connections[down_name].keys():
                 if up_name not in inputs:
@@ -246,11 +245,27 @@ class SCAESuite(nn.Module):
                 up_idxs = topk_info[up_name][0]  # [batch, k_up]
                 up_vals = topk_info[up_name][1]  # [batch, k_up]
                 
-                contributions = self.get_virtual_weights(
+                contributions = self.get_pruned_contributions(
                     up_name, down_name, up_idxs, down_idxs, up_vals
                 )  # [batch, k_down]
                 
                 approx_acts = approx_acts + contributions
+            
+            # # divide by layernorm scale
+            d_model = list(inputs.values())[0].shape[-1]
+            scale = approx_acts.norm(dim=-1, keepdim=True) / d_model ** 0.5
+
+            approx_acts = approx_acts / scale * self.configs[down_name].layernorm_gamma
+
+
+            # Add downstream encoder bias
+            down_idx = topk_info[down_name][0]
+            b_enc = self.aes[down_name].encoder.bias[down_idx]
+            approx_acts = approx_acts + b_enc
+            
+            # Subtract downstream b_dec contribution TODO: make this an option
+            W_enc = self.aes[down_name].encoder.weight[down_idx]
+            approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec            
             
             # Create sparse feature tensor
             approx_features = t.zeros(
@@ -564,7 +579,8 @@ class SCAESuite(nn.Module):
                 activation_dim=activation_dim,
                 dict_size=dict_size,
                 k=config['k'],
-                upstream_connections=config.get('upstream_connections')
+                layernorm_gamma=config.get('layernorm_gamma', 1.0),
+                upstream_connections=config.get('upstream_connections'),
             )
         
         # Initialize suite
