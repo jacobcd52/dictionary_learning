@@ -1,7 +1,8 @@
 #%%
 from buffer import AllActivationBuffer
-from trainers.top_k import TrainerSCAE, AutoEncoderTopK
-from training import trainSCAE
+from trainers.top_k import AutoEncoderTopK
+from trainers.scae import TrainerConfig
+from training import train_scae_suite
 
 from datasets import load_dataset
 import torch as t
@@ -52,8 +53,10 @@ n_layer = model.config.n_layer
 #%%
 submodules = {}
 for layer in range(n_layer):
-    submodules[f"mlp_{layer}"] = (model.transformer.h[layer].mlp, "in_and_out")
-    submodules[f"attn_{layer}"] = (model.transformer.h[layer].attn, "out")
+    submodules[f"mlp_{layer}"] = {"input_point" : (model.transformer.h[layer].ln_2, "in"),
+                                  "output_point" : (model.transformer.h[layer].mlp, "out")}
+    submodules[f"attn_{layer}"] = {"input_point" : (model.transformer.h[layer].attn, "out"),
+                                    "output_point" : (model.transformer.h[layer].attn, "out")}
 
 submodule_names = list(submodules.keys())
 
@@ -74,22 +77,13 @@ important_features = {} #{f"mlp_{layer}": t.randint(0, num_features, (num_featur
 
 #%%
 
-trainer_cfg = {
-    "trainer": TrainerSCAE,
-    "activation_dims": {name: model.config.n_embd for name in submodule_names},
-    "dict_sizes": {name: model.config.n_embd * expansion for name in submodule_names},
-    "ks": {name: k for name in submodule_names},
-    "auxk_alpha" : 1/32,
-    "device": buffer.device,
-    "submodules": submodules,
-    "important_features": important_features,
-    "connection_sparsity_coeff": 0.01,
-    "use_sparse_connections": False,
-    "dtype": t.bfloat16
-}
+trainer_cfg = TrainerConfig(
+    connection_sparsity_coeff=0.1,
+    steps=10,
+)
 
 # Run the training
-trainer = trainSCAE(
+trainer = train_scae_suite(
     buffer=buffer,
     trainer_cfg=trainer_cfg,
     steps=num_tokens // out_batch_size,
@@ -97,6 +91,6 @@ trainer = trainSCAE(
     save_dir="sae_checkpoints",
     log_steps=100,
     use_wandb=True,  # Set to False if you don't want to use wandb
-    hf_repo_id="jacobcd52/scae"
+    hf_repo_id="jacobcd52/scae_include_ln"
 )
 # %%

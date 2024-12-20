@@ -2,6 +2,7 @@ import torch as t
 from nnsight import LanguageModel
 import gc
 from tqdm import tqdm
+from contextlib import nullcontext
 
 
 from config import DEBUG
@@ -464,11 +465,18 @@ class AllActivationBuffer:
             refresh_batch_size=512,
             out_batch_size=8192,
             device="cpu",
-            dtype=t.float32,  # Add dtype parameter
+            dtype=t.float32,
         ):
-        for name, (submodule, io) in submodules.items():
-            if io not in ["in", "out", "in_and_out"]:
-                raise ValueError(f"io must be either 'in' or 'out' or 'in_and_out', got {io}")
+        # Validate submodules structure
+        for name, config in submodules.items():
+            if not isinstance(config, dict) or not all(k in config for k in ["input_point", "output_point"]):
+                raise ValueError(f"Each submodule config must be a dict with 'input_point' and 'output_point' keys")
+            for point in ["input_point", "output_point"]:
+                if not isinstance(config[point], tuple) or len(config[point]) != 2:
+                    raise ValueError(f"{point} must be a tuple of (submodule, in_or_out)")
+                submodule, in_or_out = config[point]
+                if in_or_out not in ["in", "out"]:
+                    raise ValueError(f"in_or_out must be either 'in' or 'out', got {in_or_out}")
 
         self.data = data
         self.model = model
@@ -489,12 +497,25 @@ class AllActivationBuffer:
         
         if d_submodule is None:
             d_submodule = {}
-            for name, (submodule, io) in submodules.items():
+            for name, config in submodules.items():
                 try:
-                    if io == "in":
-                        d_submodule[name] = submodule.in_features
-                    else:
-                        d_submodule[name] = submodule.out_features
+                    # Get dimensions from input point
+                    input_submodule, input_io = config["input_point"]
+                    if input_io == "in":
+                        d_in = input_submodule.in_features
+                    else:  # input_io == "out"
+                        d_in = input_submodule.out_features
+                        
+                    # Get dimensions from output point
+                    output_submodule, output_io = config["output_point"]
+                    if output_io == "in":
+                        d_out = output_submodule.in_features
+                    else:  # output_io == "out"
+                        d_out = output_submodule.out_features
+                        
+                    if d_in != d_out:
+                        raise ValueError(f"Input and output dimensions must match for {name}, got {d_in} and {d_out}")
+                    d_submodule[name] = d_in
                 except:
                     raise ValueError(f"d_submodule cannot be inferred for {name} and must be specified directly")
         elif isinstance(d_submodule, int):
@@ -504,9 +525,7 @@ class AllActivationBuffer:
 
         # Initialize activations with specified dtype
         self.activations = {}
-        for name, (submodule, _) in submodules.items():
-            # TODO: there's no point storing input and output acts in the same [batch, 2, d] tensor,
-            # since we just split them into input_acts and output_acts in __next__.
+        for name in submodules.keys():
             self.activations[name] = t.empty(0, 2, d_submodule[name], device=device, dtype=dtype)
 
         self.read = t.zeros(0, dtype=t.bool, device=device)
@@ -598,52 +617,58 @@ class AllActivationBuffer:
         while any(len(acts) < target_size for acts in self.activations.values()):
             try:
                 tokens = self.token_batch()
-                hidden_states_dict = {}
                 
                 with t.no_grad():
                     # Use autocast for mixed precision if using float16 or bfloat16
-                    if self.dtype in [t.float16, t.bfloat16]:
-                        with t.cuda.amp.autocast(dtype=self.dtype):
-                            trace = self.model.trace(tokens)
-                            with trace:
-                                saved_inputs = {}
-                                saved_outputs = {}
-                                for name, (submodule, _) in self.submodules.items():
-                                    saved_inputs[name] = submodule.input.save()
-                                    saved_outputs[name] = submodule.output.save()
-                                output = trace.output
-                    else:
+                    context_manager = (
+                        t.cuda.amp.autocast(dtype=self.dtype)
+                        if self.dtype in [t.float16, t.bfloat16]
+                        else nullcontext()
+                    )
+                    
+                    with context_manager:
                         trace = self.model.trace(tokens)
                         with trace:
-                            saved_inputs = {}
-                            saved_outputs = {}
-                            for name, (submodule, _) in self.submodules.items():
-                                saved_inputs[name] = submodule.input.save()
-                                saved_outputs[name] = submodule.output.save()
+                            # Save input and output points for each submodule
+                            saved_states = {}
+                            for name, config in self.submodules.items():
+                                saved_states[name] = {
+                                    "input": {
+                                        "submodule": config["input_point"][0].input.save(),
+                                        "io": config["input_point"][1]
+                                    },
+                                    "output": {
+                                        "submodule": config["output_point"][0].output.save(),
+                                        "io": config["output_point"][1]
+                                    }
+                                }
                             output = trace.output
 
-                    for name, (submodule, io) in self.submodules.items():
-                        raw_in = self._process_states(saved_inputs[name])
-                        raw_out = self._process_states(saved_outputs[name])
+                    for name, config in self.submodules.items():
+                        # Process input point
+                        input_states = self._process_states(saved_states[name]["input"]["submodule"])
+                        input_io = saved_states[name]["input"]["io"]
+                        input_acts = input_states if input_io == "in" else self._process_states(saved_states[name]["input"]["submodule"])
+                        
+                        # Process output point
+                        output_states = self._process_states(saved_states[name]["output"]["submodule"])
+                        output_io = saved_states[name]["output"]["io"]
+                        output_acts = output_states if output_io == "in" else self._process_states(saved_states[name]["output"]["submodule"])
                         
                         # Convert to specified dtype
-                        raw_in = raw_in.to(dtype=self.dtype)
-                        raw_out = raw_out.to(dtype=self.dtype)
+                        input_acts = input_acts.to(dtype=self.dtype)
+                        output_acts = output_acts.to(dtype=self.dtype)
                         
-                        batch_size = raw_in.shape[0]
-                        seq_len = raw_in.shape[1]
-                        hidden_dim = raw_in.shape[2]
+                        # Reshape
+                        batch_size = input_acts.shape[0]
+                        seq_len = input_acts.shape[1]
+                        hidden_dim = input_acts.shape[2]
                         
-                        flat_in = raw_in.reshape(batch_size * seq_len, hidden_dim)
-                        flat_out = raw_out.reshape(batch_size * seq_len, hidden_dim)
+                        flat_in = input_acts.reshape(batch_size * seq_len, hidden_dim)
+                        flat_out = output_acts.reshape(batch_size * seq_len, hidden_dim)
                         
-                        if io == "in":
-                            hidden_states = t.stack([flat_in, flat_in], dim=1)
-                        elif io == "out":
-                            hidden_states = t.stack([flat_out, flat_out], dim=1)
-                        else:  # io == "in_and_out"
-                            hidden_states = t.stack([flat_in, flat_out], dim=1)
-                                                
+                        # Stack and concatenate
+                        hidden_states = t.stack([flat_in, flat_out], dim=1)
                         self.activations[name] = t.cat(
                             [self.activations[name], hidden_states.to(device=self.device, dtype=self.dtype)], 
                             dim=0
