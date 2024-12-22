@@ -6,150 +6,294 @@ from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 import wandb
 
+
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Optional, Union, Tuple
+import torch as t
+import torch.nn as nn
+from tqdm import tqdm
+import json
+import os
+import tempfile
+from contextlib import nullcontext
+from huggingface_hub import hf_hub_download, HfApi
+
+
 from trainers.top_k import AutoEncoderTopK
+from buffer import AllActivationBuffer, BufferConfig
 
 
 @dataclass
-class SubmoduleConfig:
-    """Configuration for a single submodule in the SCAE suite"""
+class ModuleConfig:
+    """Configuration for a single module in the SCAE suite"""
     activation_dim: int
     dict_size: int
     k: int
-    layernorm_gamma : float # layernorm gamma value
-    upstream_connections: List[str] = None  # Names of upstream modules to connect to
+    layernorm_gamma: float = 1.0
+    connections: Dict[str, t.Tensor] = field(default_factory=dict)
     
+    # For loading pretrained models
+    pretrained_repo: Optional[str] = None
+    pretrained_filename: Optional[str] = None
+    
+    @property
+    def upstream_modules(self) -> List[str]:
+        """Get list of upstream modules from connection specs"""
+        return list(self.connections.keys())
+
+@dataclass
+class TrainingConfig:
+    """Configuration for SCAE Suite training"""
+    # Core training parameters
+    steps: int
+    base_lr: float = 2e-4
+    lr_decay_start: int = 24000
+    
+    # Loss weights and thresholds
+    auxk_alpha: float = 0.0  # Weight for auxiliary loss (dead features)
+    connection_sparsity_coeff: float = 0.0  # Weight for connection sparsity loss
+    dead_feature_threshold: int = 10_000_000  # Tokens since last activation
+    
+    # Saving and logging
+    save_steps: Optional[int] = None
+    save_dir: Optional[str] = None
+    log_steps: Optional[int] = None
+    use_wandb: bool = False
+    hf_repo_id: Optional[str] = None
 
 class SCAESuite(nn.Module):
     """A suite of Sparsely-Connected TopK Autoencoders"""
     
     def __init__(
         self,
-        submodule_configs: Dict[str, SubmoduleConfig],
-        connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
-        dtype: t.dtype = t.float32,
+        module_configs: Dict[str, ModuleConfig],
         device: Optional[str] = None,
+        dtype: t.dtype = t.float32
     ):
-        """
-        Args:
-            submodule_configs: Dictionary mapping submodule names to their configs
-            connections: Optional dictionary specifying sparse connections:
-                {downstream_name: {upstream_name: tensor}}
-                where tensor has shape [num_down_features, C] and contains indices
-                of connected upstream features, padded with -1.
-                C is the maximum number of connections per downstream feature.
-            dtype: Data type for the autoencoders
-            device: Device to place the autoencoders on
-        """
         super().__init__()
         self.device = device or ('cuda' if t.cuda.is_available() else 'cpu')
         self.dtype = dtype
-        self.is_pretrained = False
         
         # Initialize autoencoders
-        self.aes = nn.ModuleDict({
-            name: AutoEncoderTopK(
-                config.activation_dim,
-                config.dict_size,
-                config.k
-            ).to(device=self.device, dtype=self.dtype)
-            for name, config in submodule_configs.items()
-        })
+        self.aes = nn.ModuleDict()
+        for name, config in module_configs.items():
+            if config.pretrained_repo is not None:
+                # Load pretrained weights
+                weights_path = hf_hub_download(
+                    repo_id=config.pretrained_repo,
+                    filename=config.pretrained_filename
+                )
+                ae = AutoEncoderTopK(
+                    config.activation_dim,
+                    config.dict_size,
+                    config.k
+                ).to(device=self.device, dtype=self.dtype)
+                ae.load_state_dict(t.load(weights_path, map_location=self.device))
+            else:
+                # Fresh initialization
+                ae = AutoEncoderTopK(
+                    config.activation_dim,
+                    config.dict_size,
+                    config.k
+                ).to(device=self.device, dtype=self.dtype)
+            self.aes[name] = ae
         
-        # Store configs for reference
-        self.configs = submodule_configs
-        self.submodule_names = list(submodule_configs.keys())
+        self.configs = module_configs
+        self.module_names = list(module_configs.keys())
 
-        # Initialize and validate connections
-        self.connections = {}
-        if connections is not None:
-            for down_name, up_dict in connections.items():
-                self.connections[down_name] = {}
-                for up_name, conn_tensor in up_dict.items():
-                    # Verify shape
-                    assert conn_tensor.shape[0] == self.configs[down_name].dict_size, \
-                        f"Connection tensor for {down_name}->{up_name} has wrong shape. Expected first dim {self.configs[down_name].dict_size}, got {conn_tensor.shape[0]}"
-                    # Verify indices are valid
-                    valid_indices = (conn_tensor >= -1) & (conn_tensor < self.configs[up_name].dict_size)
-                    assert valid_indices.all(), \
-                        f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
-                    
-                    self.connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
+        # Process and validate connections
+        for down_name, config in module_configs.items():
+            for up_name, conn_tensor in config.connections.items():
+                # Verify shape
+                assert conn_tensor.shape[0] == config.dict_size, \
+                    f"Connection tensor for {down_name}->{up_name} has wrong shape"
+                
+                # Verify indices
+                up_dict_size = module_configs[up_name].dict_size
+                valid_indices = (conn_tensor >= -1) & (conn_tensor < up_dict_size)
+                assert valid_indices.all(), \
+                    f"Invalid indices in connection tensor for {down_name}->{up_name}"
+                
+                config.connections[up_name] = conn_tensor.to(
+                    device=self.device, 
+                    dtype=t.long
+                )
 
-    def get_pruned_contributions(
-        self,
-        up_name: str, # e.g. 'attn_0'
-        down_name: str, # e.g. 'mlp_5' currently must be mlp
-        up_indices: t.Tensor,  # [batch, k_up]
-        down_indices: t.Tensor,  # [batch, k_down]
-        up_vals: t.Tensor,  # [batch, k_up]
-    ) -> t.Tensor:  # [batch, k_down]
-        """
-        Computes the approximate direct-path contribution from upstream SAE to downstream SAE,
-        only using the nonzero connections between active features.
-        Returns shape [batch, k_down].
-        """
-        # pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
-        batch_size = up_indices.shape[0]
-        k_up = up_indices.shape[1]
-        k_down = down_indices.shape[1]
-        device = up_indices.device
+    @classmethod
+    def load_checkpoint(
+        cls,
+        checkpoint_path: str,
+        config_path: str,
+        device: Optional[str] = None
+    ) -> "SCAESuite":
+        """Load a checkpoint from disk"""
+        # Load config
+        with open(config_path) as f:
+            config_dict = json.load(f)
         
-        # Get connection tensor for this pair of modules
-        connections = self.connections[down_name][up_name]  # [num_down, C]
-        C = connections.shape[1]
+        # Convert config dict to ModuleConfigs
+        module_configs = {}
+        for name, cfg in config_dict["module_configs"].items():
+            module_configs[name] = ModuleConfig(**cfg)
         
-        # Get weights for the active features
-        up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
-        down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
-        
-        # For each batch element and downstream feature,
-        # we need to find which of its allowed upstream connections are currently active
-        
-        # First get the allowed connections for each active downstream feature
-        # [batch, k_down, C]
-        allowed_up = connections[down_indices]
-        
-        # Create a mask for valid (non-padding) connections
-        # -1 is used as a padding value in the supplied connections
-        # [batch, k_down, C]
-        valid_mask = (allowed_up != -1)
-        
-        # Create a mask of shape [batch, k_down, C, k_up] indicating where
-        # allowed_up[b,d,c] == up_indices[b,u]
-        allowed_up_expanded = allowed_up.unsqueeze(-1)  # [batch, k_down, C, 1]
-        up_indices_expanded = up_indices.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k_up]
-        connection_mask = (allowed_up_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
-        
-        # Get the corresponding upstream values
-        # [batch, k_down, C, k_up]
-        up_vals_expanded = up_vals.unsqueeze(1).unsqueeze(2).expand(-1, k_down, C, -1)
-        connected_vals = t.where(connection_mask, up_vals_expanded, t.zeros_like(up_vals_expanded))
-        
-        # Get the corresponding virtual weights
-        active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
-        active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
-        
-        active_down_vectors = down_encoder[down_indices.reshape(-1)]  # [batch*k_down, d_in]
-        active_down_vectors = active_down_vectors.view(batch_size, k_down, -1)  # [batch, k_down, d_in]
-        
-        # Compute all virtual weights between active features
-        # [batch, k_down, k_up]
-        virtual_weights = einops.einsum(
-            active_down_vectors, active_up_vectors,
-            "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
+        # Create suite instance
+        suite = cls(
+            module_configs=module_configs,
+            device=device,
+            dtype=getattr(t, config_dict["dtype"])
         )
         
-        # Expand virtual weights to match connection mask shape
-        # [batch, k_down, C, k_up]
-        virtual_weights = virtual_weights.unsqueeze(2).expand(-1, -1, C, -1)
+        # Load state dict
+        state_dict = t.load(checkpoint_path, map_location=device)
+        suite.load_state_dict(state_dict["suite_state"])
         
-        # Apply connection mask and sum contributions
-        contributions = (virtual_weights * connected_vals).sum(dim=(-1, -2))  # [batch, k_down]
+        return suite
 
-        b_dec_contrib =  self.aes[up_name].encoder.weight @ self.aes[up_name].b_dec
-        contributions = contributions + b_dec_contrib[up_indices]
+    def save_checkpoint(
+        self,
+        save_dir: str,
+        step: Optional[int] = None,
+        optimizer_state: Optional[dict] = None,
+        scheduler_state: Optional[dict] = None
+    ):
+        """Save checkpoint to disk"""
+        os.makedirs(save_dir, exist_ok=True)
         
-        return contributions
+        # Helper function to remove tensors from config
+        def remove_tensors(obj):
+            if isinstance(obj, dict):
+                return {k: remove_tensors(v) for k, v in obj.items() 
+                    if not isinstance(v, t.Tensor)}
+            elif isinstance(obj, (list, tuple)):
+                return type(obj)(remove_tensors(x) for x in obj 
+                            if not isinstance(x, t.Tensor))
+            else:
+                return obj
+        
+        # Save config filtering out tensors
+        module_configs_json = {
+            name: remove_tensors(asdict(cfg))
+            for name, cfg in self.configs.items()
+        }
+        
+        config_dict = {
+            "module_configs": module_configs_json,
+            "dtype": str(self.dtype)
+        }
+        
+        with open(os.path.join(save_dir, "config.json"), "w") as f:
+            json.dump(config_dict, f, indent=4)
+        
+        # Save model state and optimizer/scheduler state (these use torch.save which can handle tensors)
+        state_dict = {
+            "suite_state": self.state_dict(),
+            "step": step
+        }
+        if optimizer_state is not None:
+            state_dict["optimizer_state"] = optimizer_state
+        if scheduler_state is not None:
+            state_dict["scheduler_state"] = scheduler_state
+            
+        t.save(state_dict, os.path.join(save_dir, "checkpoint.pt"))
+
+    def upload_to_hub(self, repo_id: str):
+        """Upload checkpoint to HuggingFace Hub"""
+        api = HfApi()
+        
+        # Create temporary files
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Save locally first
+            self.save_checkpoint(tmp_dir)
+            
+            # Upload files
+            api.upload_file(
+                path_or_fileobj=os.path.join(tmp_dir, "config.json"),
+                path_in_repo="config.json",
+                repo_id=repo_id,
+                repo_type="model"
+            )
+            api.upload_file(
+                path_or_fileobj=os.path.join(tmp_dir, "checkpoint.pt"),
+                path_in_repo="checkpoint.pt",
+                repo_id=repo_id,
+                repo_type="model"
+            )
+
+    def get_pruned_contributions(
+            self,
+            up_name: str, # e.g. 'attn_0'
+            down_name: str, # e.g. 'mlp_5' currently must be mlp
+            up_indices: t.Tensor,  # [batch, k_up]
+            down_indices: t.Tensor,  # [batch, k_down]
+            up_vals: t.Tensor,  # [batch, k_up]
+        ) -> t.Tensor:  # [batch, k_down]
+            """
+            Computes the approximate direct-path contribution from upstream SAE to downstream SAE,
+            only using the nonzero connections between active features.
+            Returns shape [batch, k_down].
+            """
+            # pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
+            batch_size = up_indices.shape[0]
+            k_up = up_indices.shape[1]
+            k_down = down_indices.shape[1]
+            device = up_indices.device
+            
+            # Get connection tensor for this pair of modules
+            connections = self.configs[down_name].connections[up_name]  # [num_down, C]
+            C = connections.shape[1]
+            
+            # Get weights for the active features
+            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
+            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
+            
+            # For each batch element and downstream feature,
+            # we need to find which of its allowed upstream connections are currently active
+            
+            # First get the allowed connections for each active downstream feature
+            # [batch, k_down, C]
+            allowed_up = connections[down_indices]
+            
+            # Create a mask for valid (non-padding) connections
+            # -1 is used as a padding value in the supplied connections
+            # [batch, k_down, C]
+            valid_mask = (allowed_up != -1)
+            
+            # Create a mask of shape [batch, k_down, C, k_up] indicating where
+            # allowed_up[b,d,c] == up_indices[b,u]
+            allowed_up_expanded = allowed_up.unsqueeze(-1)  # [batch, k_down, C, 1]
+            up_indices_expanded = up_indices.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k_up]
+            connection_mask = (allowed_up_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
+            
+            # Get the corresponding upstream values
+            # [batch, k_down, C, k_up]
+            up_vals_expanded = up_vals.unsqueeze(1).unsqueeze(2).expand(-1, k_down, C, -1)
+            connected_vals = t.where(connection_mask, up_vals_expanded, t.zeros_like(up_vals_expanded))
+            
+            # Get the corresponding virtual weights
+            active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
+            active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
+            
+            active_down_vectors = down_encoder[down_indices.reshape(-1)]  # [batch*k_down, d_in]
+            active_down_vectors = active_down_vectors.view(batch_size, k_down, -1)  # [batch, k_down, d_in]
+            
+            # Compute all virtual weights between active features
+            # [batch, k_down, k_up]
+            virtual_weights = einops.einsum(
+                active_down_vectors, active_up_vectors,
+                "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
+            )
+            
+            # Expand virtual weights to match connection mask shape
+            # [batch, k_down, C, k_up]
+            virtual_weights = virtual_weights.unsqueeze(2).expand(-1, -1, C, -1)
+            
+            # Apply connection mask and sum contributions
+            contributions = (virtual_weights * connected_vals).sum(dim=(-1, -2))  # [batch, k_down]
+
+            b_dec_contrib =  self.aes[up_name].encoder.weight @ self.aes[up_name].b_dec
+            contributions = contributions + b_dec_contrib[up_indices]
+            
+            return contributions
 
     def vanilla_forward(
         self,
@@ -223,7 +367,8 @@ class SCAESuite(nn.Module):
         
         # Now compute approximate features for each module
         for down_name, config in self.configs.items():
-            if down_name not in self.connections:
+            # Skip if this module has no connections defined or no inputs
+            if not hasattr(config, 'connections') or not config.connections:
                 continue
                 
             if down_name not in inputs:
@@ -241,7 +386,7 @@ class SCAESuite(nn.Module):
                 return_topk=True
                 )
             
-            for up_name in self.connections[down_name].keys():
+            for up_name in self.configs[down_name].connections.keys():
                 if up_name not in inputs:
                     continue
                     
@@ -543,111 +688,33 @@ class SCAESuite(nn.Module):
         
         return results
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_configs: Dict[str, Dict],
-        connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
-        device: Optional[str] = None
-    ) -> "SCAESuite":
-        """
-        Load pretrained autoencoders from HuggingFace.
-        
-        Args:
-            pretrained_configs: Dictionary mapping submodule names to configs with:
-                - repo_id: HuggingFace repo ID
-                - filename: Name of weights file
-                - k: Number of features to use
-                - upstream_connections: List of upstream module names (optional)
-            connections: Optional sparse connection dictionary (see __init__)
-            device: Device to load models on
-                
-        Returns:
-            Initialized SCAESuite with pretrained weights
-        """
-        submodule_configs = {}
-        
-        # First load all state dicts to get dimensions
-        state_dicts = {}
-        for name, config in pretrained_configs.items():
-            weights_path = hf_hub_download(
-                repo_id=config['repo_id'],
-                filename=config['filename']
-            )
-            state_dict = t.load(weights_path, map_location='cpu')
-            state_dicts[name] = state_dict
-            
-            # Get dimensions from weights
-            dict_size, activation_dim = state_dict['encoder.weight'].shape
-            
-            submodule_configs[name] = SubmoduleConfig(
-                activation_dim=activation_dim,
-                dict_size=dict_size,
-                k=config['k'],
-                layernorm_gamma=config.get('layernorm_gamma', 1.0),
-                upstream_connections=config.get('upstream_connections'),
-            )
-        
-        # Initialize suite
-        suite = cls(submodule_configs, connections=connections, device=device)
-        
-        # Load weights
-        for name, state_dict in state_dicts.items():
-            suite.aes[name].load_state_dict(state_dict)
-
-        suite.is_pretrained = True
-        return suite
 
 
-
-
-
-@dataclass
-class TrainerConfig:
-    """Configuration for SCAE Suite training"""
-    steps: int
-    auxk_alpha: float = 0.0  # Weight for auxiliary loss (dead features)
-    connection_sparsity_coeff: float = 0.0  # Weight for connection sparsity loss
-    lr_decay_start: int = 24000  # Step to start learning rate decay
-    dead_feature_threshold: int = 10_000_000  # Tokens since last activation
-    base_lr: float = 2e-4  # Base learning rate (will be scaled by dictionary size)
-
-class TrainerSCAESuite:
+class SCAETrainer:
+    """Trainer for Sparse Connected Autoencoder Suite"""
+    
     def __init__(
         self,
         suite: SCAESuite,
-        config: TrainerConfig,
-        seed: Optional[int] = None,
-        wandb_name: Optional[str] = None,
+        config: TrainingConfig,
+        seed: Optional[int] = None
     ):
-        """
-        Trainer for Sparse Connected Autoencoder Suite.
-        
-        Args:
-            suite: SCAESuite object to train
-            config: Training configuration
-            seed: Random seed for reproducibility
-            wandb_name: Optional W&B run name
-        """
         self.suite = suite
         self.config = config
-        self.wandb_name = wandb_name
         
         if seed is not None:
             t.manual_seed(seed)
             t.cuda.manual_seed_all(seed)
         
-        # Initialize learning rates
-        self.lrs = {
+        # Initialize optimizer with per-module learning rates
+        lrs = {
             name: config.base_lr / (ae.dict_size / 2**14)**0.5 
             for name, ae in suite.aes.items()
         }
-        
-        # Initialize optimizer with per-module learning rates
         self.optimizer = t.optim.Adam([
-            {'params': ae.parameters(), 'lr': self.lrs[name]}
+            {'params': ae.parameters(), 'lr': lrs[name]}
             for name, ae in suite.aes.items()
-        ], betas=(0.9, 0.999))
+        ])
         
         # Learning rate scheduler
         def lr_fn(step):
@@ -665,48 +732,97 @@ class TrainerSCAESuite:
             for name, ae in suite.aes.items()
         }
         
-        # Initialize metrics
-        self.effective_l0s = {name: -1 for name in suite.submodule_names}
-        self.dead_features = {name: -1 for name in suite.submodule_names}
+        # Initialize wandb if requested
+        if config.use_wandb:
+            import wandb
+            
+            def remove_tensors(obj):
+                if isinstance(obj, dict):
+                    return {k: remove_tensors(v) for k, v in obj.items() 
+                           if not isinstance(v, t.Tensor)}
+                elif isinstance(obj, (list, tuple)):
+                    return type(obj)(remove_tensors(x) for x in obj 
+                                   if not isinstance(x, t.Tensor))
+                else:
+                    return obj
+            
+            # Only remove tensors from the initial config
+            module_configs_json = {
+                name: remove_tensors(asdict(cfg))
+                for name, cfg in suite.configs.items()
+            }
+            
+            wandb.init(
+                project="sae_training",
+                config={
+                    "module_configs": module_configs_json,
+                    "training_config": asdict(config)
+                }
+            )
 
-    def update(
+    def train(self, buffer: AllActivationBuffer):
+        """Run full training loop"""
+        pbar = tqdm(range(self.config.steps))
+        for step in pbar:
+            try:
+                input_acts, target_acts = next(buffer)
+            except StopIteration:
+                print("Ran out of data, ending training")
+                break
+                
+            loss = self.train_step(
+                step=step,
+                input_acts=input_acts,
+                target_acts=target_acts
+            )
+            
+            pbar.set_description(f"Loss: {loss:.4f}")
+            
+            # Save checkpoints if requested
+            if (self.config.save_steps is not None and 
+                step % self.config.save_steps == 0 and 
+                self.config.save_dir is not None):
+                
+                save_dir = os.path.join(
+                    self.config.save_dir,
+                    f"step_{step}"
+                )
+                self.suite.save_checkpoint(
+                    save_dir=save_dir,
+                    step=step,
+                    optimizer_state=self.optimizer.state_dict(),
+                    scheduler_state=self.scheduler.state_dict()
+                )
+        
+        # Save final model
+        if self.config.save_dir is not None:
+            self.suite.save_checkpoint(
+                save_dir=os.path.join(self.config.save_dir, "final"),
+                step=step,
+                optimizer_state=self.optimizer.state_dict(),
+                scheduler_state=self.scheduler.state_dict()
+            )
+        
+        # Upload to hub if requested
+        if self.config.hf_repo_id is not None:
+            self.suite.upload_to_hub(self.config.hf_repo_id)
+
+    def train_step(
         self,
         step: int,
         input_acts: Dict[str, t.Tensor],
-        target_acts: Dict[str, t.Tensor],
-        log_metrics: bool = False,
+        target_acts: Dict[str, t.Tensor]
     ) -> float:
-        """
-        Single training step.
-        
-        Args:
-            step: Current training step
-            input_acts: Dictionary of input activations for each SAE
-            target_acts: Dictionary of target activations for each SAE
-            log_metrics: Whether to log metrics to wandb
-                
-        Returns:
-            Total loss for this step
-        """
-        # Move inputs to device
+        """Single training step"""
+        # Move inputs to device and dtype
         input_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+            k: v.to(device=self.suite.device, dtype=self.suite.dtype)
             for k, v in input_acts.items()
         }
         target_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+            k: v.to(device=self.suite.device, dtype=self.suite.dtype)
             for k, v in target_acts.items()
         }
-        
-        # Initialize geometric median at step 0 only for non-pretrained SAEs
-        if step == 0 and not self.suite.is_pretrained:
-            for name, x in input_acts.items():
-                median = geometric_median(x)
-                self.suite.aes[name].b_dec.data = median
-        
-        # Ensure decoder norms are unit
-        for ae in self.suite.aes.values():
-            ae.set_decoder_norm_to_unit_norm()
         
         self.optimizer.zero_grad()
         total_loss = 0
@@ -784,14 +900,14 @@ class TrainerSCAESuite:
                     )
                     total_loss = total_loss + self.config.auxk_alpha * auxk_loss
                     losses['auxiliary'][name] = auxk_loss.item()
-        
-        # Compute connection sparsity loss
+                    
+        # Compute connection sparsity loss if requested
         if self.config.connection_sparsity_coeff > 0:
             # Get approximate reconstructions
             approx_results = self.suite.approx_forward(input_acts)
             
-            for down_name in self.suite.connections:
-                if down_name not in input_acts:
+            for down_name in self.suite.configs:
+                if down_name not in input_acts or not self.suite.configs[down_name].connection_specs:
                     continue
                 
                 x_hat_approx = approx_results[down_name]
@@ -801,10 +917,6 @@ class TrainerSCAESuite:
                 approx_loss = (x_hat_approx - tgt).pow(2).sum(dim=-1).mean()
                 total_loss = total_loss + self.config.connection_sparsity_coeff * approx_loss
                 losses['connection'][down_name] = approx_loss.item()
-
-                # l2_loss_vanilla
-                # l2_loss_pruned
-                # approximation_loss = (feature_acts_pruned - feature_acts_vanilla).pow(2).sum(dim=-1).mean()
         
         # Backward pass and optimization
         total_loss.backward()
@@ -818,7 +930,7 @@ class TrainerSCAESuite:
         self.scheduler.step()
         
         # Log metrics if requested
-        if log_metrics and self.wandb_name is not None:
+        if self.config.log_steps is not None and step % self.config.log_steps == 0 and self.config.use_wandb:
             import wandb
             
             # Log learning rates
@@ -838,7 +950,7 @@ class TrainerSCAESuite:
             wandb.log(log_dict, step=step)
         
         return total_loss.item()
-
+    
 
 def geometric_median(x: t.Tensor, num_iterations: int = 20) -> t.Tensor:
     """Compute geometric median of points."""
