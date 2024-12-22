@@ -15,9 +15,6 @@ class SubmoduleConfig:
     activation_dim: int
     dict_size: int
     k: int
-    layernorm_gamma : float # layernorm gamma value
-    upstream_connections: List[str] = None  # Names of upstream modules to connect to
-    
 
 class SCAESuite(nn.Module):
     """A suite of Sparsely-Connected TopK Autoencoders"""
@@ -74,6 +71,17 @@ class SCAESuite(nn.Module):
                         f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
                     
                     self.connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
+
+    def get_initial_contributions(
+            self,
+            initial_act: t.Tensor, # [batch, d_in]
+            down_name: str, # e.g. 'mlp_5'
+            down_indices: t.Tensor, # [batch, k_down]
+    ):
+        W_enc_FD = self.aes[down_name].encoder.weight
+        contributions_BF = initial_act @ W_enc_FD.T
+        contributions_BK = contributions_BF.gather(1, down_indices)
+        return contributions_BK
 
     def get_pruned_contributions(
         self,
@@ -201,6 +209,7 @@ class SCAESuite(nn.Module):
 
     def approx_forward(
         self,
+        initial_acts: t.Tensor,
         inputs: Dict[str, t.Tensor],
     ) -> Dict[str, t.Tensor]:
         """
@@ -220,6 +229,7 @@ class SCAESuite(nn.Module):
         results, features, topk_info = self.vanilla_forward(
             inputs, return_features=True, return_topk=True
         )
+
         
         # Now compute approximate features for each module
         for down_name, config in self.configs.items():
@@ -233,13 +243,12 @@ class SCAESuite(nn.Module):
             batch_size = down_idxs.shape[0]
             
             # Initialise approx_acts as just the contribution from initial node 
-            # E.g. if the earliest node is "attn_0", then we initialise as the input to "attn_0"
+            # E.g. if the earliest node is "attn_0", then we initialise as blocks.0.hook_resid_pre
             # ah ffs we actually need the input to the layernorm that preceded attn_0
             # TODO: add option to start at arbitrary layer
-            _, approx_acts, _ = self.aes[down_name].encode(
-                inputs['attn_0'],
-                return_topk=True
-                )
+            approx_acts = self.get_initial_contributions(
+                initial_acts, down_name, down_idxs
+            )
             
             for up_name in self.connections[down_name].keys():
                 if up_name not in inputs:
@@ -260,7 +269,7 @@ class SCAESuite(nn.Module):
             d_model = list(inputs.values())[0].shape[-1]
             scale = approx_acts.norm(dim=-1, keepdim=True) / d_model ** 0.5
 
-            approx_acts = approx_acts / scale * self.configs[down_name].layernorm_gamma
+            approx_acts = approx_acts / scale # TODO gamma and bias
 
 
             # Add downstream encoder bias
@@ -290,6 +299,7 @@ class SCAESuite(nn.Module):
     @t.no_grad()
     def evaluate_varexp_batch(
         self,
+        initial_acts: t.Tensor,
         input_acts: Dict[str, t.Tensor],
         target_acts: Dict[str, t.Tensor],
         use_sparse_connections: bool = False,
@@ -321,7 +331,7 @@ class SCAESuite(nn.Module):
         
         # Get reconstructions based on forward pass type
         if use_sparse_connections:
-            results = self.approx_forward(input_acts)
+            results = self.approx_forward(initial_acts, input_acts)
         else:
             results = self.vanilla_forward(input_acts)
         
@@ -350,7 +360,7 @@ class SCAESuite(nn.Module):
             
             metrics[name] = {
                 'l2_loss': l2_loss.item(),
-                'frac_variance_explained': frac_variance_explained.item()
+                'FVU': 1 - frac_variance_explained.item()
             }
         
         return metrics
@@ -360,6 +370,7 @@ class SCAESuite(nn.Module):
         self,
         model,
         text: Union[str, t.Tensor],
+        initial_submodule: 'Module',
         submodules: Dict[str, Tuple['Module', str]],  # Maps SAE name to (submodule, io_type)
         use_sparse_connections: bool = False,
         max_len: Optional[int] = None,
@@ -388,6 +399,7 @@ class SCAESuite(nn.Module):
                 - loss_zero: CE loss with zeroed activations
                 - frac_recovered: Fraction of performance recovered vs zeroing
         """
+
         device = device or self.device
         
         # Setup invoker args for length control
@@ -401,7 +413,7 @@ class SCAESuite(nn.Module):
         # Get all activations in one pass
         saved_activations = {}
         with model.trace(text, **tracer_args, invoker_args=invoker_args):
-            for name, (submodule, io) in submodules.items():
+            for name, (submodule, io) in list(submodules.items()) + [('initial', (initial_submodule, 'in'))]:
                 if io in ['in', 'in_and_out']:
                     x = submodule.input
                 elif io == 'out':
@@ -432,16 +444,21 @@ class SCAESuite(nn.Module):
         inputs = {
             name: saved['x'].to(device).view(-1, saved['x'].shape[-1])
             for name, saved in saved_activations.items()
+            if name != 'initial'
         }
+
+        initial_acts = saved_activations['initial']['x'].to(device).view(-1, saved_activations['initial']['x'].shape[-1])
         
         # Choose forward pass based on use_sparse_connections
         if use_sparse_connections:
-            reconstructions = self.approx_forward(inputs)
+            reconstructions = self.approx_forward(initial_acts, inputs)
         else:
             reconstructions = self.vanilla_forward(inputs)
         
         # Reshape reconstructions back to original shapes and apply scaling
         for name, saved in saved_activations.items():
+            if name == 'initial':
+                continue
             x_shape = saved['x'].shape
             x_hat = reconstructions[name]
             x_hat = x_hat.view(x_shape)
@@ -548,7 +565,8 @@ class SCAESuite(nn.Module):
         cls,
         pretrained_configs: Dict[str, Dict],
         connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        dtype : t.dtype = t.float32
     ) -> "SCAESuite":
         """
         Load pretrained autoencoders from HuggingFace.
@@ -558,7 +576,6 @@ class SCAESuite(nn.Module):
                 - repo_id: HuggingFace repo ID
                 - filename: Name of weights file
                 - k: Number of features to use
-                - upstream_connections: List of upstream module names (optional)
             connections: Optional sparse connection dictionary (see __init__)
             device: Device to load models on
                 
@@ -584,12 +601,10 @@ class SCAESuite(nn.Module):
                 activation_dim=activation_dim,
                 dict_size=dict_size,
                 k=config['k'],
-                layernorm_gamma=config.get('layernorm_gamma', 1.0),
-                upstream_connections=config.get('upstream_connections'),
             )
         
         # Initialize suite
-        suite = cls(submodule_configs, connections=connections, device=device)
+        suite = cls(submodule_configs, connections=connections, device=device, dtype=dtype)
         
         # Load weights
         for name, state_dict in state_dicts.items():
@@ -610,7 +625,7 @@ class TrainerConfig:
     connection_sparsity_coeff: float = 0.0  # Weight for connection sparsity loss
     lr_decay_start: int = 24000  # Step to start learning rate decay
     dead_feature_threshold: int = 10_000_000  # Tokens since last activation
-    base_lr: float = 2e-4  # Base learning rate (will be scaled by dictionary size)
+    base_lr: float = 5e-5  # Base learning rate (will be scaled by dictionary size)
 
 class TrainerSCAESuite:
     def __init__(
@@ -672,6 +687,7 @@ class TrainerSCAESuite:
     def update(
         self,
         step: int,
+        initial_acts: t.Tensor,
         input_acts: Dict[str, t.Tensor],
         target_acts: Dict[str, t.Tensor],
         log_metrics: bool = False,
@@ -689,6 +705,7 @@ class TrainerSCAESuite:
             Total loss for this step
         """
         # Move inputs to device
+        initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
         input_acts = {
             k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
             for k, v in input_acts.items()
@@ -716,7 +733,7 @@ class TrainerSCAESuite:
             'reconstruction': {},
             'auxiliary': {},
             'connection': {},
-            'variance_explained': {},
+            'FVU': {},
             'dead_features': {},
         }
         
@@ -750,7 +767,7 @@ class TrainerSCAESuite:
             total_variance = t.var(tgt, dim=0).sum()
             residual_variance = t.var(tgt - x_hat, dim=0).sum()
             frac_variance_explained = 1 - residual_variance / total_variance
-            losses['variance_explained'][name] = frac_variance_explained.item()
+            losses['FVU'][name] = 1 - frac_variance_explained.item()
             
             # Auxiliary loss for dead features
             if self.config.auxk_alpha > 0:
@@ -788,7 +805,7 @@ class TrainerSCAESuite:
         # Compute connection sparsity loss
         if self.config.connection_sparsity_coeff > 0:
             # Get approximate reconstructions
-            approx_results = self.suite.approx_forward(input_acts)
+            approx_results = self.suite.approx_forward(initial_acts, input_acts)
             
             for down_name in self.suite.connections:
                 if down_name not in input_acts:
