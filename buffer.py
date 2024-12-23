@@ -12,36 +12,73 @@ else:
     tracer_kwargs = {'scan' : False, 'validate' : False}
 
 
+from collections import namedtuple
+import torch as t
+
+ActivationBatch = namedtuple('ActivationBatch', ['initial', 'src', 'tgt', 'layernorm_scale'])
+
+from collections import namedtuple
+import torch as t
+from typing import Dict, Iterator, Union, Tuple, Any
+
+ActivationBatch = namedtuple('ActivationBatch', ['initial', 'src', 'tgt', 'layernorm_scale'])
+
 class AllActivationBuffer:
+    """Buffer for collecting and managing neural network activations during processing.
+    
+    Stores activations from specified submodules, including input/output pairs and layernorm scales.
+    Handles both tokenized and raw text input, with support for mixed precision training.
+    """
+    
     def __init__(
             self,
-            data,
-            model: LanguageModel,
-            submodules,
-            initial_submodule,
-            d_submodule=None,
-            n_ctxs=3e4,
-            ctx_len=128,
-            refresh_batch_size=512,
-            out_batch_size=8192,
-            device="cpu",
-            dtype=t.float32,
+            data: Iterator[Union[str, t.Tensor]],
+            model: 'LanguageModel',
+            submodules: Dict[str, Tuple['Module', str]],
+            initial_submodule: 'Module',
+            layernorm_submodules: Dict[str, 'Module'],
+            d_submodule: Union[Dict[str, int], int, None] = None,
+            n_ctxs: int = int(3e4),
+            ctx_len: int = 128,
+            refresh_batch_size: int = 512,
+            out_batch_size: int = 8192,
+            device: str = "cpu",
+            dtype: t.dtype = t.float32,
         ):
-        for name, (submodule, io) in submodules.items():
+        """Initialize the activation buffer.
+        
+        Args:
+            data: Iterator of input data (strings or tensors)
+            model: Language model to process data
+            submodules: Dict mapping names to (submodule, io_type) pairs
+            initial_submodule: First submodule for initial activations
+            layernorm_submodules: Dict mapping names to layernorm submodules
+            d_submodule: Hidden dimensions (int or dict mapping names to dims)
+            n_ctxs: Number of contexts to store
+            ctx_len: Maximum context length
+            refresh_batch_size: Batch size for refreshing buffer
+            out_batch_size: Batch size for outputs
+            device: Device to store tensors on
+            dtype: Data type for stored tensors
+        """
+        # Validate submodule IO types
+        for name, (_, io) in submodules.items():
             if io not in ["in", "out", "in_and_out"]:
-                raise ValueError(f"io must be either 'in' or 'out' or 'in_and_out', got {io}")
+                raise ValueError(f"io must be 'in', 'out', or 'in_and_out', got {io}")
 
         self.data = data
         self.model = model
         self.submodules = submodules
         self.initial_submodule = initial_submodule
-        self.n_ctxs = int(n_ctxs)
+        self.layernorm_submodules = layernorm_submodules
+        self.n_ctxs = n_ctxs
         self.ctx_len = ctx_len
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
         self.device = device
         self.dtype = dtype
         
+        # Determine if tokenization is needed
         try:
             first_item = next(iter(data))
             self.needs_tokenization = isinstance(first_item, str)
@@ -49,42 +86,61 @@ class AllActivationBuffer:
         except StopIteration:
             raise ValueError("Empty data iterator provided")
         
-        if d_submodule is None:
-            d_submodule = {}
-            for name, (submodule, io) in submodules.items():
-                try:
-                    if io == "in":
-                        d_submodule[name] = submodule.in_features
-                    else:
-                        d_submodule[name] = submodule.out_features
-                except:
-                    raise ValueError(f"d_submodule cannot be inferred for {name} and must be specified directly")
-                
-                try:
-                    d_initial = initial_submodule.in_features
-                except:
-                    raise ValueError("Could not infer input dimension for initial_submodule")
-                
-        elif isinstance(d_submodule, int):
-            d_initial = d_submodule
-            d_submodule = {name: d_submodule for name in submodules.keys()}
-            
-        self.d_submodule = d_submodule
-
-        # Initialize activations with specified dtype
-        self.activations = {}
-        for name, (submodule, _) in submodules.items():
-            # Store as [batch, 2, d] for input/output pairs
-            self.activations[name] = t.empty(0, 2, d_submodule[name], device=device, dtype=dtype)
+        # Infer or validate hidden dimensions
+        self.d_submodule = self._setup_hidden_dims(d_submodule)
         
-
-        self.initial_activations = t.empty(0, d_initial, device=device, dtype=dtype)
+        # Initialize activation storage
+        self.activations = self._init_activations()
+        self.initial_activations = t.empty(0, self.d_submodule['initial'], device=device, dtype=dtype)
+        self.ln_scales = {
+            name: t.empty(0, device=device, dtype=dtype)
+            for name in layernorm_submodules
+        }
         
         self.read = t.zeros(0, dtype=t.bool, device=device)
         self.refresh()
-        
-    def process_batch(self, batch, batch_size=None):
-        """Process a batch of inputs, handling both tokenized and untokenized data."""
+    
+    def _setup_hidden_dims(self, d_submodule: Union[Dict[str, int], int, None]) -> Dict[str, int]:
+        """Set up hidden dimensions for all submodules."""
+        if d_submodule is None:
+            d_submodule = {}
+            # Infer dimensions from submodules where possible
+            for name, (submodule, io) in self.submodules.items():
+                try:
+                    d_submodule[name] = (
+                        submodule.in_features if io == "in" 
+                        else submodule.out_features
+                    )
+                except:
+                    raise ValueError(f"d_submodule cannot be inferred for {name}")
+            
+            try:
+                d_submodule['initial'] = self.initial_submodule.in_features
+            except:
+                raise ValueError("Could not infer input dimension for initial_submodule")
+                
+        elif isinstance(d_submodule, int):
+            d_initial = d_submodule
+            d_submodule = {
+                'initial': d_initial,
+                **{name: d_initial for name in self.submodules}
+            }
+            
+        return d_submodule
+    
+    def _init_activations(self) -> Dict[str, t.Tensor]:
+        """Initialize empty activation tensors for all submodules."""
+        return {
+            name: t.empty(0, 2, self.d_submodule[name], device=self.device, dtype=self.dtype)
+            for name in self.submodules
+        }
+
+    def _compute_ln_scale(self, acts: t.Tensor, eps: float=1e-5) -> t.Tensor:
+        """Compute layernorm scale factor sqrt(x^2 + eps)."""
+        return t.sqrt(acts.var(dim=-1) + eps)
+
+    def process_batch(self, batch: list, batch_size: int = None) -> t.Tensor:
+        """Process a batch of inputs, handling tokenization if needed."""
         if batch_size is None:
             batch_size = self.refresh_batch_size
 
@@ -98,12 +154,10 @@ class AllActivationBuffer:
             ).input_ids.to(self.device)
         else:
             tokens = t.tensor(batch, device=self.device)
-            if len(tokens.shape) == 1:
-                tokens = tokens.unsqueeze(0)
-            return tokens
+            return tokens.unsqueeze(0) if len(tokens.shape) == 1 else tokens
 
-    def token_batch(self, batch_size=None):
-        """Return a batch of tokens, automatically handling tokenization if needed"""
+    def token_batch(self, batch_size: int = None) -> t.Tensor:
+        """Return a batch of tokens, handling tokenization if needed."""
         if batch_size is None:
             batch_size = self.refresh_batch_size
         try:
@@ -112,144 +166,156 @@ class AllActivationBuffer:
         except StopIteration:
             raise StopIteration("End of data stream reached")
 
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        """
-        Return a tuple (initial_act, input_acts, target_acts) where:
-        - initial_act is a tensor of shape [batch, d] from the initial submodule
-        - input_acts and target_acts are dictionaries of tensors of shape [batch, d]
-        """
-        with t.no_grad():
-            # Check if we need to refresh based on number of unread samples
-            n_unread = (~self.read).sum().item()
-            if n_unread < self.out_batch_size:
-                self.refresh()
-
-            # Set seed for reproducible randomness
-            g = t.Generator(device=self.device)
-            g.manual_seed(42)
-            
-            # Get random unread indices using seeded generator
-            unreads = (~self.read).nonzero().squeeze()
-            perm = t.randperm(len(unreads), device=unreads.device, generator=g)
-            idxs = unreads[perm[: self.out_batch_size]]
-            self.read[idxs] = True
-            
-            # Get initial activations
-            initial_act = self.initial_activations[idxs]  # [batch, d]
-            
-            # Split module activations into inputs and targets
-            input_acts = {}
-            target_acts = {}
-            
-            for name in self.submodules.keys():
-                acts = self.activations[name][idxs]  # [batch, 2, d]
-                input_acts[name] = acts[:, 0]  # [batch, d]
-                target_acts[name] = acts[:, 1]  # [batch, d]
-            
-            return initial_act, input_acts, target_acts
-
-    def _process_states(self, states):
-        """Process states to handle tuples and get the main activation tensor"""
+    def _process_states(self, states: Any) -> t.Tensor:
+        """Extract activation tensor from potentially nested state structure."""
         if hasattr(states, "value"):
             states = states.value
         
         if isinstance(states, tuple):
             for item in states:
                 if item is not None and hasattr(item, 'shape'):
-                    states = item
-                    break
+                    return item
         
         return states
 
+    def __next__(self) -> ActivationBatch:
+        """Return a batch of activations as a named tuple."""
+        with t.no_grad():
+            # Refresh buffer if needed
+            n_unread = (~self.read).sum().item()
+            if n_unread < self.out_batch_size:
+                self.refresh()
+
+            # Get random unread indices
+            g = t.Generator(device=self.device).manual_seed(42)
+            unreads = (~self.read).nonzero().squeeze()
+            perm = t.randperm(len(unreads), device=unreads.device, generator=g)
+            idxs = unreads[perm[: self.out_batch_size]]
+            self.read[idxs] = True
+            
+            # Collect activations for the batch
+            initial_act = self.initial_activations[idxs]
+            
+            input_acts = {}
+            target_acts = {}
+            for name in self.submodules:
+                acts = self.activations[name][idxs]
+                input_acts[name] = acts[:, 0]
+                target_acts[name] = acts[:, 1]
+            
+            ln_scales = {
+                name: self.ln_scales[name][idxs]
+                for name in self.layernorm_submodules
+            }
+            
+            return ActivationBatch(
+                initial=initial_act,
+                src=input_acts,
+                tgt=target_acts,
+                layernorm_scale=ln_scales
+            )
+
     def refresh(self):
+        """Refresh the activation buffer with new data."""
+        # Clear read activations
         if len(self.read) > 0:
-            for name in self.submodules.keys():
+            for name in self.submodules:
                 self.activations[name] = self.activations[name][~self.read]
+            for name in self.layernorm_submodules:
+                self.ln_scales[name] = self.ln_scales[name][~self.read]
             self.initial_activations = self.initial_activations[~self.read]
 
         target_size = self.n_ctxs * self.ctx_len
         while any(len(acts) < target_size for acts in self.activations.values()):
             try:
                 tokens = self.token_batch()
-                hidden_states_dict = {}
                 
                 with t.no_grad():
-                    # Use autocast for mixed precision if using float16 or bfloat16
-                    if self.dtype in [t.float16, t.bfloat16]:
-                        with t.cuda.amp.autocast(dtype=self.dtype):
-                            trace = self.model.trace(tokens)
-                            with trace:
-                                initial_input = self.initial_submodule.input.save()
-                                saved_inputs = {}
-                                saved_outputs = {}
-                                for name, (submodule, _) in self.submodules.items():
-                                    saved_inputs[name] = submodule.input.save()
-                                    saved_outputs[name] = submodule.output.save()
-                                output = trace.output
-                    else:
+                    context_manager = (
+                        t.cuda.amp.autocast(dtype=self.dtype)
+                        if self.dtype in [t.float16, t.bfloat16]
+                        else t.no_grad()
+                    )
+                    
+                    with context_manager:
                         trace = self.model.trace(tokens)
                         with trace:
+                            # Save all required activation states
                             initial_input = self.initial_submodule.input.save()
-                            saved_inputs = {}
-                            saved_outputs = {}
-                            for name, (submodule, _) in self.submodules.items():
-                                saved_inputs[name] = submodule.input.save()
-                                saved_outputs[name] = submodule.output.save()
+                            saved_inputs = {
+                                name: submodule.input.save()
+                                for name, (submodule, _) in self.submodules.items()
+                            }
+                            saved_outputs = {
+                                name: submodule.output.save()
+                                for name, (submodule, _) in self.submodules.items()
+                            }
+                            ln_inputs = {
+                                name: submodule.input.save()
+                                for name, submodule in self.layernorm_submodules.items()
+                            }
                             output = trace.output
 
-                    # Process initial input
-                    initial_state = self._process_states(initial_input)
-                    initial_state = initial_state.to(dtype=self.dtype)
-                    batch_size = initial_state.shape[0]
-                    seq_len = initial_state.shape[1]
-                    hidden_dim = initial_state.shape[2]
+                    # Process initial activations
+                    initial_state = self._process_states(initial_input).to(dtype=self.dtype)
+                    batch_size, seq_len, hidden_dim = initial_state.shape
                     flat_initial = initial_state.reshape(batch_size * seq_len, hidden_dim)
-                    
-                    # Store initial activations
                     self.initial_activations = t.cat(
-                        [self.initial_activations, flat_initial], 
+                        [self.initial_activations, flat_initial],
                         dim=0
                     )
                     
+                    # Process layernorm inputs and compute scales
+                    for name, ln_input in ln_inputs.items():
+                        ln_state = self._process_states(ln_input).to(dtype=self.dtype)
+                        flat_ln = ln_state.reshape(batch_size * seq_len, hidden_dim)
+                        scale = self._compute_ln_scale(
+                            flat_ln, 
+                            self.layernorm_submodules[name].eps
+                        )
+                        self.ln_scales[name] = t.cat(
+                            [self.ln_scales[name], scale],
+                            dim=0
+                        )
+                    
+                    # Process submodule activations
                     for name, (submodule, io) in self.submodules.items():
-                        raw_in = self._process_states(saved_inputs[name])
-                        raw_out = self._process_states(saved_outputs[name])
-                        
-                        # Convert to specified dtype
-                        raw_in = raw_in.to(dtype=self.dtype)
-                        raw_out = raw_out.to(dtype=self.dtype)
-                        
-                        batch_size = raw_in.shape[0]
-                        seq_len = raw_in.shape[1]
-                        hidden_dim = raw_in.shape[2]
+                        raw_in = self._process_states(saved_inputs[name]).to(dtype=self.dtype)
+                        raw_out = self._process_states(saved_outputs[name]).to(dtype=self.dtype)
                         
                         flat_in = raw_in.reshape(batch_size * seq_len, hidden_dim)
                         flat_out = raw_out.reshape(batch_size * seq_len, hidden_dim)
                         
-                        if io == "in":
-                            hidden_states = t.stack([flat_in, flat_in], dim=1)
-                        elif io == "out":
-                            hidden_states = t.stack([flat_out, flat_out], dim=1)
-                        else:  # io == "in_and_out"
-                            hidden_states = t.stack([flat_in, flat_out], dim=1)
-                                                
+                        # Stack inputs/outputs based on IO type
+                        hidden_states = t.stack(
+                            [flat_in, flat_in] if io == "in"
+                            else [flat_out, flat_out] if io == "out"
+                            else [flat_in, flat_out],
+                            dim=1
+                        )
+                        
                         self.activations[name] = t.cat(
-                            [self.activations[name], hidden_states.to(device=self.device, dtype=self.dtype)], 
+                            [self.activations[name], hidden_states],
                             dim=0
                         )
 
-                    self.read = t.zeros(len(next(iter(self.activations.values()))), dtype=t.bool, device=self.device)
+                    self.read = t.zeros(
+                        len(next(iter(self.activations.values()))),
+                        dtype=t.bool,
+                        device=self.device
+                    )
                 
             except StopIteration:
                 if all(len(acts) == 0 for acts in self.activations.values()):
                     raise StopIteration("No data available to process")
                 break
             
+    def __iter__(self):
+        return self
+
     @property
-    def config(self):
+    def config(self) -> dict:
+        """Return the current configuration of the buffer."""
         return {
             "d_submodule": self.d_submodule,
             "n_ctxs": self.n_ctxs,

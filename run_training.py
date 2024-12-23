@@ -20,14 +20,14 @@ C = 10
 expansion = 16
 k = 128 # TODO auto-detect if loading from pretrained
 
-out_batch_size = 2048
-num_tokens = int(5e8)
+out_batch_size = 4096
+num_tokens = int(2e8)
 
 
 
 #%%
-# model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
-model = LanguageModel(MODEL_NAME, device_map=device, torch_dtype=DTYPE)
+model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
+# model = LanguageModel(MODEL_NAME, device_map=device, torch_dtype=DTYPE)
 data = load_iterable_dataset('Skylion007/openwebtext')
 
 num_features = model.config.n_embd * expansion
@@ -37,9 +37,12 @@ n_layer = model.config.n_layer
 #%%
 initial_submodule = model.transformer.h[0]
 submodules = {}
+layernorm_submodules = {}
 for layer in range(n_layer):
     submodules[f"mlp_{layer}"] = (model.transformer.h[layer].mlp, "in_and_out")
     submodules[f"attn_{layer}"] = (model.transformer.h[layer].attn, "out")
+
+    layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
 
 submodule_names = list(submodules.keys())
 
@@ -48,6 +51,7 @@ buffer = AllActivationBuffer(
     model=model,
     submodules=submodules,
     initial_submodule=initial_submodule,
+    layernorm_submodules=layernorm_submodules,
     d_submodule=model.config.n_embd, # output dimension of the model component
     n_ctxs=1024,  # you can set this higher or lower depending on your available memory
     device="cuda",
@@ -82,6 +86,6 @@ trainer = train_scae_suite(
     log_steps = 20,
     use_wandb = True,
     hf_repo_id = "jacobcd52/gpt2_suite_folded_ln",
-    # seed: Optional[int] = None,
+    seed = 42
 )
 # %%

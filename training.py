@@ -202,7 +202,7 @@ def train_scae_suite(
     
     # Training loop
     pbar = tqdm(buffer, total=steps) if steps is not None else tqdm(buffer)
-    for step, (initial_acts, input_acts, target_acts) in enumerate(pbar):
+    for step, (initial_acts, input_acts, target_acts, layernorm_scales) in enumerate(pbar):
         if steps is not None and step >= steps:
             break
         
@@ -212,6 +212,7 @@ def train_scae_suite(
             initial_acts=initial_acts,
             input_acts=input_acts,
             target_acts=target_acts,
+            layernorm_scales=layernorm_scales,
             log_metrics=(log_steps is not None and step % log_steps == 0)
         )
         

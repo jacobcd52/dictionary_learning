@@ -211,6 +211,7 @@ class SCAESuite(nn.Module):
         self,
         initial_acts: t.Tensor,
         inputs: Dict[str, t.Tensor],
+        layernorm_scales: Dict[str, t.Tensor],
     ) -> Dict[str, t.Tensor]:
         """
         Run approximate forward pass using virtual weights.
@@ -243,9 +244,6 @@ class SCAESuite(nn.Module):
             batch_size = down_idxs.shape[0]
             
             # Initialise approx_acts as just the contribution from initial node 
-            # E.g. if the earliest node is "attn_0", then we initialise as blocks.0.hook_resid_pre
-            # ah ffs we actually need the input to the layernorm that preceded attn_0
-            # TODO: add option to start at arbitrary layer
             approx_acts = self.get_initial_contributions(
                 initial_acts, down_name, down_idxs
             )
@@ -264,12 +262,7 @@ class SCAESuite(nn.Module):
                 approx_acts = approx_acts + contributions
             
             # divide by layernorm scale
-            # TODO: layernorm also has a bias arghhhh
-            # gotta be a cleaner way of doing this
-            d_model = list(inputs.values())[0].shape[-1]
-            scale = approx_acts.norm(dim=-1, keepdim=True) / d_model ** 0.5
-
-            approx_acts = approx_acts / scale # TODO gamma and bias
+            approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1) # TODO worry about centering?
 
 
             # Add downstream encoder bias
@@ -302,6 +295,7 @@ class SCAESuite(nn.Module):
         initial_acts: t.Tensor,
         input_acts: Dict[str, t.Tensor],
         target_acts: Dict[str, t.Tensor],
+        layernorm_scales: Dict[str, t.Tensor],
         use_sparse_connections: bool = False,
         normalize_batch: bool = False,
     ) -> Dict[str, Dict[str, float]]:
@@ -331,7 +325,7 @@ class SCAESuite(nn.Module):
         
         # Get reconstructions based on forward pass type
         if use_sparse_connections:
-            results = self.approx_forward(initial_acts, input_acts)
+            results = self.approx_forward(initial_acts, input_acts, layernorm_scales)
         else:
             results = self.vanilla_forward(input_acts)
         
@@ -372,6 +366,7 @@ class SCAESuite(nn.Module):
         text: Union[str, t.Tensor],
         initial_submodule: 'Module',
         submodules: Dict[str, Tuple['Module', str]],  # Maps SAE name to (submodule, io_type)
+        layernorm_submodules: Dict[str, 'Module'],
         use_sparse_connections: bool = False,
         max_len: Optional[int] = None,
         normalize_batch: bool = False,
@@ -410,7 +405,7 @@ class SCAESuite(nn.Module):
             logits_original = model.output.save()
         logits_original = logits_original.value
         
-        # Get all activations in one pass
+        # Get all activations in one pass TODO: layernorm_scales
         saved_activations = {}
         with model.trace(text, **tracer_args, invoker_args=invoker_args):
             for name, (submodule, io) in list(submodules.items()) + [('initial', (initial_submodule, 'in'))]:
@@ -451,7 +446,11 @@ class SCAESuite(nn.Module):
         
         # Choose forward pass based on use_sparse_connections
         if use_sparse_connections:
-            reconstructions = self.approx_forward(initial_acts, inputs)
+            layernorm_scales = {
+                name: t.ones([initial_acts.shape[0]], dtype=self.dtype, device=device)
+                for name in submodules
+            } # TODO fix
+            reconstructions = self.approx_forward(initial_acts, inputs, layernorm_scales)
         else:
             reconstructions = self.vanilla_forward(inputs)
         
@@ -621,11 +620,11 @@ class SCAESuite(nn.Module):
 class TrainerConfig:
     """Configuration for SCAE Suite training"""
     steps: int
-    auxk_alpha: float = 0.0  # Weight for auxiliary loss (dead features)
+    auxk_alpha: float = 1/32  # Weight for auxiliary loss (dead features)
     connection_sparsity_coeff: float = 0.0  # Weight for connection sparsity loss
-    lr_decay_start: int = 24000  # Step to start learning rate decay
+    lr_decay_start_proportion: int = 0.8  # Fraction of training at which to start decaying LR
     dead_feature_threshold: int = 10_000_000  # Tokens since last activation
-    base_lr: float = 5e-5  # Base learning rate (will be scaled by dictionary size)
+    base_lr: float = 2e-4  # Base learning rate (will be scaled by dictionary size)
 
 class TrainerSCAESuite:
     def __init__(
@@ -666,9 +665,9 @@ class TrainerSCAESuite:
         
         # Learning rate scheduler
         def lr_fn(step):
-            if step < config.lr_decay_start:
+            if step < config.lr_decay_start_proportion * config.steps:
                 return 1.0
-            return (config.steps - step) / (config.steps - config.lr_decay_start)
+            return (config.steps - step) / (config.steps - config.lr_decay_start_proportion * config.steps)
         
         self.scheduler = t.optim.lr_scheduler.LambdaLR(
             self.optimizer, lr_lambda=lr_fn
@@ -690,6 +689,7 @@ class TrainerSCAESuite:
         initial_acts: t.Tensor,
         input_acts: Dict[str, t.Tensor],
         target_acts: Dict[str, t.Tensor],
+        layernorm_scales: Dict[str, t.Tensor],
         log_metrics: bool = False,
     ) -> float:
         """
@@ -805,7 +805,7 @@ class TrainerSCAESuite:
         # Compute connection sparsity loss
         if self.config.connection_sparsity_coeff > 0:
             # Get approximate reconstructions
-            approx_results = self.suite.approx_forward(initial_acts, input_acts)
+            approx_results = self.suite.approx_forward(initial_acts, input_acts, layernorm_scales)
             
             for down_name in self.suite.connections:
                 if down_name not in input_acts:
