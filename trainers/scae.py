@@ -5,6 +5,7 @@ from typing import Dict, Tuple, Optional, List, Union
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
 import wandb
+import json 
 
 from trainers.top_k import AutoEncoderTopK
 
@@ -562,56 +563,86 @@ class SCAESuite(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_configs: Dict[str, Dict],
-        connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
+        repo_id: str,
         device: Optional[str] = None,
-        dtype : t.dtype = t.float32
+        dtype: t.dtype = t.float32
     ) -> "SCAESuite":
         """
-        Load pretrained autoencoders from HuggingFace.
+        Load a pretrained SCAESuite from HuggingFace.
         
         Args:
-            pretrained_configs: Dictionary mapping submodule names to configs with:
-                - repo_id: HuggingFace repo ID
-                - filename: Name of weights file
-                - k: Number of features to use
-            connections: Optional sparse connection dictionary (see __init__)
-            device: Device to load models on
-                
+            repo_id: HuggingFace repository ID containing the saved model
+            device: Device to load the model on
+            dtype: Data type for model parameters
+            
         Returns:
             Initialized SCAESuite with pretrained weights
+            
+        Example:
+            >>> suite = SCAESuite.from_pretrained("organization/model-name")
         """
-        submodule_configs = {}
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise ImportError(
+                "huggingface_hub package is required to load pretrained models. "
+                "Install with: pip install huggingface_hub"
+            )
+
+        # Download configuration
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
         
-        # First load all state dicts to get dimensions
-        state_dicts = {}
-        for name, config in pretrained_configs.items():
-            weights_path = hf_hub_download(
-                repo_id=config['repo_id'],
-                filename=config['filename']
+        # Extract submodule configs
+        if config.get("is_pretrained", False):
+            # Handle nested pretrained case (though this shouldn't happen in practice)
+            raise ValueError(
+                f"Model {repo_id} was initialized from pretrained weights. "
+                "Please load from the original source."
             )
-            state_dict = t.load(weights_path, map_location='cpu')
-            state_dicts[name] = state_dict
-            
-            # Get dimensions from weights
-            dict_size, activation_dim = state_dict['encoder.weight'].shape
-            
-            submodule_configs[name] = SubmoduleConfig(
-                activation_dim=activation_dim,
-                dict_size=dict_size,
-                k=config['k'],
-            )
+        
+        submodule_configs = {
+            name: SubmoduleConfig(**cfg)
+            for name, cfg in config["submodule_configs"].items()
+        }
+        
+        # Try to load connections if they exist
+        try:
+            connections_path = hf_hub_download(repo_id=repo_id, filename="connections.pt")
+            connections = t.load(connections_path, map_location='cpu')
+        except Exception:
+            connections = None
         
         # Initialize suite
-        suite = cls(submodule_configs, connections=connections, device=device, dtype=dtype)
+        suite = cls(
+            submodule_configs=submodule_configs,
+            connections=connections,
+            dtype=dtype,
+            device=device
+        )
         
-        # Load weights
-        for name, state_dict in state_dicts.items():
-            suite.aes[name].load_state_dict(state_dict)
-
+        # Download and load state dict
+        checkpoint_path = hf_hub_download(repo_id=repo_id, filename="checkpoint.pt")
+        checkpoint = t.load(checkpoint_path, map_location='cpu')
+        
+        # Load state dict
+        if isinstance(checkpoint, dict) and 'suite_state' in checkpoint:
+            state_dict = checkpoint['suite_state']
+        else:
+            # Handle case where checkpoint is just the state dict
+            state_dict = checkpoint
+        
+        # Load state dict into suite
+        missing_keys, unexpected_keys = suite.load_state_dict(state_dict)
+        
+        if len(missing_keys) > 0:
+            print(f"Warning: Missing keys in state dict: {missing_keys}")
+        if len(unexpected_keys) > 0:
+            print(f"Warning: Unexpected keys in state dict: {unexpected_keys}")
+        
         suite.is_pretrained = True
         return suite
-
 
 
 
