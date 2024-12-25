@@ -26,13 +26,13 @@ from typing import Dict, List
 import torch.sparse as sparse
 
 def get_top_connections(
-    suite: SCAESuite, 
+    suite: SCAESuite,
     c: int,
     buffer: AllActivationBuffer,
     num_batches: int = 1
 ) -> Dict[str, Dict[str, t.Tensor]]:
     """
-    Compute importance scores between all valid pairs of autoencoders.
+    Compute importance scores between causally valid pairs of autoencoders.
     
     Args:
         suite: The SCAESuite instance
@@ -44,162 +44,161 @@ def get_top_connections(
         Dictionary mapping downstream module names to dictionaries of importance scores.
         Format: {down_name: {up_name: importance_tensor}}
         where importance_tensor has shape [n_down_features, c] containing indices 
-        of connected upstream features, padded with -1
+        of connected upstream features
     """
-    # Get all module names and configs
-    mlp_names = [name for name in suite.submodule_names if name.startswith('mlp_')]
-    attn_names = [name for name in suite.submodule_names if name.startswith('attn_')]
+    # Sort module names
+    mlp_names = sorted([name for name in suite.submodule_names if name.startswith('mlp_')])
+    attn_names = sorted([name for name in suite.submodule_names if name.startswith('attn_')])
     
-    # Sort names to ensure correct ordering
-    mlp_names.sort()
-    attn_names.sort()
+    # Initialize importance scores dictionary
+    importance_scores: Dict[str, Dict[str, sparse.FloatTensor]] = {}
     
-    # Initialize dictionary to store importance scores
-    importance_scores = {}
-    
-    # Process multiple batches
+    # Process batches
     for batch_idx in tqdm(range(num_batches)):
-        # Get inputs from buffer and determine batch size
+        # Get batch inputs and run forward pass
         inputs = next(buffer).src
-        batch_size = next(iter(inputs.values())).size(0)
-        
-        # Run vanilla forward pass to get features and top-k info
         _, features, topk_info = suite.vanilla_forward(inputs, return_features=True, return_topk=True)
         
-        # For each downstream MLP module
+        # Process each downstream MLP module
         for down_idx, down_name in enumerate(mlp_names):
             if batch_idx == 0:
                 importance_scores[down_name] = {}
+                
             down_config = suite.configs[down_name]
-            
-            # Initialize sparse tensor for storing scores
             scores_shape = (down_config.dict_size, down_config.dict_size)
             
-            # Get downstream active features and indices
+            # Get downstream active features
             down_idxs = topk_info[down_name][0]  # [batch, k_down]
             k_down = down_idxs.shape[1]
             
-            # Process all valid upstream modules
+            # Get valid upstream modules based on causal ordering
             valid_up_names = (
                 [name for name in mlp_names if int(name.split('_')[1]) < down_idx] +
                 [name for name in attn_names if int(name.split('_')[1]) <= down_idx]
             )
             
+            # Process each valid upstream module
             for up_name in valid_up_names:
                 up_config = suite.configs[up_name]
                 
-                # Get active features
+                # Get active upstream features
                 up_idxs = topk_info[up_name][0]  # [batch, k_up]
                 up_vals = topk_info[up_name][1]  # [batch, k_up]
                 k_up = up_idxs.shape[1]
                 
-                # Get active weight matrices
+                # Get active weight matrices and compute virtual weights
                 up_decoder = suite.aes[up_name].decoder.weight  # [d_in, d_up]
                 down_encoder = suite.aes[down_name].encoder.weight  # [d_down, d_in]
                 
-                # Get active vectors
-                active_up_vectors = up_decoder[:, up_idxs.reshape(-1)].T  # [batch*k_up, d_in]
-                active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
+                batch_size = next(iter(inputs.values())).size(0)
+                active_up = up_decoder[:, up_idxs.reshape(-1)].T.view(batch_size, k_up, -1)
+                active_down = down_encoder[down_idxs.reshape(-1)].view(batch_size, k_down, -1)
                 
-                active_down_vectors = down_encoder[down_idxs.reshape(-1)]  # [batch*k_down, d_in]
-                active_down_vectors = active_down_vectors.view(batch_size, k_down, -1)  # [batch, k_down, d_in]
-                
-                # Compute virtual weights between active features
+                # Compute virtual weights and contributions
                 virtual_weights = einops.einsum(
-                    active_down_vectors, active_up_vectors,
+                    active_down, active_up,
                     "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
                 )
+                contributions = virtual_weights * up_vals.unsqueeze(1).expand(-1, k_down, -1)
                 
-                # Get upstream values and compute contributions
-                up_vals_expanded = up_vals.unsqueeze(1).expand(-1, k_down, -1)
-                contributions = virtual_weights * up_vals_expanded
+                # Create indices for sparse tensor
+                down_expanded = down_idxs.unsqueeze(-1).expand(-1, -1, k_up)
+                up_expanded = up_idxs.unsqueeze(1).expand(-1, k_down, -1)
                 
-                # Accumulate importance scores
-                contributions_abs = contributions.abs()
-                
-                # Create indices for sparse tensor updates
-                down_idxs_expanded = down_idxs.unsqueeze(-1).expand(-1, -1, k_up)  # [batch, k_down, k_up]
-                up_idxs_expanded = up_idxs.unsqueeze(1).expand(-1, k_down, -1)  # [batch, k_down, k_up]
-                
-                # Flatten indices and values
-                flat_down_idxs = down_idxs_expanded.reshape(-1)
-                flat_up_idxs = up_idxs_expanded.reshape(-1)
-                flat_values = contributions_abs.reshape(-1)
-                
-                # Create sparse tensor of importance scores
-                indices = t.stack([flat_down_idxs, flat_up_idxs])
+                # Create and accumulate sparse tensor of importance scores
+                indices = t.stack([down_expanded.reshape(-1), up_expanded.reshape(-1)])
                 batch_scores = sparse.FloatTensor(
-                    indices, flat_values,
+                    indices, 
+                    contributions.abs().reshape(-1),
                     scores_shape
                 ).coalesce()
                 
                 if batch_idx == 0:
                     importance_scores[down_name][up_name] = batch_scores
                 else:
-                    existing_scores = importance_scores[down_name][up_name]
-                    importance_scores[down_name][up_name] = (existing_scores + batch_scores).coalesce()
+                    importance_scores[down_name][up_name] = (
+                        importance_scores[down_name][up_name] + batch_scores
+                    ).coalesce()
     
+    # Convert importance scores to connections
     connections = {}
-    downstream_modules = list(importance_scores.keys())
-    
-    # Define chunk size for processing
     chunk_size = 1000  # Adjust based on available memory
+    
+    # Get list of modules to process before we start modifying the dictionary
+    downstream_modules = list(importance_scores.keys())
     
     # Process one downstream module at a time
     for down_name in downstream_modules:
         up_dict = importance_scores[down_name]
-        connections[down_name] = {}
+        print(f"Processing downstream module: {down_name}")
         down_size = suite.configs[down_name].dict_size
-        module_names = list(up_dict.keys())
+        connections[down_name] = {}
         
         try:
-            # Initialize connection tensors for each upstream module
-            for up_name in module_names:
-                connections[down_name][up_name] = t.full((down_size, c), -1, device=suite.device)
-            
             # Process in chunks
             for chunk_start in range(0, down_size, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, down_size)
+                chunk_size_actual = chunk_end - chunk_start
+                
+                # Get valid upstream modules based on causal ordering
+                down_idx = int(down_name.split('_')[1])
+                valid_up_names = (
+                    [name for name in mlp_names if int(name.split('_')[1]) < down_idx] +
+                    [name for name in attn_names if int(name.split('_')[1]) <= down_idx]
+                )
+                
+                # Stack scores from each valid upstream module
                 chunk_scores = []
+                up_names = []
                 
-                # Get chunk of scores from each upstream module
-                for up_name, scores in up_dict.items():
-                    # Convert to dense first, then slice the chunk
-                    dense_scores = scores.to_dense()
-                    dense_chunk = dense_scores[chunk_start:chunk_end]
-                    del dense_scores  # Clean up the full dense tensor
-                    chunk_scores.append(dense_chunk)
+                for up_name in valid_up_names:
+                    if up_name not in up_dict:
+                        continue
+                    scores = up_dict[up_name]
+                    dense_chunk = scores.to_dense()[chunk_start:chunk_end]
+                    if dense_chunk.sum() > 0:  # Only include if there are non-zero scores
+                        chunk_scores.append(dense_chunk)
+                        up_names.append(up_name)
                 
-                # Stack and process just this chunk
-                chunk_all_scores = t.stack(chunk_scores, dim=1)
-                flat_chunk_scores = chunk_all_scores.reshape(chunk_end - chunk_start, -1)
-                del chunk_all_scores
+                if not chunk_scores:  # Skip if no valid connections in chunk
+                    continue
+                    
+                # Find top connections
+                stacked_scores = t.stack(chunk_scores, dim=1)
+                flat_scores = stacked_scores.reshape(chunk_size_actual, -1)
+                top_values, top_indices = t.topk(flat_scores, min(c, flat_scores.size(1)))
                 
-                # Get top c for this chunk
-                top_values, top_indices = t.topk(flat_chunk_scores, c)
-                del flat_chunk_scores
-                
-                # Convert flat indices back to module and feature indices
-                max_up_size = up_dict[module_names[0]].size(1)
+                # Convert indices back to module and feature indices
+                max_up_size = up_dict[up_names[0]].size(1)
                 module_idx = top_indices // max_up_size
                 feature_idx = top_indices % max_up_size
-                del top_indices
                 
-                # Update connections for each upstream module
-                for i, up_name in enumerate(module_names):
+                # Create connections for each upstream module
+                for i, up_name in enumerate(up_names):
                     module_mask = (module_idx == i) & (top_values > 0)
+                    if not module_mask.any():
+                        continue
+                        
                     rows, cols = t.where(module_mask)
                     valid_indices = feature_idx[rows, cols]
                     
-                    if len(valid_indices) > 0:
-                        connections[down_name][up_name][chunk_start + rows, cols] = valid_indices
+                    if up_name not in connections[down_name]:
+                        connections[down_name][up_name] = t.full(
+                            (down_size, c), 
+                            -1, 
+                            device=suite.device
+                        )
+                    
+                    connections[down_name][up_name][
+                        chunk_start + rows, cols
+                    ] = valid_indices
                 
-                # Clean up chunk processing
-                del module_idx, feature_idx, top_values
+                # Clean up
+                del stacked_scores, flat_scores, top_values, top_indices
                 t.cuda.empty_cache()
-            
+                
         finally:
-            # Clean up importance scores after processing each downstream module
+            # Clean up after processing each downstream module
             del importance_scores[down_name]
             t.cuda.empty_cache()
     
@@ -240,7 +239,7 @@ out = get_top_connections(
     suite,
     c=200,
     buffer=buffer,
-    num_batches=40,
+    num_batches=100,
 )
 # %%
 # save the output as pickle
@@ -249,3 +248,4 @@ with open('top_connections.pkl', 'wb') as f:
     pickle.dump(out, f)
 
 #%%
+
