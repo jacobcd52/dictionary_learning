@@ -91,21 +91,25 @@ class SCAESuite(nn.Module):
         up_indices: t.Tensor,  # [batch, k_up]
         down_indices: t.Tensor,  # [batch, k_down]
         up_vals: t.Tensor,  # [batch, k_up]
+        C: int = 1
     ) -> t.Tensor:  # [batch, k_down]
         """
         Computes the approximate direct-path contribution from upstream SAE to downstream SAE,
         only using the nonzero connections between active features.
         Returns shape [batch, k_down].
+
+        pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
         """
-        # pruned_contribution = (down_encoder @ up_decoder) @ up_feature_acts
+        
         batch_size = up_indices.shape[0]
         k_up = up_indices.shape[1]
         k_down = down_indices.shape[1]
         device = up_indices.device
         
         # Get connection tensor for this pair of modules
-        connections = self.connections[down_name][up_name]  # [num_down, C]
-        C = connections.shape[1]
+        # connections = self.connections[down_name][up_name]  # [num_down, C]
+        # C = connections.shape[1]
+
         
         # Get weights for the active features
         up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
@@ -116,23 +120,23 @@ class SCAESuite(nn.Module):
         
         # First get the allowed connections for each active downstream feature
         # [batch, k_down, C]
-        allowed_up = connections[down_indices]
+        # allowed_up = connections[down_indices]
         
         # Create a mask for valid (non-padding) connections
         # -1 is used as a padding value in the supplied connections
         # [batch, k_down, C]
-        valid_mask = (allowed_up != -1)
+        # valid_mask = (allowed_up != -1)
         
         # Create a mask of shape [batch, k_down, C, k_up] indicating where
         # allowed_up[b,d,c] == up_indices[b,u]
-        allowed_up_expanded = allowed_up.unsqueeze(-1)  # [batch, k_down, C, 1]
+        # allowed_up_expanded = allowed_up.unsqueeze(-1)  # [batch, k_down, C, 1]
         up_indices_expanded = up_indices.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k_up]
-        connection_mask = (allowed_up_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
+        # connection_mask = (allowed_up_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
         
         # Get the corresponding upstream values
         # [batch, k_down, C, k_up]
         up_vals_expanded = up_vals.unsqueeze(1).unsqueeze(2).expand(-1, k_down, C, -1)
-        connected_vals = t.where(connection_mask, up_vals_expanded, t.zeros_like(up_vals_expanded))
+        connected_vals = up_vals_expanded # t.where(connection_mask, up_vals_expanded, t.zeros_like(up_vals_expanded))
         
         # Get the corresponding virtual weights
         active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
@@ -155,10 +159,26 @@ class SCAESuite(nn.Module):
         # Apply connection mask and sum contributions
         contributions = (virtual_weights * connected_vals).sum(dim=(-1, -2))  # [batch, k_down]
 
-        b_dec_contrib =  self.aes[up_name].encoder.weight @ self.aes[up_name].b_dec
-        contributions = contributions + b_dec_contrib[up_indices]
+        b_dec_contrib =  self.aes[down_name].encoder.weight @ self.aes[up_name].b_dec
+        contributions = contributions + b_dec_contrib[down_indices]
+
+        up_recons = (active_up_vectors * up_vals.unsqueeze(-1)).sum(1) + self.aes[up_name].b_dec
         
         return contributions
+    
+    def test_pruned_contributions(
+        self,
+        up_tgt,
+        down_name,
+        down_inds
+    ) -> t.Tensor:
+        """
+        Test the pruned contributions function by computing the full contribution
+        and comparing to the pruned contribution.
+        """
+        all_contribs = up_tgt @ self.aes[down_name].encoder.weight.T
+        contribs = all_contribs.gather(1, down_inds)
+        return contribs
 
     def vanilla_forward(
         self,
