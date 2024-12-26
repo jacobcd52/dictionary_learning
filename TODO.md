@@ -4,3 +4,4 @@
 
 - Worry about layernorm - layernorm bias argh
 - Decide on 3 losses
+ -rename inputs/src to be consistent

@@ -25,6 +25,7 @@ import einops
 from typing import Dict, List
 import torch.sparse as sparse
 
+
 def get_top_connections(
     suite: SCAESuite,
     c: int,
@@ -229,17 +230,18 @@ buffer = AllActivationBuffer(
     layernorm_submodules=layernorm_submodules,
     d_submodule=model.config.n_embd,
     n_ctxs=128,
-    out_batch_size = 128,
+    out_batch_size = 512,
     refresh_batch_size = 256,
     device=device,
     dtype=DTYPE,
 )
+
 # %%
-out = get_top_connections(
+out = get_top_connections_micro_batches(
     suite,
-    c=200,
+    c=100,
     buffer=buffer,
-    num_batches=100,
+    num_batches=50,
 )
 # %%
 # save the output as pickle
