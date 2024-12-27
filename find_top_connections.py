@@ -1,146 +1,192 @@
-#%%
 import torch as t
 import einops
 from typing import Dict, List
 import torch.sparse as sparse
 from tqdm import tqdm
+import gc
+import pickle
+from pathlib import Path
 
 from trainers.scae import SCAESuite
 from buffer import AllActivationBuffer
 from utils import load_model_with_folded_ln2, load_iterable_dataset
 
-device = t.device('cuda' if t.cuda.is_available() else 'cpu')
-DTYPE = t.bfloat16
-t.manual_seed(42)
 
-t.set_grad_enabled(False)
-
-#%%
-
+import gc
 import torch as t
-import torch.sparse as sparse
 import einops
+from pathlib import Path
+from typing import Dict
 from tqdm import tqdm
 import pickle
-from typing import Dict, List
+from torch import sparse
+
+import gc
+import torch as t
+import einops
 from pathlib import Path
+from typing import Dict
+from tqdm import tqdm
+import pickle
+from torch import sparse
 
 def get_importance_scores(
     suite: SCAESuite,
     buffer: AllActivationBuffer,
+    down_name: str,
     num_batches: int = 1,
-    save_path: Path = None
-) -> Dict[str, Dict[str, sparse.FloatTensor]]:
+    save_path: Path = None,
+    top_c: int = 1000,
+    checkpoint_every: int = 50
+) -> Dict[str, sparse.FloatTensor]:
     """
-    Compute importance scores between causally valid pairs of autoencoders and optionally save to file.
-    Memory-optimized version with periodic saving and explicit cleanup.
-    
-    Args:
-        suite: The SCAESuite instance
-        buffer: Iterator yielding batches of data
-        num_batches: Number of batches to process
-        save_path: Optional path to save importance scores as pickle file
-        
-    Returns:
-        Dictionary mapping downstream module names to dictionaries of importance scores.
-        Format: {down_name: {up_name: importance_tensor}}
+    Compute importance scores using efficient sparse tensor accumulation.
     """
-    # Sort module names
     mlp_names = sorted([name for name in suite.submodule_names if name.startswith('mlp_')])
     attn_names = sorted([name for name in suite.submodule_names if name.startswith('attn_')])
     
-    # Initialize importance scores dictionary
-    importance_scores: Dict[str, Dict[str, sparse.FloatTensor]] = {}
+    if down_name not in mlp_names:
+        raise ValueError(f"Downstream component {down_name} not found in MLPs")
+    down_layer = int(down_name.split('_')[1])
     
-    # Process batches without gradient tracking
+    valid_up_names = (
+        [name for name in mlp_names if int(name.split('_')[1]) < down_layer] +
+        [name for name in attn_names if int(name.split('_')[1]) <= down_layer]
+    )
+
+    print(f"Valid upstream modules: {valid_up_names}")
+    
+    down_config = suite.configs[down_name]
+    scores_shape = (down_config.dict_size, down_config.dict_size)
+    
+    if save_path is not None:
+        checkpoint_dir = save_path.parent / f"{save_path.stem}_checkpoints"
+        checkpoint_dir.mkdir(exist_ok=True)
+    
+    running_totals = {
+        up_name: t.sparse_coo_tensor(size=scores_shape, device='cuda')
+        for up_name in valid_up_names
+    }
+    
     with t.no_grad():
         for batch_idx in tqdm(range(num_batches)):
-            # Clear CUDA cache at start of each batch
-            if t.cuda.is_available():
-                t.cuda.empty_cache()
-            
-            # Get batch inputs and run forward pass
             inputs = next(buffer).src
             _, features, topk_info = suite.vanilla_forward(inputs, return_features=True, return_topk=True)
+            del features
             
-            # Process each downstream MLP module
-            for down_idx, down_name in enumerate(mlp_names):
-                if batch_idx == 0:
-                    importance_scores[down_name] = {}
-                    
-                down_config = suite.configs[down_name]
-                scores_shape = (down_config.dict_size, down_config.dict_size)
+            down_idxs = topk_info[down_name][0]
+            batch_size, k_down = down_idxs.shape
+            
+            for up_name in valid_up_names:
+                up_idxs = topk_info[up_name][0]
+                up_vals = topk_info[up_name][1]
+                _, k_up = up_idxs.shape
                 
-                # Get downstream active features
-                down_idxs = topk_info[down_name][0]  # [batch, k_down]
-                k_down = down_idxs.shape[1]
+                # Compute virtual weights
+                up_decoder = suite.aes[up_name].decoder.weight
+                down_encoder = suite.aes[down_name].encoder.weight
                 
-                # Get valid upstream modules based on causal ordering
-                valid_up_names = (
-                    [name for name in mlp_names if int(name.split('_')[1]) < down_idx] +
-                    [name for name in attn_names if int(name.split('_')[1]) <= down_idx]
+                active_up = up_decoder[:, up_idxs.reshape(-1)].T.view(batch_size, k_up, -1)
+                active_down = down_encoder[down_idxs.reshape(-1)].view(batch_size, k_down, -1)
+                del up_decoder, down_encoder
+                
+                virtual_weights = einops.einsum(
+                    active_down, active_up,
+                    "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
                 )
+                del active_up, active_down
                 
-                # Process each valid upstream module
+                # Compute contributions
+                up_vals_expanded = up_vals.unsqueeze(1)
+                contributions = virtual_weights * up_vals_expanded
+                del virtual_weights, up_vals_expanded
+                
+                # Create sparse tensor
+                down_expanded = down_idxs.unsqueeze(2).expand(-1, -1, k_up)
+                up_expanded = up_idxs.unsqueeze(1).expand(-1, k_down, -1)
+                
+                indices = t.stack([
+                    down_expanded.reshape(-1),
+                    up_expanded.reshape(-1)
+                ])
+                del down_expanded, up_expanded
+                
+                values = contributions.reshape(-1)
+                del contributions
+                
+                batch_totals = t.sparse_coo_tensor(
+                    indices=indices,
+                    values=values,
+                    size=scores_shape,
+                    device='cuda'
+                )
+                del indices, values
+                
+                # Update running totals without coalescing every time
+                running_totals[up_name] = running_totals[up_name] + batch_totals
+                del batch_totals
+            
+            del topk_info
+            
+            if save_path is not None and (batch_idx + 1) % checkpoint_every == 0:
+                checkpoint_number = batch_idx // checkpoint_every
+                
                 for up_name in valid_up_names:
-                    up_config = suite.configs[up_name]
+                    # Coalesce before saving
+                    running_totals[up_name] = running_totals[up_name].coalesce()
                     
-                    # Get active upstream features
-                    up_idxs = topk_info[up_name][0]  # [batch, k_up]
-                    up_vals = topk_info[up_name][1]  # [batch, k_up]
-                    k_up = up_idxs.shape[1]
+                    up_checkpoint_path = checkpoint_dir / f"connections_{checkpoint_number}_{up_name}.pkl"
+                    total_data = running_totals[up_name].cpu()
+                    with open(up_checkpoint_path, 'wb') as f:
+                        pickle.dump(total_data, f)
+                    del total_data
                     
-                    # Get active weight matrices and compute virtual weights
-                    up_decoder = suite.aes[up_name].decoder.weight  # [d_in, d_up]
-                    down_encoder = suite.aes[down_name].encoder.weight  # [d_down, d_in]
-                    
-                    batch_size = next(iter(inputs.values())).size(0)
-                    active_up = up_decoder[:, up_idxs.reshape(-1)].T.view(batch_size, k_up, -1)
-                    active_down = down_encoder[down_idxs.reshape(-1)].view(batch_size, k_down, -1)
-                    
-                    # Compute virtual weights and contributions
-                    virtual_weights = einops.einsum(
-                        active_down, active_up,
-                        "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
-                    )
-                    contributions = virtual_weights * up_vals.unsqueeze(1).expand(-1, k_down, -1)
-                    del virtual_weights  # Free memory
-                    
-                    # Create indices for sparse tensor
-                    down_expanded = down_idxs.unsqueeze(-1).expand(-1, -1, k_up)
-                    up_expanded = up_idxs.unsqueeze(1).expand(-1, k_down, -1)
-                    indices = t.stack([down_expanded.reshape(-1), up_expanded.reshape(-1)])
-                    
-                    # Create and accumulate sparse tensor of importance scores
-                    batch_scores = sparse.FloatTensor(
-                        indices, 
-                        contributions.abs().reshape(-1),
-                        scores_shape
-                    ).coalesce()
-                    
-                    # Clean up intermediate tensors
-                    del indices, down_expanded, up_expanded, contributions
-                    del active_up, active_down
-                    
-                    if batch_idx == 0:
-                        importance_scores[down_name][up_name] = batch_scores
-                    else:
-                        # Update existing tensor in-place when possible
-                        importance_scores[down_name][up_name].add_(batch_scores)
-                        importance_scores[down_name][up_name] = importance_scores[down_name][up_name].coalesce()
-                    
-            # Periodic saving every 10 batches
-            if save_path and batch_idx > 0 and batch_idx % 10 == 0:
-                temp_save_path = save_path.with_suffix('.temp.pkl')
-                with open(temp_save_path, 'wb') as f:
-                    pickle.dump(importance_scores, f)
+                    running_totals[up_name] = t.sparse_coo_tensor(size=scores_shape, device='cuda')
+                
+                # Cleanup after all checkpoints are saved
+                gc.collect()
+                if t.cuda.is_available():
+                    t.cuda.empty_cache()
+                
+                print(f"Saved checkpoint {checkpoint_number}")
     
-    # Save final importance scores if path provided
+    # Compute final importance scores
+    importance_scores = {}
+    for up_name in valid_up_names:
+        totals = running_totals[up_name].coalesce()
+        means = totals.values()
+        indices = totals.indices()
+        
+        means_dense = t.zeros(scores_shape, device='cuda')
+        means_dense[indices[0], indices[1]] = means
+        del means, indices
+        
+        top_values, top_indices = means_dense.topk(min(top_c, means_dense.size(1)), dim=1)
+        del means_dense
+        
+        valid_mask = top_values > 0
+        downstream_indices = t.arange(scores_shape[0], device='cuda').unsqueeze(1).expand(-1, top_c)
+        downstream_indices = downstream_indices[valid_mask]
+        upstream_indices = top_indices[valid_mask]
+        final_values = top_values[valid_mask]
+        del top_values, top_indices, valid_mask
+        
+        importance_scores[up_name] = t.sparse_coo_tensor(
+            indices=t.stack([downstream_indices, upstream_indices]),
+            values=final_values,
+            size=scores_shape,
+            device='cuda'
+        ).coalesce()
+        del downstream_indices, upstream_indices, final_values
+    
     if save_path:
+        cpu_scores = {name: tensor.cpu() for name, tensor in importance_scores.items()}
         with open(save_path, 'wb') as f:
-            pickle.dump(importance_scores, f)
+            pickle.dump(cpu_scores, f)
+        del cpu_scores
     
     return importance_scores
+
 
 def get_top_connections(
     suite: SCAESuite,
@@ -245,56 +291,3 @@ def get_top_connections(
             t.cuda.empty_cache()
     
     return connections
-
-#%%
-
-# if __name__ == "__main__":
-model = load_model_with_folded_ln2("gpt2", device=device, torch_dtype=DTYPE)
-data = load_iterable_dataset('Skylion007/openwebtext')
-suite = SCAESuite.from_pretrained(
-    'jacobcd52/gpt2_suite_folded_ln',
-    device=device,
-    dtype=DTYPE,
-    )
-
-initial_submodule = model.transformer.h[0]
-layernorm_submodules = {}
-submodules = {}
-for layer in range(model.config.n_layer):
-    submodules[f"mlp_{layer}"] = (model.transformer.h[layer].mlp, "in_and_out")
-    submodules[f"attn_{layer}"] = (model.transformer.h[layer].attn, "out")
-
-    layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
-
-buffer = AllActivationBuffer(
-    data=data,
-    model=model,
-    submodules=submodules,
-    initial_submodule=initial_submodule,
-    layernorm_submodules=layernorm_submodules,
-    d_submodule=model.config.n_embd,
-    n_ctxs=128,
-    out_batch_size = 256,
-    refresh_batch_size = 256,
-    device=device,
-    dtype=DTYPE,
-)
-
-#%%
-
-# Compute importance scores
-importance_scores = get_importance_scores(suite, buffer, num_batches=100, save_path=Path('importance_scores.pkl'))
-
-
-#%%
-# Later, load importance scores and compute connections
-with open('importance_scores.pkl', 'rb') as f:
-    importance_scores = pickle.load(f)
-
-connections = get_top_connections(
-    suite=suite,
-    importance_scores=importance_scores,
-    c=10,
-    chunk_size=1000
-)
-# %%
