@@ -30,264 +30,176 @@ from tqdm import tqdm
 import pickle
 from torch import sparse
 
-def get_importance_scores(
-    suite: SCAESuite,
-    buffer: AllActivationBuffer,
-    down_name: str,
-    num_batches: int = 1,
-    save_path: Path = None,
-    top_c: int = 1000,
-    checkpoint_every: int = 50
-) -> Dict[str, sparse.FloatTensor]:
-    """
-    Compute importance scores using efficient sparse tensor accumulation.
-    """
+import gc
+import torch as t
+import einops
+from pathlib import Path
+from typing import Dict, List, Tuple
+from tqdm import tqdm
+import pickle
+from torch import sparse
+import sys
+
+def get_valid_pairs(suite: SCAESuite) -> List[Tuple[str, str]]:
+    """Get all valid (upstream, downstream) pairs to process."""
     mlp_names = sorted([name for name in suite.submodule_names if name.startswith('mlp_')])
     attn_names = sorted([name for name in suite.submodule_names if name.startswith('attn_')])
     
-    if down_name not in mlp_names:
-        raise ValueError(f"Downstream component {down_name} not found in MLPs")
-    down_layer = int(down_name.split('_')[1])
+    pairs = []
+    for down_name in mlp_names:
+        down_layer = int(down_name.split('_')[1])
+        valid_up_names = (
+            [name for name in mlp_names if int(name.split('_')[1]) < down_layer] +
+            [name for name in attn_names if int(name.split('_')[1]) <= down_layer]
+        )
+        pairs.extend([(up, down_name) for up in valid_up_names])
     
-    valid_up_names = (
-        [name for name in mlp_names if int(name.split('_')[1]) < down_layer] +
-        [name for name in attn_names if int(name.split('_')[1]) <= down_layer]
-    )
+    return pairs
 
-    print(f"Valid upstream modules: {valid_up_names}")
+def process_pair(
+    suite: SCAESuite,
+    buffer: AllActivationBuffer,
+    up_name: str,
+    down_name: str,
+    num_batches: int,
+    top_c: int,
+    save_dir: Path = None
+) -> sparse.FloatTensor:
+    """Process a single (upstream, downstream) pair."""
     
     down_config = suite.configs[down_name]
     scores_shape = (down_config.dict_size, down_config.dict_size)
     
-    if save_path is not None:
-        checkpoint_dir = save_path.parent / f"{save_path.stem}_checkpoints"
-        checkpoint_dir.mkdir(exist_ok=True)
-    
-    running_totals = {
-        up_name: t.sparse_coo_tensor(size=scores_shape, device='cuda')
-        for up_name in valid_up_names
-    }
+    # Initialize running top-k values and indices for each downstream feature
+    top_values = t.zeros((scores_shape[0], top_c), device='cuda') - float('inf')
+    top_indices = t.zeros((scores_shape[0], top_c), dtype=t.long, device='cuda')
     
     with t.no_grad():
-        for batch_idx in tqdm(range(num_batches)):
+        for batch_idx in range(num_batches):
+            # Get activations
             inputs = next(buffer).src
-            _, features, topk_info = suite.vanilla_forward(inputs, return_features=True, return_topk=True)
-            del features
+            _, _, topk_info = suite.vanilla_forward(inputs, return_features=True, return_topk=True)
             
-            down_idxs = topk_info[down_name][0]
+            down_idxs = topk_info[down_name][0]  # [batch, k_down]
             batch_size, k_down = down_idxs.shape
             
-            for up_name in valid_up_names:
-                up_idxs = topk_info[up_name][0]
-                up_vals = topk_info[up_name][1]
-                _, k_up = up_idxs.shape
-                
-                # Compute virtual weights
-                up_decoder = suite.aes[up_name].decoder.weight
-                down_encoder = suite.aes[down_name].encoder.weight
-                
-                active_up = up_decoder[:, up_idxs.reshape(-1)].T.view(batch_size, k_up, -1)
-                active_down = down_encoder[down_idxs.reshape(-1)].view(batch_size, k_down, -1)
-                del up_decoder, down_encoder
-                
-                virtual_weights = einops.einsum(
-                    active_down, active_up,
-                    "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
-                )
-                del active_up, active_down
-                
-                # Compute contributions
-                up_vals_expanded = up_vals.unsqueeze(1)
-                contributions = virtual_weights * up_vals_expanded
-                del virtual_weights, up_vals_expanded
-                
-                # Create sparse tensor
-                down_expanded = down_idxs.unsqueeze(2).expand(-1, -1, k_up)
-                up_expanded = up_idxs.unsqueeze(1).expand(-1, k_down, -1)
-                
-                indices = t.stack([
-                    down_expanded.reshape(-1),
-                    up_expanded.reshape(-1)
-                ])
-                del down_expanded, up_expanded
-                
-                values = contributions.reshape(-1)
-                del contributions
-                
-                batch_totals = t.sparse_coo_tensor(
-                    indices=indices,
-                    values=values,
-                    size=scores_shape,
-                    device='cuda'
-                )
-                del indices, values
-                
-                # Update running totals without coalescing every time
-                running_totals[up_name] = running_totals[up_name] + batch_totals
-                del batch_totals
+            up_idxs = topk_info[up_name][0]  # [batch, k_up]
+            up_vals = topk_info[up_name][1]  # [batch, k_up]
+            _, k_up = up_idxs.shape
             
-            del topk_info
+            # Compute virtual weights
+            up_decoder = suite.aes[up_name].decoder.weight
+            down_encoder = suite.aes[down_name].encoder.weight
             
-            if save_path is not None and (batch_idx + 1) % checkpoint_every == 0:
-                checkpoint_number = batch_idx // checkpoint_every
-                
-                for up_name in valid_up_names:
-                    # Coalesce before saving
-                    running_totals[up_name] = running_totals[up_name].coalesce()
-                    
-                    up_checkpoint_path = checkpoint_dir / f"connections_{checkpoint_number}_{up_name}.pkl"
-                    total_data = running_totals[up_name].cpu()
-                    with open(up_checkpoint_path, 'wb') as f:
-                        pickle.dump(total_data, f)
-                    del total_data
-                    
-                    running_totals[up_name] = t.sparse_coo_tensor(size=scores_shape, device='cuda')
-                
-                # Cleanup after all checkpoints are saved
-                gc.collect()
-                if t.cuda.is_available():
-                    t.cuda.empty_cache()
-                
-                print(f"Saved checkpoint {checkpoint_number}")
+            active_up = up_decoder[:, up_idxs.reshape(-1)].T.view(batch_size, k_up, -1)
+            active_down = down_encoder[down_idxs.reshape(-1)].view(batch_size, k_down, -1)
+            del up_decoder, down_encoder
+            
+            virtual_weights = einops.einsum(
+                active_down, active_up,
+                "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
+            )
+            del active_up, active_down
+            
+            # Compute contributions
+            up_vals_expanded = up_vals.unsqueeze(1)  # [batch, 1, k_up]
+            contributions = virtual_weights * up_vals_expanded  # [batch, k_down, k_up]
+            del virtual_weights, up_vals_expanded
+            
+            # Reshape contributions to [num_down_feats, num_values]
+            # First, create a tensor that will hold all values for each downstream feature
+            # Size is [dict_size, batch * k_down * k_up]
+            num_values_per_feature = batch_size * k_down * k_up
+            all_values = t.zeros((scores_shape[0], num_values_per_feature), device='cuda')
+            all_indices = t.zeros((scores_shape[0], num_values_per_feature), dtype=t.long, device='cuda')
+            
+            # Create index tensors for scattering
+            # For each downstream feature, we want its values in the corresponding row
+            flat_down_idxs = down_idxs.reshape(-1)  # [batch * k_down]
+            flat_contributions = contributions.reshape(-1, k_up)  # [batch * k_down, k_up]
+            flat_up_idxs = up_idxs.repeat_interleave(k_down, dim=0)  # [batch * k_down, k_up]
+            
+            # Create scatter indices
+            row_idx = flat_down_idxs.repeat_interleave(k_up)  # Repeat each downstream idx k_up times
+            col_idx = t.arange(num_values_per_feature, device='cuda')
+            
+            # Scatter the values and indices
+            all_values.scatter_(0, row_idx.unsqueeze(0), flat_contributions.reshape(1, -1))
+            all_indices.scatter_(0, row_idx.unsqueeze(0), flat_up_idxs.reshape(1, -1))
+            
+            # Combine with existing top values
+            combined_values = t.cat([top_values, all_values], dim=1)
+            combined_indices = t.cat([top_indices, all_indices], dim=1)
+            
+            # Get top-k for all features at once
+            new_top_values, top_idx = combined_values.topk(top_c, dim=1)
+            
+            # Gather corresponding indices
+            new_top_indices = t.gather(combined_indices, 1, top_idx)
+            
+            # Update top values and indices
+            top_values = new_top_values
+            top_indices = new_top_indices
+            
+            del contributions, topk_info
+            gc.collect()
+            if t.cuda.is_available():
+                t.cuda.empty_cache()
+            
+            # Update progress inline
+            sys.stdout.write(f"\rProcessing {up_name} -> {down_name}: {batch_idx+1}/{num_batches} batches")
+            sys.stdout.flush()
     
-    # Compute final importance scores
-    importance_scores = {}
-    for up_name in valid_up_names:
-        totals = running_totals[up_name].coalesce()
-        means = totals.values()
-        indices = totals.indices()
-        
-        means_dense = t.zeros(scores_shape, device='cuda')
-        means_dense[indices[0], indices[1]] = means
-        del means, indices
-        
-        top_values, top_indices = means_dense.topk(min(top_c, means_dense.size(1)), dim=1)
-        del means_dense
-        
-        valid_mask = top_values > 0
-        downstream_indices = t.arange(scores_shape[0], device='cuda').unsqueeze(1).expand(-1, top_c)
-        downstream_indices = downstream_indices[valid_mask]
-        upstream_indices = top_indices[valid_mask]
-        final_values = top_values[valid_mask]
-        del top_values, top_indices, valid_mask
-        
-        importance_scores[up_name] = t.sparse_coo_tensor(
-            indices=t.stack([downstream_indices, upstream_indices]),
-            values=final_values,
-            size=scores_shape,
-            device='cuda'
-        ).coalesce()
-        del downstream_indices, upstream_indices, final_values
+    # Create final sparse tensor from top-k values
+    valid_mask = top_values > -float('inf')
+    downstream_idx = t.arange(scores_shape[0], device='cuda').unsqueeze(1).expand_as(valid_mask)[valid_mask]
+    upstream_idx = top_indices[valid_mask]
+    values = top_values[valid_mask]
     
-    if save_path:
-        cpu_scores = {name: tensor.cpu() for name, tensor in importance_scores.items()}
+    importance_scores = t.sparse_coo_tensor(
+        indices=t.stack([downstream_idx, upstream_idx]),
+        values=values,
+        size=scores_shape,
+        device='cuda'
+    ).coalesce()
+    
+    # Save if directory provided
+    if save_dir is not None:
+        save_path = save_dir / f"importance_{up_name}_to_{down_name}.pkl"
         with open(save_path, 'wb') as f:
-            pickle.dump(cpu_scores, f)
-        del cpu_scores
+            pickle.dump(importance_scores.cpu(), f)
     
     return importance_scores
 
-
-def get_top_connections(
+def get_importance_scores(
     suite: SCAESuite,
-    importance_scores: Dict[str, Dict[str, sparse.FloatTensor]],
-    c: int,
-    chunk_size: int = 1000
-) -> Dict[str, Dict[str, t.Tensor]]:
+    buffer: AllActivationBuffer,
+    num_batches: int = 1,
+    top_c: int = 1000,
+    save_dir: Path = None,
+) -> Dict[Tuple[str, str], sparse.FloatTensor]:
     """
-    Convert importance scores to top connections for each downstream feature.
-    
-    Args:
-        suite: The SCAESuite instance
-        importance_scores: Dictionary of importance scores from get_importance_scores
-        c: Number of connections to return per downstream feature
-        chunk_size: Size of chunks for processing (adjust based on available memory)
-        
-    Returns:
-        Dictionary mapping downstream module names to dictionaries of connections.
-        Format: {down_name: {up_name: connection_tensor}}
-        where connection_tensor has shape [n_down_features, c] containing indices 
-        of connected upstream features
+    Compute importance scores for all valid pairs, processing one pair at a time
+    to minimize memory usage.
     """
-    mlp_names = sorted([name for name in suite.submodule_names if name.startswith('mlp_')])
-    attn_names = sorted([name for name in suite.submodule_names if name.startswith('attn_')])
-    connections = {}
+    if save_dir is not None:
+        save_dir.mkdir(exist_ok=True)
     
-    # Get list of modules to process
-    downstream_modules = list(importance_scores.keys())
+    pairs = get_valid_pairs(suite)
+    print(f"Processing {len(pairs)} (upstream, downstream) pairs...")
     
-    # Process one downstream module at a time
-    for down_name in downstream_modules:
-        up_dict = importance_scores[down_name]
-        print(f"Processing downstream module: {down_name}")
-        down_size = suite.configs[down_name].dict_size
-        connections[down_name] = {}
-        
-        try:
-            # Process in chunks
-            for chunk_start in range(0, down_size, chunk_size):
-                chunk_end = min(chunk_start + chunk_size, down_size)
-                chunk_size_actual = chunk_end - chunk_start
-                
-                # Get valid upstream modules based on causal ordering
-                down_idx = int(down_name.split('_')[1])
-                valid_up_names = (
-                    [name for name in mlp_names if int(name.split('_')[1]) < down_idx] +
-                    [name for name in attn_names if int(name.split('_')[1]) <= down_idx]
-                )
-                
-                # Stack scores from each valid upstream module
-                chunk_scores = []
-                up_names = []
-                
-                for up_name in valid_up_names:
-                    if up_name not in up_dict:
-                        continue
-                    scores = up_dict[up_name]
-                    dense_chunk = scores.to_dense()[chunk_start:chunk_end]
-                    if dense_chunk.sum() > 0:  # Only include if there are non-zero scores
-                        chunk_scores.append(dense_chunk)
-                        up_names.append(up_name)
-                
-                if not chunk_scores:  # Skip if no valid connections in chunk
-                    continue
-                    
-                # Find top connections
-                stacked_scores = t.stack(chunk_scores, dim=1)
-                flat_scores = stacked_scores.reshape(chunk_size_actual, -1)
-                top_values, top_indices = t.topk(flat_scores, min(c, flat_scores.size(1)))
-                
-                # Convert indices back to module and feature indices
-                max_up_size = up_dict[up_names[0]].size(1)
-                module_idx = top_indices // max_up_size
-                feature_idx = top_indices % max_up_size
-                
-                # Create connections for each upstream module
-                for i, up_name in enumerate(up_names):
-                    module_mask = (module_idx == i) & (top_values > 0)
-                    if not module_mask.any():
-                        continue
-                        
-                    rows, cols = t.where(module_mask)
-                    valid_indices = feature_idx[rows, cols]
-                    
-                    if up_name not in connections[down_name]:
-                        connections[down_name][up_name] = t.full(
-                            (down_size, c), 
-                            -1, 
-                            device=suite.device
-                        )
-                    
-                    connections[down_name][up_name][
-                        chunk_start + rows, cols
-                    ] = valid_indices
-                
-                # Clean up
-                del stacked_scores, flat_scores, top_values, top_indices
-                t.cuda.empty_cache()
-                
-        finally:
-            # Clean up after processing each downstream module
-            t.cuda.empty_cache()
+    importance_scores = {}
+    for up_name, down_name in pairs:
+        scores = process_pair(
+            suite=suite,
+            buffer=buffer,
+            up_name=up_name,
+            down_name=down_name,
+            num_batches=num_batches,
+            top_c=top_c,
+            save_dir=save_dir
+        )
+        importance_scores[(up_name, down_name)] = scores
+        print(f"\nCompleted {up_name} -> {down_name}")
     
-    return connections
+    return importance_scores
