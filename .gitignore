@@ -1,5 +1,6 @@
 # SAE checkpoints
 sae_checkpoints/
+noteboooks/importance_scores
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

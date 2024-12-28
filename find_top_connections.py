@@ -1,34 +1,16 @@
 import torch as t
 import einops
-from typing import Dict, List
+from typing import Dict, List, Tuple
 import torch.sparse as sparse
 from tqdm import tqdm
 import gc
 import pickle
 from pathlib import Path
+import sys 
 
 from trainers.scae import SCAESuite
 from buffer import AllActivationBuffer
-from utils import load_model_with_folded_ln2, load_iterable_dataset
 
-
-import gc
-import torch as t
-import einops
-from pathlib import Path
-from typing import Dict
-from tqdm import tqdm
-import pickle
-from torch import sparse
-
-import gc
-import torch as t
-import einops
-from pathlib import Path
-from typing import Dict
-from tqdm import tqdm
-import pickle
-from torch import sparse
 
 import gc
 import torch as t
@@ -106,40 +88,60 @@ def process_pair(
             contributions = virtual_weights * up_vals_expanded  # [batch, k_down, k_up]
             del virtual_weights, up_vals_expanded
             
-            # Reshape contributions to [num_down_feats, num_values]
-            # First, create a tensor that will hold all values for each downstream feature
-            # Size is [dict_size, batch * k_down * k_up]
-            num_values_per_feature = batch_size * k_down * k_up
-            all_values = t.zeros((scores_shape[0], num_values_per_feature), device='cuda')
-            all_indices = t.zeros((scores_shape[0], num_values_per_feature), dtype=t.long, device='cuda')
-            
-            # Create index tensors for scattering
-            # For each downstream feature, we want its values in the corresponding row
+            # 1. First organize all our values and indices
             flat_down_idxs = down_idxs.reshape(-1)  # [batch * k_down]
-            flat_contributions = contributions.reshape(-1, k_up)  # [batch * k_down, k_up]
             flat_up_idxs = up_idxs.repeat_interleave(k_down, dim=0)  # [batch * k_down, k_up]
+            flat_contributions = contributions.reshape(-1, k_up)  # [batch * k_down, k_up]
             
-            # Create scatter indices
-            row_idx = flat_down_idxs.repeat_interleave(k_up)  # Repeat each downstream idx k_up times
-            col_idx = t.arange(num_values_per_feature, device='cuda')
+            # 2. Create indices for the full matrix of current batch's values
+            row_indices = flat_down_idxs.repeat_interleave(k_up)  # Each downstream idx repeated k_up times
+            col_indices = t.arange(flat_up_idxs.shape[0] * k_up, device='cuda') % k_up  # [0,1,...,k_up-1] repeated
+            values = flat_contributions.reshape(-1)  # All contribution values
             
-            # Scatter the values and indices
-            all_values.scatter_(0, row_idx.unsqueeze(0), flat_contributions.reshape(1, -1))
-            all_indices.scatter_(0, row_idx.unsqueeze(0), flat_up_idxs.reshape(1, -1))
+            # 3. Create sparse tensor of new values 
+            new_values = t.sparse_coo_tensor(
+                indices=t.stack([row_indices, col_indices]),
+                values=values,
+                size=(scores_shape[0], k_up),  # We only need k_up columns for this batch
+                device='cuda'
+            ).coalesce()
             
-            # Combine with existing top values
-            combined_values = t.cat([top_values, all_values], dim=1)
-            combined_indices = t.cat([top_indices, all_indices], dim=1)
+            # 4. Convert to dense only for active features
+            active_rows = t.unique(row_indices)
             
-            # Get top-k for all features at once
-            new_top_values, top_idx = combined_values.topk(top_c, dim=1)
+            # 5. Create a dense matrix for active features that combines old and new values
+            combined_values = t.zeros((len(active_rows), top_c + k_up), device='cuda')
+            combined_indices = t.zeros((len(active_rows), top_c + k_up), dtype=t.long, device='cuda')
             
-            # Gather corresponding indices
-            new_top_indices = t.gather(combined_indices, 1, top_idx)
+            # 6. Fill in existing top values and indices for active features
+            combined_values[:, :top_c] = top_values[active_rows]
+            combined_indices[:, :top_c] = top_indices[active_rows]
             
-            # Update top values and indices
-            top_values = new_top_values
-            top_indices = new_top_indices
+            # 7. Add new values from sparse tensor
+            dense_new = new_values.index_select(0, active_rows).to_dense()
+            combined_values[:, top_c:] = dense_new
+            
+            # 8. Create corresponding indices for new values
+            # Expand flat_up_idxs to match the shape we need
+            expanded_up_idxs = flat_up_idxs.reshape(-1, k_up)  # [batch * k_down, k_up]
+            active_up_idxs = expanded_up_idxs[active_rows]
+            combined_indices[:, top_c:] = active_up_idxs
+            
+            # 9. Get top-k for all features at once
+            top_k_values, top_k_indices = combined_values.topk(top_c, dim=1)
+            
+            # 10. Gather corresponding feature indices
+            new_top_indices = t.gather(combined_indices, 1, top_k_indices)
+            
+            # 11. Update the top values and indices for active features
+            top_values[active_rows] = top_k_values
+            top_indices[active_rows] = new_top_indices
+            
+            # Clean up large intermediate tensors
+            del combined_values, combined_indices, dense_new
+            gc.collect()
+            if t.cuda.is_available():
+                t.cuda.empty_cache()
             
             del contributions, topk_info
             gc.collect()
