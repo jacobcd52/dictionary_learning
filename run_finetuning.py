@@ -3,6 +3,7 @@ from buffer import AllActivationBuffer
 from training import train_scae_suite
 from trainers.scae import TrainerSCAESuite, TrainerConfig, SubmoduleConfig
 from utils import load_model_with_folded_ln2, load_iterable_dataset
+from find_top_connections import generate_fake_connections
 
 from datasets import load_dataset
 import torch as t
@@ -16,7 +17,7 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 
 
 #%%
-DTYPE = t.bfloat16
+DTYPE = t.float32
 MODEL_NAME = "gpt2"
 expansion = 16
 k = 128 # TODO auto-detect if loading from pretrained
@@ -32,6 +33,7 @@ data = load_iterable_dataset('Skylion007/openwebtext')
 
 num_features = model.config.n_embd * expansion
 n_layer = model.config.n_layer
+
 
 
 #%%
@@ -62,8 +64,21 @@ buffer = AllActivationBuffer(
 pretrained_configs = {}
 # Load connections from connections_100.pkl
 import pickle
-with open("notebooks/connections_100.pkl", "rb") as f:
+with open("connections_100.pkl", "rb") as f:
     connections = pickle.load(f)
+
+# fake_connections = generate_fake_connections(
+#     connections,
+#     num_features=num_features,
+# )
+
+
+# If training from scratch
+# submodule_cfg = SubmoduleConfig(
+#             dict_size=num_features,
+#             activation_dim=model.config.n_embd,
+#             k=k)
+# submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
 
 
 trainer_cfg = TrainerConfig(
@@ -75,7 +90,7 @@ trainer_cfg = TrainerConfig(
 trainer = train_scae_suite(
     buffer,
     trainer_config=trainer_cfg,
-    submodule_configs=None,
+    submodule_configs=None, #submodule_configs,
     connections=connections,
     steps=num_tokens // out_batch_size,
     save_steps = 1000,
@@ -85,6 +100,6 @@ trainer = train_scae_suite(
     use_wandb = True,
     repo_id_in='jacobcd52/gpt2_suite_folded_ln',
     repo_id_out = "jacobcd52/gpt2_scae",
-    # seed: Optional[int] = None,
+    wandb_project_name="gpt2_scae_finetuning",
 )
 # %%

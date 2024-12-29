@@ -323,3 +323,76 @@ def get_top_c_indices(top_connections_dict: Dict[str, t.Tensor], c: int, chunk_s
         t.cuda.empty_cache()
     
     return {k : v.cuda() for k, v in result_dict.items()}
+
+
+import torch
+import typing as t
+from collections import defaultdict
+
+def generate_fake_connections(
+    connections: Dict[str, Dict[str, torch.Tensor]], 
+    num_features: int
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """
+    Generate fake connections with the same structure as the input connections.
+    Uses parallelized tensor operations for efficiency.
+    
+    For each tensor in the original connections:
+    - Preserves -1 values (padding)
+    - Replaces other values with random integers in range(num_features)
+    - Ensures random values are distinct across each N-slice
+    
+    Args:
+        connections: Nested dict of tensors, each with shape [N, c]
+        num_features: Upper bound (exclusive) for random integers
+        
+    Returns:
+        Dict with same structure as input but with randomized values
+    """
+    fake_connections = {}
+    
+    for outer_key, inner_dict in connections.items():
+        fake_connections[outer_key] = {}
+        
+        for inner_key, tensor in inner_dict.items():
+            N, c = tensor.shape
+            mask = tensor != -1  # [N, c]
+            
+            # Check if we can generate enough distinct values
+            max_needed = mask.sum(dim=1).max().item()
+            if max_needed > num_features:
+                raise ValueError(
+                    f"Cannot generate {max_needed} distinct values "
+                    f"from range(0, {num_features})"
+                )
+            
+            # Create independent random permutations for each row
+            # Shape: [N, num_features]
+            all_perms = torch.stack([
+                torch.randperm(num_features, device=tensor.device) 
+                for _ in range(N)
+            ])
+            
+            # Create output tensor filled with padding
+            fake_tensor = torch.full_like(tensor, -1)
+            
+            # For each position that needs a value (each True in mask),
+            # we'll take the next unused value from all_perms
+            counts = torch.zeros(N, dtype=torch.long, device=tensor.device)
+            
+            # Create index tensor for gathering values
+            idx = torch.arange(c, device=tensor.device).unsqueeze(0).expand(N, -1)  # [N, c]
+            
+            # Use cumsum on mask to get indices into the permutation array
+            # This ensures we use consecutive values from all_perms for each row
+            indices = (mask.cumsum(dim=1) - 1)
+            
+            # Only gather values where mask is True
+            fake_tensor[mask] = all_perms[
+                torch.arange(N, device=tensor.device).unsqueeze(1).expand(-1, c)[mask],
+                indices[mask]
+            ]
+            
+            fake_connections[outer_key][inner_key] = fake_tensor
+    
+    return fake_connections

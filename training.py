@@ -98,6 +98,7 @@ def train_scae_suite(
     dtype: t.dtype = t.float32,
     device: Optional[str] = None,
     seed: Optional[int] = None,
+    wandb_project_name: str = "scae",
 ):
     """
     Train a Sparse Connected Autoencoder Suite.
@@ -148,11 +149,12 @@ def train_scae_suite(
             device=device,
             dtype=dtype,
         )
-        suite.connections = connections # TODO make this cleaner
+        # TODO make this cleaner
         # Store config for saving
         config_dict = {
             "is_pretrained": True
         }
+    suite.connections = connections
     
     # Initialize trainer
     trainer = TrainerSCAESuite(
@@ -183,7 +185,7 @@ def train_scae_suite(
     if use_wandb:
         import wandb
         wandb.init(
-            project="gpt2_suite_folded_ln",
+            project=wandb_project_name,
             config=config_dict,
         )
     

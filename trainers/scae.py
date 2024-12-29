@@ -685,7 +685,7 @@ class TrainerSCAESuite:
         
         # Initialize learning rates
         self.lrs = {
-            name: config.base_lr / (ae.dict_size / 2**14)**0.5 
+            name: config.base_lr / (ae.dict_size / 2**14)**0.5
             for name, ae in suite.aes.items()
         }
         
@@ -793,7 +793,7 @@ class TrainerSCAESuite:
             
             # L2 reconstruction loss
             l2_loss = (x_hat - tgt).pow(2).sum(dim=-1).mean()
-            total_loss = total_loss + l2_loss
+            # total_loss = total_loss + l2_loss
             losses['reconstruction'][name] = l2_loss.item()
             
             # Compute variance explained
