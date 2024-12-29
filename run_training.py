@@ -76,7 +76,7 @@ trainer_cfg = TrainerConfig(
 
 trainer = train_scae_suite(
     buffer,
-    module_specs=submodule_configs,
+    submodule_configs=submodule_configs,
     trainer_config=trainer_cfg,
     steps=num_tokens // out_batch_size,
     save_steps = 1000,
@@ -85,7 +85,7 @@ trainer = train_scae_suite(
     # save_dir: Optional[str] = None,
     log_steps = 20,
     use_wandb = True,
-    hf_repo_id = "jacobcd52/gpt2_suite_folded_ln",
+    repo_id_out = "jacobcd52/gpt2_suite_folded_ln",
     seed = 42
 )
 # %%

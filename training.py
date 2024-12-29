@@ -81,22 +81,20 @@ import tempfile
 import torch as t
 from tqdm.auto import tqdm
 
-ModuleSpecs = Union[
-    Dict[str, SubmoduleConfig],  # For fresh initialization
-    Dict[str, Dict[str, str]],   # For pretrained (keys: repo_id, filename)
-]
+
 
 def train_scae_suite(
     buffer,
-    module_specs: ModuleSpecs,
     trainer_config: TrainerConfig,
+    submodule_configs: Optional[Dict[str, SubmoduleConfig]]=None,
     connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
     steps: Optional[int] = None,
     save_steps: Optional[int] = None,
     save_dir: Optional[str] = None,
     log_steps: Optional[int] = None,
     use_wandb: bool = False,
-    hf_repo_id: Optional[str] = None,
+    repo_id_in: Optional[str] = None,
+    repo_id_out: Optional[str] = None,
     dtype: t.dtype = t.float32,
     device: Optional[str] = None,
     seed: Optional[int] = None,
@@ -129,41 +127,30 @@ def train_scae_suite(
     device = device or ('cuda' if t.cuda.is_available() else 'cpu')
     
     # Check if we're loading pretrained or initializing fresh
-    sample_value = next(iter(module_specs.values()))
-    if isinstance(sample_value, SubmoduleConfig):
+    if repo_id_in is None:
         # Fresh initialization
         suite = SCAESuite(
-            submodule_configs=module_specs,
-            connections=connections,
+            submodule_configs=submodule_configs,
             dtype=dtype,
             device=device,
         )
         # Store config for saving
         config_dict = {
             "submodule_configs": {
-                name: asdict(cfg) for name, cfg in module_specs.items()
+                name: asdict(cfg) for name, cfg in submodule_configs.items()
             },
             "is_pretrained": False
         }
-    else:
-        # Verify pretrained config format
-        for name, cfg in module_specs.items():
-            required_keys = {'repo_id', 'filename'}
-            if not required_keys.issubset(cfg.keys()):
-                raise ValueError(
-                    f"Pretrained config for {name} missing required keys: "
-                    f"{required_keys - set(cfg.keys())}"
-                )
-        
+    else:      
         # Load pretrained
         suite = SCAESuite.from_pretrained(
-            pretrained_configs=module_specs,
-            connections=connections,
-            device=device
+            repo_id=repo_id_in,
+            device=device,
+            dtype=dtype,
         )
+        suite.connections = connections # TODO make this cleaner
         # Store config for saving
         config_dict = {
-            "pretrained_configs": module_specs,
             "is_pretrained": True
         }
     
@@ -263,11 +250,11 @@ def train_scae_suite(
             )
     
     # Upload to HuggingFace if requested
-    if hf_repo_id is not None:
+    if repo_id_out is not None:
         try:
             from huggingface_hub import HfApi
             
-            print(f"\nUploading models to HuggingFace repo: {hf_repo_id}")
+            print(f"\nUploading models to HuggingFace repo: {repo_id_out}")
             api = HfApi()
             
             # Upload configuration
@@ -277,7 +264,7 @@ def train_scae_suite(
                 api.upload_file(
                     path_or_fileobj=f.name,
                     path_in_repo="config.json",
-                    repo_id=hf_repo_id,
+                    repo_id=repo_id_out,
                     repo_type="model",
                 )
             
@@ -290,7 +277,7 @@ def train_scae_suite(
                 api.upload_file(
                     path_or_fileobj=f.name,
                     path_in_repo="checkpoint.pt",
-                    repo_id=hf_repo_id,
+                    repo_id=repo_id_out,
                     repo_type="model",
                 )
             
@@ -301,7 +288,7 @@ def train_scae_suite(
                     api.upload_file(
                         path_or_fileobj=f.name,
                         path_in_repo="connections.pt",
-                        repo_id=hf_repo_id,
+                        repo_id=repo_id_out,
                         repo_type="model",
                     )
             

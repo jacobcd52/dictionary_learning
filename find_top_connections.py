@@ -205,3 +205,121 @@ def get_importance_scores(
         print(f"\nCompleted {up_name} -> {down_name}")
     
     return importance_scores
+
+
+from tqdm import tqdm
+import psutil
+import sys
+
+def get_top_c_indices(top_connections_dict: Dict[str, t.Tensor], c: int, chunk_size: int = 100, 
+                      memory_threshold_gb: float = 32) -> Dict[str, t.Tensor]:
+    """
+    Args:
+        top_connections_dict: Dictionary mapping strings to sparse COO tensors, each of shape [M, N]
+        c: Number of top indices to return per row
+        chunk_size: Number of rows to process at once to manage memory
+        memory_threshold_gb: Maximum allowed CPU memory usage in gigabytes
+        
+    Returns:
+        Dictionary mapping strings to tensors of shape [M, c] containing indices that correspond
+        to values that rank in the top c by magnitude across all dictionary entries combined
+        
+    Raises:
+        MemoryError: If CPU memory usage exceeds memory_threshold_gb
+    """
+    def get_memory_usage_gb():
+        """Get current memory usage in GB"""
+        process = psutil.Process()
+        return process.memory_info().rss / (1024 ** 3)
+    
+    def check_memory_usage():
+        """Check if memory usage exceeds threshold"""
+        current_usage = get_memory_usage_gb()
+        if current_usage > memory_threshold_gb:
+            raise MemoryError(f"Memory usage ({current_usage:.2f}GB) exceeded threshold ({memory_threshold_gb}GB)")
+    
+    # Initial memory check
+    check_memory_usage()
+    
+    # Convert all tensors to dense and get shapes
+    print("Converting sparse tensors to dense...")
+    dense_dict = {key: tensor.to_dense() for key, tensor in top_connections_dict.items()}
+    check_memory_usage()
+    
+    M, N = next(iter(dense_dict.values())).shape
+    device = next(iter(dense_dict.values())).device
+    num_dicts = len(dense_dict)
+    dict_keys = list(dense_dict.keys())
+    
+    print(f"Processing {M} rows in chunks of {chunk_size}")
+    print(f"Current memory usage: {get_memory_usage_gb():.2f}GB")
+    
+    # Initialize result dictionary with -1s on CPU
+    result_dict = {key: t.full((M, c), -1, dtype=t.long) for key in dict_keys}
+    check_memory_usage()
+    
+    # Process chunks
+    chunk_pbar = tqdm(range(0, M, chunk_size), desc="Processing chunks")
+    for start_idx in chunk_pbar:
+        end_idx = min(start_idx + chunk_size, M)
+        chunk_pbar.set_postfix({'mem_usage': f'{get_memory_usage_gb():.2f}GB'})
+        
+        # Stack chunk of all tensors
+        chunk_values = t.stack([dense[start_idx:end_idx] for dense in dense_dict.values()], dim=1).cuda()
+        chunk_size_actual = end_idx - start_idx
+        
+        # Get absolute values
+        abs_values = chunk_values.abs()
+        
+        # Create indices tensors
+        batch_idx = t.arange(chunk_size_actual, device='cuda')[:, None, None].expand(-1, num_dicts, N)
+        dict_idx = t.arange(num_dicts, device='cuda')[None, :, None].expand(chunk_size_actual, -1, N)
+        col_idx = t.arange(N, device='cuda')[None, None, :].expand(chunk_size_actual, num_dicts, -1)
+        
+        # Mask for nonzero values
+        nonzero_mask = chunk_values != 0
+        
+        # Get values and indices where values are nonzero
+        values_flat = abs_values[nonzero_mask]
+        batch_flat = batch_idx[nonzero_mask]
+        dict_flat = dict_idx[nonzero_mask]
+        col_flat = col_idx[nonzero_mask]
+        
+        # Group by batch within chunk
+        batch_sizes = nonzero_mask.sum(dim=(1,2))
+        batch_groups = t.split(t.arange(values_flat.size(0), device='cuda'), batch_sizes.tolist())
+        
+        # Sort values within each batch group and get top c
+        batch_pbar = tqdm(enumerate(batch_groups), 
+                         total=len(batch_groups), 
+                         desc="Processing batches",
+                         leave=False)
+        
+        for b, group in batch_pbar:
+            if len(group) > 0:
+                # Sort this batch's values
+                sorted_vals, sort_idx = values_flat[group].sort(descending=True)
+                top_c_idx = group[sort_idx[:c]]
+                
+                # Get corresponding dictionary indices and column indices
+                top_dict_indices = dict_flat[top_c_idx]
+                top_col_indices = col_flat[top_c_idx]
+                
+                # For each dictionary
+                for d, key in enumerate(dict_keys):
+                    # Get indices where this dictionary appears
+                    dict_mask = top_dict_indices == d
+                    if dict_mask.any():
+                        # Get columns for this dictionary and place them in result
+                        dict_cols = top_col_indices[dict_mask]
+                        num_cols = dict_cols.size(0)
+                        result_dict[key][start_idx + b, :num_cols] = dict_cols
+            
+            check_memory_usage()
+        
+        # Clear GPU memory
+        del chunk_values, abs_values, batch_idx, dict_idx, col_idx
+        del values_flat, batch_flat, dict_flat, col_flat
+        t.cuda.empty_cache()
+    
+    return {k : v.cuda() for k, v in result_dict.items()}

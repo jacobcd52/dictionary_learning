@@ -52,7 +52,7 @@ if __name__ == '__main__':
         layernorm_submodules=layernorm_submodules,
         d_submodule=model.config.n_embd,
         n_ctxs=128,
-        out_batch_size = 2048*16,
+        out_batch_size = 2048*4,
         refresh_batch_size = 128,
         device=device,
         dtype=DTYPE,
@@ -66,3 +66,5 @@ if __name__ == '__main__':
         top_c=500,
         save_dir=Path(f'importance_scores'),
         )
+
+# %%

@@ -765,7 +765,8 @@ class TrainerSCAESuite:
             'reconstruction': {},
             'auxiliary': {},
             'connection': {},
-            'FVU': {},
+            'vanilla FVU': {},
+            'pruned FVU': {},
             'dead_features': {},
         }
         
@@ -799,7 +800,7 @@ class TrainerSCAESuite:
             total_variance = t.var(tgt, dim=0).sum()
             residual_variance = t.var(tgt - x_hat, dim=0).sum()
             frac_variance_explained = 1 - residual_variance / total_variance
-            losses['FVU'][name] = 1 - frac_variance_explained.item()
+            losses['vanilla FVU'][name] = 1 - frac_variance_explained.item()
             
             # Auxiliary loss for dead features
             if self.config.auxk_alpha > 0:
@@ -850,6 +851,7 @@ class TrainerSCAESuite:
                 approx_loss = (x_hat_approx - tgt).pow(2).sum(dim=-1).mean()
                 total_loss = total_loss + self.config.connection_sparsity_coeff * approx_loss
                 losses['connection'][down_name] = approx_loss.item()
+                losses['pruned FVU'][down_name] = 1 - t.var(tgt - x_hat_approx, dim=0).sum() / t.var(tgt, dim=0).sum()
 
                 # l2_loss_vanilla
                 # l2_loss_pruned
