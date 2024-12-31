@@ -793,7 +793,7 @@ class TrainerSCAESuite:
             
             # L2 reconstruction loss
             l2_loss = (x_hat - tgt).pow(2).sum(dim=-1).mean()
-            # total_loss = total_loss + l2_loss
+            total_loss = total_loss + l2_loss
             losses['reconstruction'][name] = l2_loss.item()
             
             # Compute variance explained
@@ -851,11 +851,7 @@ class TrainerSCAESuite:
                 approx_loss = (x_hat_approx - tgt).pow(2).sum(dim=-1).mean()
                 total_loss = total_loss + self.config.connection_sparsity_coeff * approx_loss
                 losses['connection'][down_name] = approx_loss.item()
-                losses['pruned FVU'][down_name] = 1 - t.var(tgt - x_hat_approx, dim=0).sum() / t.var(tgt, dim=0).sum()
-
-                # l2_loss_vanilla
-                # l2_loss_pruned
-                # approximation_loss = (feature_acts_pruned - feature_acts_vanilla).pow(2).sum(dim=-1).mean()
+                losses['pruned FVU'][down_name] = t.var(tgt - x_hat_approx, dim=0).sum() / t.var(tgt, dim=0).sum()
         
         # Backward pass and optimization
         total_loss.backward()

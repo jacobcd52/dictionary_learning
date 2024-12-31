@@ -3,19 +3,16 @@ Training dictionaries
 """
 
 import json
-import multiprocessing as mp
 import os
 from queue import Empty
-
 import torch as t
-from tqdm import tqdm
-
+from typing import Union, Dict, Optional, TypeVar
+from dataclasses import asdict
+import tempfile
+from tqdm.auto import tqdm
 import wandb
 
-from dictionary import AutoEncoder
-from trainers.standard import StandardTrainer
 from trainers.scae import SubmoduleConfig, SCAESuite, TrainerSCAESuite, TrainerConfig
-
 
 def new_wandb_process(config, log_queue, entity, project):
     wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"])
@@ -28,59 +25,6 @@ def new_wandb_process(config, log_queue, entity, project):
         except Empty:
             continue
     wandb.finish()
-
-
-# def log_stats(
-#     trainers,
-#     step: int,
-#     act: t.Tensor,
-#     activations_split_by_head: bool,
-#     transcoder: bool,
-#     log_queues: list=[],
-# ):
-#     with t.no_grad():
-#         # quick hack to make sure all trainers get the same x
-#         z = act.clone()
-#         for i, trainer in enumerate(trainers):
-#             log = {}
-#             act = z.clone()
-#             if activations_split_by_head:  # x.shape: [batch, pos, n_heads, d_head]
-#                 act = act[..., i, :]
-#             if not transcoder:
-#                 act, act_hat, f, losslog = trainer.loss(act, step=step, logging=True)
-
-#                 # L0
-#                 l0 = (f != 0).float().sum(dim=-1).mean().item()
-#                 # fraction of variance explained
-#                 total_variance = t.var(act, dim=0).sum()
-#                 residual_variance = t.var(act - act_hat, dim=0).sum()
-#                 frac_variance_explained = 1 - residual_variance / total_variance
-#                 log["FVU"] = 1 - frac_variance_explained.item()
-#             else:  # transcoder
-#                 x, x_hat, f, losslog = trainer.loss(act, step=step, logging=True)
-
-#                 # L0
-#                 l0 = (f != 0).float().sum(dim=-1).mean().item()
-
-#             # log parameters from training
-#             log.update({f"{k}": v for k, v in losslog.items()})
-#             log[f"l0"] = l0
-#             trainer_log = trainer.get_logging_parameters()
-#             for name, value in trainer_log.items():
-#                 log[f"{name}"] = value
-
-#             if log_queues:
-#                 log_queues[i].put(log)
-
-
-from typing import Union, Dict, Optional, TypeVar
-from dataclasses import asdict
-import json
-import os
-import tempfile
-import torch as t
-from tqdm.auto import tqdm
-
 
 
 def train_scae_suite(

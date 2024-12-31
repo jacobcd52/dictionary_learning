@@ -44,6 +44,7 @@ class AllActivationBuffer:
             out_batch_size: int = 8192,
             device: str = "cpu",
             dtype: t.dtype = t.float32,
+            remove_bos=False
         ):
         """Initialize the activation buffer.
         
@@ -77,6 +78,7 @@ class AllActivationBuffer:
         self.out_batch_size = out_batch_size
         self.device = device
         self.dtype = dtype
+        self.start_pos = 1 if remove_bos else 0
         
         # Determine if tokenization is needed
         try:
@@ -257,7 +259,7 @@ class AllActivationBuffer:
                             output = trace.output
 
                     # Process initial activations
-                    initial_state = self._process_states(initial_input).to(dtype=self.dtype)
+                    initial_state = self._process_states(initial_input).to(dtype=self.dtype)[:, self.start_pos:]
                     batch_size, seq_len, hidden_dim = initial_state.shape
                     flat_initial = initial_state.reshape(batch_size * seq_len, hidden_dim)
                     self.initial_activations = t.cat(
@@ -267,7 +269,7 @@ class AllActivationBuffer:
                     
                     # Process layernorm inputs and compute scales
                     for name, ln_input in ln_inputs.items():
-                        ln_state = self._process_states(ln_input).to(dtype=self.dtype)
+                        ln_state = self._process_states(ln_input).to(dtype=self.dtype)[:, self.start_pos:]
                         flat_ln = ln_state.reshape(batch_size * seq_len, hidden_dim)
                         scale = self._compute_ln_scale(
                             flat_ln, 
@@ -280,8 +282,8 @@ class AllActivationBuffer:
                     
                     # Process submodule activations
                     for name, (submodule, io) in self.submodules.items():
-                        raw_in = self._process_states(saved_inputs[name]).to(dtype=self.dtype)
-                        raw_out = self._process_states(saved_outputs[name]).to(dtype=self.dtype)
+                        raw_in = self._process_states(saved_inputs[name]).to(dtype=self.dtype)[:, self.start_pos:]
+                        raw_out = self._process_states(saved_outputs[name]).to(dtype=self.dtype)[:, self.start_pos:]
                         
                         flat_in = raw_in.reshape(batch_size * seq_len, hidden_dim)
                         flat_out = raw_out.reshape(batch_size * seq_len, hidden_dim)

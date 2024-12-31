@@ -1,30 +1,33 @@
 #%%
 from buffer import AllActivationBuffer
 from training import train_scae_suite
-from trainers.scae import TrainerSCAESuite, TrainerConfig, SubmoduleConfig
+from trainers.scae import TrainerConfig, SubmoduleConfig
 from utils import load_model_with_folded_ln2, load_iterable_dataset
 from find_top_connections import generate_fake_connections
 
-from datasets import load_dataset
 import torch as t
-from nnsight import LanguageModel
-from collections import defaultdict
 from huggingface_hub import login
+import pickle
 
+# Jacob's token but feel free to use
 login("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")
 device = "cuda:0" if t.cuda.is_available() else "cpu"
+
 
 
 
 #%%
 DTYPE = t.float32
 MODEL_NAME = "gpt2"
-expansion = 16
-k = 128 # TODO auto-detect if loading from pretrained
 
 out_batch_size = 64
 num_tokens = int(1e7)
+connection_sparsity_coeff = 1.0
+remove_bos=True # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
 
+# Only need these if training from scratch
+expansion = 16
+k = 128
 
 
 #%%
@@ -58,20 +61,24 @@ buffer = AllActivationBuffer(
     out_batch_size = out_batch_size,
     refresh_batch_size = 256,
     dtype=DTYPE,
+    remove_bos=remove_bos
 ) 
 
+
 #%%
-pretrained_configs = {}
+trainer_cfg = TrainerConfig(
+    connection_sparsity_coeff=connection_sparsity_coeff,
+    steps=num_tokens // out_batch_size,)
+
 # Load connections from connections_100.pkl
-import pickle
 with open("connections_100.pkl", "rb") as f:
     connections = pickle.load(f)
 
+# If using random connections
 # fake_connections = generate_fake_connections(
 #     connections,
 #     num_features=num_features,
 # )
-
 
 # If training from scratch
 # submodule_cfg = SubmoduleConfig(
@@ -81,16 +88,12 @@ with open("connections_100.pkl", "rb") as f:
 # submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
 
 
-trainer_cfg = TrainerConfig(
-    connection_sparsity_coeff=5.0,
-    steps=num_tokens // out_batch_size,
-)
 
 #%%
 trainer = train_scae_suite(
     buffer,
     trainer_config=trainer_cfg,
-    submodule_configs=None, #submodule_configs,
+    submodule_configs=None, #submodule_configs, # use if training from scratch
     connections=connections,
     steps=num_tokens // out_batch_size,
     save_steps = 1000,
