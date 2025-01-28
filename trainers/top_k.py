@@ -70,20 +70,22 @@ class AutoEncoderTopK(Dictionary, nn.Module):
 
         self.b_dec = nn.Parameter(t.zeros(activation_dim))
 
-    def encode(self, x: t.Tensor, return_topk: bool = False):
+    def encode(self, x: t.Tensor, return_topk: bool = False, n_threshold: int = 0):
         """Standard encode function for inputs of shape [batch, d]"""
         preact_BF = self.encoder(x - self.b_dec)
         post_relu_feat_acts_BF = nn.functional.relu(preact_BF)
-        post_topk = post_relu_feat_acts_BF.topk(self.k, sorted=False, dim=-1)
+        post_topk = post_relu_feat_acts_BF.topk(self.k + n_threshold, sorted=True, dim=-1)
 
-        tops_acts_BK = post_topk.values
-        top_indices_BK = post_topk.indices
+        top_acts_all = post_topk.values
+        top_indices_all = post_topk.indices
+        tops_acts_BK = post_topk.values[:, :self.k]
+        top_indices_BK = post_topk.indices[:, :self.k]
 
         buffer_BF = t.zeros_like(post_relu_feat_acts_BF)
         encoded_acts_BF = buffer_BF.scatter_(dim=-1, index=top_indices_BK, src=tops_acts_BK)
 
         if return_topk:
-            return encoded_acts_BF, tops_acts_BK, top_indices_BK
+            return encoded_acts_BF, top_acts_all, top_indices_all
         else:
             return encoded_acts_BF
 

@@ -3,8 +3,7 @@ import torch.nn as nn
 import einops
 from typing import Dict, Tuple, Optional, List, Union
 from dataclasses import dataclass
-from huggingface_hub import hf_hub_download
-import wandb
+import numpy as np
 import json 
 
 from trainers.top_k import AutoEncoderTopK
@@ -77,29 +76,27 @@ class SCAESuite(nn.Module):
             self,
             initial_act: t.Tensor, # [batch, d_in]
             down_name: str, # e.g. 'mlp_5'
-            down_indices: t.Tensor, # [batch, k_down]
+            down_indices: t.Tensor, # [batch, k_down + n_threshold + n_random]
     ):
         W_enc_FD = self.aes[down_name].encoder.weight
         contributions_BF = initial_act @ W_enc_FD.T
         contributions_BK = contributions_BF.gather(1, down_indices)
         return contributions_BK
 
-    
     def get_pruned_contributions(
         self,
         up_name: str,
         down_name: str,
         up_indices: t.Tensor,  # [batch, k_up]
-        down_indices: t.Tensor,  # [batch, k_down]
+        down_indices: t.Tensor,  # [batch, k_down + n_threshold + n_random]
         up_vals: t.Tensor,  # [batch, k_up]
-    ) -> t.Tensor:  # [batch, k_down]
+    ) -> t.Tensor:  # [batch, k_down + n_threshold + n_random]
         """
         Memory-efficient version that maintains GPU parallelism.
         """
-        
         batch_size = up_indices.shape[0]
         k_up = up_indices.shape[1]
-        k_down = down_indices.shape[1]
+        total_down_features = down_indices.shape[1]  # k_down + n_threshold + n_random
         device = up_indices.device
         
         # Get connection tensor for this pair of modules
@@ -113,48 +110,47 @@ class SCAESuite(nn.Module):
         active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
         active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
         
-        active_down_vectors = down_encoder[down_indices.reshape(-1)]  # [batch*k_down, d_in]
-        active_down_vectors = active_down_vectors.view(batch_size, k_down, -1)  # [batch, k_down, d_in]
+        # Get all relevant downstream vectors
+        active_down_vectors = down_encoder[down_indices.reshape(-1)]  # [batch*(k_down + n_threshold + n_random), d_in]
+        active_down_vectors = active_down_vectors.view(batch_size, total_down_features, -1)  # [batch, k_down + n_threshold + n_random, d_in]
         
         # Compute virtual weights between active features
         virtual_weights = einops.einsum(
             active_down_vectors, active_up_vectors,
             "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
-        )  # [batch, k_down, k_up]
+        )  # [batch, k_down + n_threshold + n_random, k_up]
         
-        # Instead of expanding to [batch, k_down, C, k_up],
-        # we'll process each chunk of C connections separately
-        chunk_size = 256  # Adjust this based on memory constraints
+        # Initialize contributions tensor for all selected downstream features
+        contributions = t.zeros((batch_size, total_down_features), device=device, dtype=up_vals.dtype)
+        
+        chunk_size = 256
         num_chunks = (C + chunk_size - 1) // chunk_size
-        
-        contributions = t.zeros((batch_size, k_down), device=device, dtype=up_vals.dtype)
         
         for chunk_idx in range(num_chunks):
             start_idx = chunk_idx * chunk_size
             end_idx = min((chunk_idx + 1) * chunk_size, C)
-            chunk_connections = connections[:, start_idx:end_idx]  # [num_down, chunk_size]
             
-            # Get allowed connections for this chunk
-            allowed_up = chunk_connections[down_indices]  # [batch, k_down, chunk_size]
-            valid_mask = (allowed_up != -1)
+            # Get the current chunk of connections for ALL downstream features we care about
+            chunk_connections = connections[down_indices.reshape(-1), start_idx:end_idx]  # [(batch*(k_down + n_threshold + n_random)), chunk_size]
+            chunk_connections = chunk_connections.view(batch_size, total_down_features, -1)  # [batch, k_down + n_threshold + n_random, chunk_size]
             
-            # Create mask for this chunk only
-            allowed_up_expanded = allowed_up.unsqueeze(-1)  # [batch, k_down, chunk_size, 1]
+            valid_mask = (chunk_connections != -1)  # [batch, k_down + n_threshold + n_random, chunk_size]
+            
+            # Match upstream features
+            chunk_connections_expanded = chunk_connections.unsqueeze(-1)  # [batch, k_down + n_threshold + n_random, chunk_size, 1]
             up_indices_expanded = up_indices.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k_up]
-            connection_mask = (allowed_up_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
+            connection_mask = (chunk_connections_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
             
-            # Apply mask to virtual weights for this chunk
+            # Apply mask and compute contributions
             chunk_contributions = t.where(
                 connection_mask,
                 virtual_weights.unsqueeze(2) * up_vals.unsqueeze(1).unsqueeze(2),
                 t.zeros_like(virtual_weights[:, :, None, :])
             )
             
-            # Sum over chunk_size and k_up dimensions
             contributions += chunk_contributions.sum(dim=(2, 3))
         
-        
-        # Add bias terms
+        # Add bias terms for all selected features
         b_dec_contrib = self.aes[down_name].encoder.weight @ self.aes[up_name].b_dec
         contributions = contributions + b_dec_contrib[down_indices]
         
@@ -164,20 +160,17 @@ class SCAESuite(nn.Module):
         self,
         inputs: Dict[str, t.Tensor],
         return_features: bool = False,
-        return_topk: bool = False
+        return_topk: bool = False,
+        n_threshold: Optional[int] = None
     ) -> Union[Dict[str, t.Tensor], Tuple[Dict[str, t.Tensor], Dict[str, t.Tensor]]]:
         """
-        Run vanilla forward pass through each autoencoder.
+        Modified vanilla forward pass to support additional threshold features.
         
         Args:
             inputs: Dictionary mapping submodule names to input tensors
             return_features: Whether to return encoded features
             return_topk: Whether to return top-k feature indices and values
-            
-        Returns:
-            Dictionary of reconstructions for each submodule
-            (Optional) Dictionary of encoded features for each submodule
-            (Optional) Dictionary of (top_indices, top_values) for each submodule
+            n_threshold: Optional number of additional threshold features to return
         """
         results = {}
         features = {}
@@ -188,7 +181,7 @@ class SCAESuite(nn.Module):
                 continue
                 
             if return_topk:
-                feat, top_vals, top_idxs = ae.encode(inputs[name], return_topk=True)
+                feat, top_vals, top_idxs = ae.encode(inputs[name], return_topk=True, n_threshold=n_threshold)
                 topk_info[name] = (top_idxs, top_vals)
             else:
                 feat = ae.encode(inputs[name])
@@ -208,89 +201,121 @@ class SCAESuite(nn.Module):
         else:
             return results
 
-    def approx_forward(
+    def pruned_forward_train(
         self,
         initial_acts: t.Tensor,
         inputs: Dict[str, t.Tensor],
         layernorm_scales: Dict[str, t.Tensor],
-    ) -> Dict[str, t.Tensor]:
+        n_threshold: int,
+        n_random: int
+    ) -> Dict[str, Dict[str, t.Tensor]]:
         """
-        Run approximate forward pass using virtual weights.
-        
-        First runs vanilla forward to get features, then uses virtual weights
-        to approximate downstream features.
+        Run modified forward pass that computes:
+        - Top k features
+        - Additional n_threshold features
+        - n_random randomly selected features
         
         Args:
+            initial_acts: Initial activations
             inputs: Dictionary mapping submodule names to input tensors
+            layernorm_scales: Dictionary of layernorm scales
+            n_threshold: Number of additional threshold features to compute
+            n_random: Number of random features to compute
             
         Returns:
-            Dictionary of reconstructions for each submodule
-
+            Dictionary with structure:
+            {module_name: {
+                'topk': tensor of top-k feature activations,
+                'threshold': tensor of threshold feature activations,
+                'random': tensor of random feature activations,
+                'all_indices': tensor of concatenated indices [batch, k_down + n_threshold + n_random]
+            }}
         """
         # First get vanilla features and topk info
         results, features, topk_info = self.vanilla_forward(
-            inputs, return_features=True, return_topk=True
+            inputs, return_features=True, return_topk=True, n_threshold=n_threshold
         )
-
         
-        # Now compute approximate features for each module
+        outputs = {}
+        
+        # Now compute features for each module
         for down_name, config in self.configs.items():
-            if down_name not in self.connections:
+            if down_name not in self.connections or down_name not in inputs:
                 continue
-                
-            if down_name not in inputs:
-                continue
-                
-            down_idxs = topk_info[down_name][0]  # [batch, k_down]
-            batch_size = down_idxs.shape[0]
             
-            # Initialise approx_acts as just the contribution from initial node 
+            batch_size = inputs[down_name].shape[0]
+            device = inputs[down_name].device
+                    
+            # Get top k + threshold indices and values
+            down_idxs_extended = topk_info[down_name][0]  # [batch, k + n_threshold]
+            k_down = self.configs[down_name].k
+            
+            # Split into topk and threshold
+            down_idxs_topk = down_idxs_extended[:, :k_down]
+            down_idxs_threshold = down_idxs_extended[:, k_down:]
+            
+            # Generate random indices (excluding those already selected)
+            all_indices = set(range(config.dict_size))
+            batch_random_indices = []
+            
+            for b in range(batch_size):
+                used_indices = set(down_idxs_extended[b].cpu().numpy())
+                available_indices = list(all_indices - used_indices)
+                selected_random = t.tensor(
+                    np.random.choice(available_indices, n_random, replace=False),
+                    device=device
+                )
+                batch_random_indices.append(selected_random)
+                
+            down_idxs_random = t.stack(batch_random_indices)  # [batch, n_random]
+            
+            # Combine all indices for computation
+            down_idxs_all = t.cat([
+                down_idxs_topk,
+                down_idxs_threshold,
+                down_idxs_random
+            ], dim=1)  # [batch, k_down + n_threshold + n_random]
+            
+            # Get initial contributions
             approx_acts = self.get_initial_contributions(
-                initial_acts, down_name, down_idxs
+                initial_acts, down_name, down_idxs_all
             )
             
+            # Get contributions from each upstream module
             for up_name in self.connections[down_name].keys():
                 if up_name not in inputs:
                     continue
                     
-                up_idxs = topk_info[up_name][0]  # [batch, k_up]
-                up_vals = topk_info[up_name][1]  # [batch, k_up]
+                up_idxs = topk_info[up_name][0][:, :self.configs[up_name].k]  # [batch, k_up]
+                up_vals = topk_info[up_name][1][:, :self.configs[up_name].k]  # [batch, k_up]
                 
                 contributions = self.get_pruned_contributions(
-                    up_name, down_name, up_idxs, down_idxs, up_vals
-                )  # [batch, k_down]
-               
+                    up_name, down_name, up_idxs, down_idxs_all, up_vals
+                )
+                
                 approx_acts = approx_acts + contributions
             
-            # divide by layernorm scale
-            approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1) # TODO worry about centering?
-
-
-            # Add downstream encoder bias
-            down_idx = topk_info[down_name][0]
-            b_enc = self.aes[down_name].encoder.bias[down_idx]
+            # Apply layernorm scaling
+            approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)
+            
+            # Add encoder bias and subtract decoder bias contribution
+            b_enc = self.aes[down_name].encoder.bias[down_idxs_all]
             approx_acts = approx_acts + b_enc
             
-            # Subtract downstream b_dec contribution TODO: make this an option
-            W_enc = self.aes[down_name].encoder.weight[down_idx]
-            approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec            
+            W_enc = self.aes[down_name].encoder.weight[down_idxs_all]
+            approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec
             
-            # Create sparse feature tensor
-            approx_features = t.zeros(
-                (batch_size, config.dict_size),
-                device=self.device,
-                dtype=self.dtype
-            )
-            approx_features.scatter_(
-                dim=1, index=down_idxs, src=approx_acts
-            )
-            
-            # Update reconstruction
-            results[down_name] = self.aes[down_name].decode(approx_features)
+            # Split results and store concatenated indices
+            outputs[down_name] = {
+                'topk': approx_acts[:, :k_down],
+                'threshold': approx_acts[:, k_down:k_down + n_threshold],
+                'random': approx_acts[:, k_down + n_threshold:],
+                'all_indices': down_idxs_all  # [batch, k_down + n_threshold + n_random]
+            }
         
-        return results
+        return outputs
 
-    
+    # TODO: put evaluation code in evaluate.py
     @t.no_grad()
     def evaluate_varexp_batch(
         self,
