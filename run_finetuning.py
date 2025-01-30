@@ -17,12 +17,11 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 
 
 #%%
-DTYPE = t.float32
+DTYPE = t.bfloat16
 MODEL_NAME = "gpt2"
 
-out_batch_size = 64
+out_batch_size = 32
 num_tokens = int(1e7)
-connection_sparsity_coeff = 1.0
 remove_bos=True # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
 
 # Only need these if training from scratch
@@ -67,8 +66,11 @@ buffer = AllActivationBuffer(
 
 #%%
 trainer_cfg = TrainerConfig(
-    connection_sparsity_coeff=connection_sparsity_coeff,
-    steps=num_tokens // out_batch_size,)
+    steps=num_tokens // out_batch_size,
+    n_threshold=0,
+    n_random=0,
+    random_loss_coeff=0.0
+)
 
 # Load connections from connections_100.pkl
 with open("connections_100.pkl", "rb") as f:
