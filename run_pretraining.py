@@ -16,23 +16,22 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.float32
 MODEL_NAME = "gpt2"
-C = 10
+# C = 10
 expansion = 16
 k = 128 # TODO auto-detect if loading from pretrained
+remove_bos = True
 
-out_batch_size = 4096
+out_batch_size = 4096 //2
 num_tokens = int(2e8)
 
 
 
 #%%
 model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
-# model = LanguageModel(MODEL_NAME, device_map=device, torch_dtype=DTYPE)
 data = load_iterable_dataset('Skylion007/openwebtext')
 
 num_features = model.config.n_embd * expansion
 n_layer = model.config.n_layer
-
 
 #%%
 initial_submodule = model.transformer.h[0]
@@ -53,10 +52,11 @@ buffer = AllActivationBuffer(
     initial_submodule=initial_submodule,
     layernorm_submodules=layernorm_submodules,
     d_submodule=model.config.n_embd, # output dimension of the model component
-    n_ctxs=1024,  # you can set this higher or lower depending on your available memory
+    n_ctxs=256,  # you can set this higher or lower depending on your available memory
     device="cuda",
     out_batch_size = out_batch_size,
-    refresh_batch_size = 256,
+    refresh_batch_size = 128,
+    remove_bos=remove_bos
 ) 
 
 #%%
@@ -68,24 +68,23 @@ submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in 
 
 
 trainer_cfg = TrainerConfig(
-    connection_sparsity_coeff=0.0,
     steps=num_tokens // out_batch_size,
+    use_vanilla_training=True
 )
 
 #%%
-
 trainer = train_scae_suite(
     buffer,
     submodule_configs=submodule_configs,
     trainer_config=trainer_cfg,
-    steps=num_tokens // out_batch_size,
+    steps=200, #num_tokens // out_batch_size,
     save_steps = 1000,
     dtype = DTYPE,
     device=device,
-    # save_dir: Optional[str] = None,
     log_steps = 20,
     use_wandb = True,
-    repo_id_out = "jacobcd52/gpt2_suite_folded_ln",
-    seed = 42
+    repo_id_out = "jacobcd52/gpt2_suite_folded_ln_nobos",
+    seed = 42,
+    wandb_project_name="gpt2_pretrain_nobos"
 )
 # %%

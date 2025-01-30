@@ -3,7 +3,7 @@ from buffer import AllActivationBuffer
 from training import train_scae_suite
 from trainers.scae import TrainerConfig, SubmoduleConfig
 from utils import load_model_with_folded_ln2, load_iterable_dataset
-from find_top_connections import generate_fake_connections
+from find_top_connections import generate_fake_connections 
 
 import torch as t
 from huggingface_hub import login
@@ -22,7 +22,7 @@ MODEL_NAME = "gpt2"
 
 out_batch_size = 32
 num_tokens = int(1e7)
-remove_bos=True # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
+remove_bos=False # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
 
 # Only need these if training from scratch
 expansion = 16
@@ -88,6 +88,15 @@ with open("connections_100.pkl", "rb") as f:
 #             activation_dim=model.config.n_embd,
 #             k=k)
 # submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
+
+#%%
+# Special connections for mlp_1
+
+for k in connections['mlp_1'].keys():
+    connections['mlp_1'][k] = t.arange(0, num_features).unsqueeze(0).repeat(num_features, 1).cuda()
+
+# for k in connections['mlp_0'].keys():
+#     connections['mlp_0'][k] = t.arange(0, num_features).unsqueeze(0).repeat(num_features, 1).cuda()
 
 
 

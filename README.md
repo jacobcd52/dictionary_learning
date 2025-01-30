@@ -35,11 +35,9 @@ Compared to Sam Marks' repo, the main new pieces of code are:
 
 TODOs
 
-- Currently we just optimize the vanilla-active feature for good approx. It's too expensive to optimize *all* downstream features, but it might make sense to randomly select a small number of non-active features per input and optimize these.
+
 - Sparse connections to embed/unembed?
-- Decide on 3 losses
 - Rename inputs/src to be consistent
 - More informative errors (e.g. "if no repo_id_in provided, you must provide submodule_configs" etc)
-- Implement patched CE and add logging step. Need to worry about layernorm, and remove_bos.
-- Multi-GPU support
-- Move SCAESuite evaluation methods to standalone functions in evaluate.py.
+- Improve multi-GPU support
+- find_top_connections shouldn't look at attribs on BOS token

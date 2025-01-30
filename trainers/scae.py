@@ -437,6 +437,7 @@ class SCAESuite(nn.Module):
         # Now compute features for each module
         for down_name, config in self.configs.items():
             if down_name not in inputs:
+                print(f"{down_name} not in inputs")
                 continue
                 
             if 'attn' in down_name:
@@ -617,277 +618,6 @@ class SCAESuite(nn.Module):
         pass # TODO finish this
 
 
-    # # TODO: put evaluation code in evaluate.py
-    # @t.no_grad()
-    # def evaluate_varexp_batch(
-    #     self,
-    #     initial_acts: t.Tensor,
-    #     input_acts: Dict[str, t.Tensor],
-    #     target_acts: Dict[str, t.Tensor],
-    #     layernorm_scales: Dict[str, t.Tensor],
-    #     use_sparse_connections: bool = False,
-    #     normalize_batch: bool = False,
-    # ) -> Dict[str, Dict[str, float]]:
-    #     """
-    #     Evaluate reconstruction quality metrics.
-        
-    #     Args:
-    #         input_acts: Dictionary of input activations
-    #         target_acts: Dictionary of target activations
-    #         use_sparse_connections: Whether to use approximate forward pass
-    #         normalize_batch: Whether to normalize inputs by their mean norm
-            
-    #     Returns:
-    #         Dictionary of metrics for each SAE
-    #     """
-    #     metrics = {}
-        
-    #     # Move inputs to device
-    #     input_acts = {
-    #         k: v.to(device=self.device, dtype=self.dtype) 
-    #         for k, v in input_acts.items()
-    #     }
-    #     target_acts = {
-    #         k: v.to(device=self.device, dtype=self.dtype) 
-    #         for k, v in target_acts.items()
-    #     }
-        
-    #     # Get reconstructions based on forward pass type
-    #     if use_sparse_connections:
-    #         results = self.approx_forward(initial_acts, input_acts, layernorm_scales)
-    #     else:
-    #         results = self.vanilla_forward(input_acts)
-        
-    #     for name, ae in self.aes.items():
-    #         if name not in input_acts:
-    #             continue
-                
-    #         x = input_acts[name]
-    #         tgt = target_acts[name]
-            
-    #         if normalize_batch:
-    #             scale = (ae.activation_dim ** 0.5) / x.norm(dim=-1).mean()
-    #             x = x * scale
-    #             tgt = tgt * scale
-            
-    #         x_hat = results[name]
-    #         if normalize_batch:
-    #             x_hat = x_hat / scale
-            
-    #         # Compute metrics
-    #         l2_loss = t.linalg.norm(tgt - x_hat, dim=-1).mean()
-            
-    #         total_variance = t.var(tgt, dim=0).sum()
-    #         residual_variance = t.var(tgt - x_hat, dim=0).sum()
-    #         frac_variance_explained = 1 - residual_variance / total_variance
-            
-    #         metrics[name] = {
-    #             'l2_loss': l2_loss.item(),
-    #             'FVU': 1 - frac_variance_explained.item()
-    #         }
-        
-    #     return metrics
-
-    # @t.no_grad()
-    # def evaluate_ce_batch(
-    #     self,
-    #     model,
-    #     text: Union[str, t.Tensor],
-    #     initial_submodule: 'Module',
-    #     submodules: Dict[str, Tuple['Module', str]],  # Maps SAE name to (submodule, io_type)
-    #     layernorm_submodules: Dict[str, 'Module'],
-    #     use_sparse_connections: bool = False,
-    #     max_len: Optional[int] = None,
-    #     normalize_batch: bool = False,
-    #     device: Optional[str] = None,
-    #     tracer_args: dict = {'use_cache': False, 'output_attentions': False}
-    # ) -> Dict[str, Dict[str, float]]:
-    #     """
-    #     Evaluate cross entropy loss when patching in reconstructed activations.
-        
-    #     Args:
-    #         model: TransformerLens model to evaluate
-    #         text: Input text or token tensor
-    #         submodules: Dictionary mapping SAE names to (submodule, io_type) pairs
-    #             where io_type is one of ['in', 'out', 'in_and_out']
-    #         use_sparse_connections: Whether to use approximate forward pass
-    #         max_len: Optional maximum sequence length
-    #         normalize_batch: Whether to normalize activations by their mean norm
-    #         device: Device to run evaluation on
-    #         tracer_args: Arguments for model.trace
-            
-    #     Returns:
-    #         Dictionary mapping submodule names to metrics:
-    #             - loss_original: CE loss of unmodified model
-    #             - loss_reconstructed: CE loss with reconstructed activations
-    #             - loss_zero: CE loss with zeroed activations
-    #             - frac_recovered: Fraction of performance recovered vs zeroing
-    #     """
-
-    #     device = device or self.device
-        
-    #     # Setup invoker args for length control
-    #     invoker_args = {"truncation": True, "max_length": max_len} if max_len else {}
-        
-    #     # Get original model outputs
-    #     with model.trace(text, invoker_args=invoker_args):
-    #         logits_original = model.output.save()
-    #     logits_original = logits_original.value
-        
-    #     # Get all activations in one pass TODO: layernorm_scales
-    #     saved_activations = {}
-    #     with model.trace(text, **tracer_args, invoker_args=invoker_args):
-    #         for name, (submodule, io) in list(submodules.items()) + [('initial', (initial_submodule, 'in'))]:
-    #             if io in ['in', 'in_and_out']:
-    #                 x = submodule.input
-    #             elif io == 'out':
-    #                 x = submodule.output
-    #             else:
-    #                 raise ValueError(f"Invalid io type: {io}")
-                
-    #             if normalize_batch:
-    #                 scale = (self.aes[name].activation_dim ** 0.5) / x.norm(dim=-1).mean()
-    #                 x = x * scale
-    #             else:
-    #                 scale = 1.0
-                
-    #             saved_activations[name] = {
-    #                 'x': x.save(),
-    #                 'io': io,
-    #                 'scale': scale
-    #             }
-        
-    #     # Process saved activations
-    #     for name, saved in saved_activations.items():
-    #         if isinstance(saved['x'].value, tuple):
-    #             saved['x'] = saved['x'].value[0]
-    #         else:
-    #             saved['x'] = saved['x'].value
-                
-    #     # Get reconstructions
-    #     inputs = {
-    #         name: saved['x'].to(device).view(-1, saved['x'].shape[-1])
-    #         for name, saved in saved_activations.items()
-    #         if name != 'initial'
-    #     }
-
-    #     initial_acts = saved_activations['initial']['x'].to(device).view(-1, saved_activations['initial']['x'].shape[-1])
-        
-    #     # Choose forward pass based on use_sparse_connections
-    #     if use_sparse_connections:
-    #         layernorm_scales = {
-    #             name: t.ones([initial_acts.shape[0]], dtype=self.dtype, device=device)
-    #             for name in submodules
-    #         } # TODO fix
-    #         reconstructions = self.approx_forward(initial_acts, inputs, layernorm_scales)
-    #     else:
-    #         reconstructions = self.vanilla_forward(inputs)
-        
-    #     # Reshape reconstructions back to original shapes and apply scaling
-    #     for name, saved in saved_activations.items():
-    #         if name == 'initial':
-    #             continue
-    #         x_shape = saved['x'].shape
-    #         x_hat = reconstructions[name]
-    #         x_hat = x_hat.view(x_shape)
-    #         if normalize_batch:
-    #             x_hat = x_hat / saved['scale']
-    #         reconstructions[name] = x_hat.to(model.dtype)
-        
-    #     # Get tokens for loss computation
-    #     if isinstance(text, t.Tensor):
-    #         tokens = text
-    #     else:
-    #         with model.trace(text, **tracer_args, invoker_args=invoker_args):
-    #             model_input = model.input.save()
-    #         try:
-    #             tokens = model_input.value[1]['input_ids']
-    #         except:
-    #             tokens = model_input.value[1]['input']
-        
-    #     # Setup loss function
-    #     if hasattr(model, 'tokenizer') and model.tokenizer is not None:
-    #         loss_kwargs = {'ignore_index': model.tokenizer.pad_token_id}
-    #     else:
-    #         loss_kwargs = {}
-        
-    #     # Compute original loss
-    #     try:
-    #         logits = logits_original.logits
-    #     except:
-    #         logits = logits_original
-            
-    #     loss_original = t.nn.CrossEntropyLoss(**loss_kwargs)(
-    #         logits[:, :-1, :].reshape(-1, logits.shape[-1]),
-    #         tokens[:, 1:].reshape(-1)
-    #     ).item()
-        
-    #     # Compute per-submodule metrics
-    #     results = {}
-        
-    #     for name, (submodule, io) in submodules.items():
-    #         # Test with reconstructed activations
-    #         with model.trace(text, **tracer_args, invoker_args=invoker_args):
-    #             x_hat = reconstructions[name]
-    #             # Patch reconstructions
-    #             submodule.input = x_hat
-    #             if io in ['out', 'in_and_out']:
-    #                 if "attn" in name:
-    #                     submodule.output = (x_hat,)
-    #                 elif "mlp" in name:
-    #                     submodule.output = x_hat
-    #                 else:
-    #                     raise ValueError(f"Invalid submodule name: {name}")
-                
-    #             logits_reconstructed = model.output.save()
-            
-    #         # Test with zeroed activations
-    #         with model.trace(text, **tracer_args, invoker_args=invoker_args):
-    #             if io in ['in', 'in_and_out']:
-    #                 x = submodule.input
-    #                 submodule.input = t.zeros_like(x)
-    #             if io in ['out', 'in_and_out']:
-    #                 x = submodule.output
-    #                 if "attn" in name:
-    #                     submodule.output = (t.zeros_like(x[0]),)
-    #                 elif "mlp" in name:
-    #                     submodule.output = t.zeros_like(x)
-                
-    #             logits_zero = model.output.save()
-            
-    #         # Format logits and compute losses
-    #         try:
-    #             logits_reconstructed = logits_reconstructed.value.logits
-    #             logits_zero = logits_zero.value.logits
-    #         except:
-    #             logits_reconstructed = logits_reconstructed.value
-    #             logits_zero = logits_zero.value
-            
-    #         loss_reconstructed = t.nn.CrossEntropyLoss(**loss_kwargs)(
-    #             logits_reconstructed[:, :-1, :].reshape(-1, logits_reconstructed.shape[-1]),
-    #             tokens[:, 1:].reshape(-1)
-    #         ).item()
-            
-    #         loss_zero = t.nn.CrossEntropyLoss(**loss_kwargs)(
-    #             logits_zero[:, :-1, :].reshape(-1, logits_zero.shape[-1]),
-    #             tokens[:, 1:].reshape(-1)
-    #         ).item()
-            
-    #         # Compute recovery fraction
-    #         if loss_original - loss_zero != 0:
-    #             frac_recovered = (loss_reconstructed - loss_zero) / (loss_original - loss_zero)
-    #         else:
-    #             frac_recovered = 0.0
-            
-    #         results[name] = {
-    #             'loss_original': loss_original,
-    #             'loss_reconstructed': loss_reconstructed,
-    #             'loss_zero': loss_zero,
-    #             'frac_recovered': frac_recovered
-    #         }
-        
-    #     return results
-
     @classmethod
     def from_pretrained(
         cls,
@@ -985,6 +715,7 @@ class TrainerConfig:
     test_batch_size: int = 8
     base_lr: float = 2e-4
     lr_decay_start_proportion: float = 0.8
+    use_vanilla_training: bool = False  # New flag to control training mode
 
 class TrainerSCAESuite:
     def __init__(
@@ -1109,7 +840,21 @@ class TrainerSCAESuite:
         buffer: Optional[Any] = None,
         log_metrics: bool = False,
     ) -> float:
-        """Single training step using pruned forward pass with FVU loss."""
+        """
+        Single training step using either vanilla or pruned forward pass with FVU loss.
+        
+        Args:
+            step: Current training step
+            initial_acts: Initial activations
+            input_acts: Dictionary mapping submodule names to input tensors
+            target_acts: Dictionary mapping submodule names to target tensors
+            layernorm_scales: Dictionary of layernorm scales
+            buffer: Optional buffer for test metrics
+            log_metrics: Whether to log metrics
+            
+        Returns:
+            Total loss value for this step
+        """
         # Move inputs to device
         initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
         input_acts = {
@@ -1136,21 +881,24 @@ class TrainerSCAESuite:
         
         # Track losses for logging
         losses = {
-            'pruned FVU': {},
+            'FVU': {},
             'random_penalty': {},
         }
         
-        # Get pruned forward pass results for MLP modules
-        pruned_results = self.suite.pruned_forward_train(
-            initial_acts=initial_acts,
-            inputs=input_acts,
-            layernorm_scales=layernorm_scales,
-            n_threshold=self.config.n_threshold,
-            n_random=self.config.n_random
-        )
-        
-        # Also get vanilla forward pass results for attention modules
-        vanilla_results = self.suite.vanilla_forward(inputs=input_acts)
+        if self.config.use_vanilla_training:
+            # Get vanilla forward pass results for all modules
+            reconstructions = self.suite.vanilla_forward(inputs=input_acts)
+        else:
+            # Get pruned forward pass results for MLP modules
+            pruned_results = self.suite.pruned_forward_train(
+                initial_acts=initial_acts,
+                inputs=input_acts,
+                layernorm_scales=layernorm_scales,
+                n_threshold=self.config.n_threshold,
+                n_random=self.config.n_random
+            )
+            # Also get vanilla forward pass results for attention modules
+            vanilla_results = self.suite.vanilla_forward(inputs=input_acts)
         
         # Compute losses for each module
         for name, ae in self.suite.aes.items():
@@ -1159,52 +907,62 @@ class TrainerSCAESuite:
             
             tgt = target_acts[name]
             
-            if 'mlp' in name: # and int(name.split('_')[-1]) < 2:
-                # Use pruned results for MLP modules
-                module_results = pruned_results[name]
-                x_hat = module_results['pruned_reconstruction']
-                
+            if self.config.use_vanilla_training:
+                # Use vanilla results for all modules
+                x_hat = reconstructions[name]
                 # Compute FVU loss
                 total_variance = t.var(tgt, dim=0).sum()
                 residual_variance = t.var(tgt - x_hat, dim=0).sum()
                 fvu_loss = residual_variance / total_variance
                 total_loss = total_loss + fvu_loss
-                losses['pruned FVU'][name] = fvu_loss.item()
+                losses['FVU'][name] = fvu_loss.item()
                 
-                # Random activation penalty
-                topk_threshold_acts = t.cat([
-                    module_results['topk'],
-                    module_results['threshold']
-                ], dim=1)  # [batch, k + n_threshold]
-                min_top_acts = topk_threshold_acts.min(dim=1, keepdim=True).values  # [batch, 1]
-                
-                # Penalize random features that exceed this minimum
-                random_penalty = t.relu(module_results['random'] - min_top_acts)  # [batch, n_random]
-                random_loss = random_penalty.sum()  # sum over both batch and features
-                
-                total_loss = total_loss + self.config.random_loss_coeff * random_loss
-                losses['random_penalty'][name] = random_loss.item()
-                
-            elif 'attn' in name: # and int(name.split('_')[-1]) < 2:
-                # Use vanilla results for attention modules
-                x_hat = vanilla_results[name]
-                
-                # Compute FVU loss
-                total_variance = t.var(tgt, dim=0).sum()
-                residual_variance = t.var(tgt - x_hat, dim=0).sum()
-                fvu_loss = residual_variance / total_variance
-                total_loss = total_loss + fvu_loss
-                losses['pruned FVU'][name] = fvu_loss.item()
-            
             else:
-                raise ValueError(f"Invalid submodule name: {name}")
+                # Original pruned training logic
+                if 'mlp' in name and int(name.split('_')[-1]) < 2 and name != 'mlp_0':
+                    module_results = pruned_results[name]
+                    x_hat = module_results['pruned_reconstruction']
+                    
+                    # Compute FVU loss
+                    total_variance = t.var(tgt, dim=0).sum()
+                    residual_variance = t.var(tgt - x_hat, dim=0).sum()
+                    fvu_loss = residual_variance / total_variance
+                    total_loss = total_loss + fvu_loss
+                    losses['FVU'][name] = fvu_loss.item()
+                    
+                    # Random activation penalty
+                    topk_threshold_acts = t.cat([
+                        module_results['topk'],
+                        module_results['threshold']
+                    ], dim=1)
+                    min_top_acts = topk_threshold_acts.min(dim=1, keepdim=True).values
+                    
+                    # Penalize random features that exceed this minimum
+                    random_penalty = t.relu(module_results['random'] - min_top_acts)
+                    random_loss = random_penalty.sum()
+                    
+                    total_loss = total_loss + self.config.random_loss_coeff * random_loss
+                    losses['random_penalty'][name] = random_loss.item()
+                    
+                elif ('attn' in name and int(name.split('_')[-1]) < 2) or name == 'mlp_0':
+                    x_hat = vanilla_results[name]
+                    
+                    # Compute FVU loss
+                    total_variance = t.var(tgt, dim=0).sum()
+                    residual_variance = t.var(tgt - x_hat, dim=0).sum()
+                    fvu_loss = residual_variance / total_variance
+                    total_loss = total_loss + fvu_loss
+                    losses['FVU'][name] = fvu_loss.item()
+                
+                else:
+                    continue
         
         # Backward pass and optimization
         total_loss.backward()
         
         # Clip gradients and remove parallel components
         for ae in self.suite.aes.values():
-            if ae.decoder.weight.grad is not None: #TODO
+            if ae.decoder.weight.grad is not None:
                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
                 ae.remove_gradient_parallel_to_decoder_directions()
         
