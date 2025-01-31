@@ -16,14 +16,12 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.float32
 MODEL_NAME = "gpt2"
-# C = 10
 expansion = 16
-k = 128 # TODO auto-detect if loading from pretrained
+k = 128
 remove_bos = True
 
-out_batch_size = 4096 //2
-num_tokens = int(2e8)
-
+out_batch_size = int(4*2048)
+num_tokens = int(4e8)
 
 
 #%%
@@ -66,10 +64,11 @@ submodule_cfg = SubmoduleConfig(
             k=k)
 submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
 
-
+print("steps = ", num_tokens // out_batch_size)
 trainer_cfg = TrainerConfig(
     steps=num_tokens // out_batch_size,
-    use_vanilla_training=True
+    use_vanilla_training=True,
+    base_lr=5e-4
 )
 
 #%%
@@ -77,9 +76,9 @@ trainer = train_scae_suite(
     buffer,
     submodule_configs=submodule_configs,
     trainer_config=trainer_cfg,
-    steps=200, #num_tokens // out_batch_size,
+    steps=num_tokens // out_batch_size,
     save_steps = 1000,
-    dtype = DTYPE,
+    dtype=DTYPE,
     device=device,
     log_steps = 20,
     use_wandb = True,
