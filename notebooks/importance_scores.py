@@ -20,6 +20,7 @@ from find_top_connections import get_importance_scores
 
 DTYPE = t.bfloat16
 device = t.device('cuda' if t.cuda.is_available() else 'cpu')
+MODEL_NAME = "gpt2"
 t.manual_seed(42)
 t.set_grad_enabled(False)
 gc.collect()
@@ -27,7 +28,7 @@ gc.collect()
 
 #%%
 if __name__ == '__main__':
-    model = load_model_with_folded_ln2("gpt2", device=device, torch_dtype=DTYPE)
+    model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
     data = load_iterable_dataset('Skylion007/openwebtext')
     suite = SCAESuite.from_pretrained(
         'jacobcd52/gpt2_suite_folded_ln',
@@ -47,10 +48,7 @@ if __name__ == '__main__':
     buffer = AllActivationBuffer(
         data=data,
         model=model,
-        submodules=submodules,
-        initial_submodule=initial_submodule,
-        layernorm_submodules=layernorm_submodules,
-        d_submodule=model.config.n_embd,
+        model_name=MODEL_NAME,
         n_ctxs=128,
         out_batch_size = 2048*4,
         refresh_batch_size = 128,

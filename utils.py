@@ -92,3 +92,22 @@ def load_iterable_dataset(
             return next(self.data)['text']
 
     return  CustomData(dataset)
+
+
+def get_modules(model, model_name : str):
+    if model_name == "gpt2":
+        initial_submodule = model.transformer.h[0]
+        submodules = {}
+        layernorm_submodules = {}
+        for layer in range(model.config.n_layer):
+            submodules[f"mlp_{layer}"] = (model.transformer.h[layer].mlp, "in_and_out")
+            submodules[f"attn_{layer}"] = (model.transformer.h[layer].attn, "out")
+
+            layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
+
+        d_submodule = model.config.n_embd
+
+    else:
+        raise ValueError(f"Model {model_name} not supported")
+
+    return initial_submodule, layernorm_submodules, submodules, d_submodule

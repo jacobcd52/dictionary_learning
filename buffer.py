@@ -1,7 +1,7 @@
 import torch as t
 from nnsight import LanguageModel
-import gc
 from tqdm import tqdm
+from utils import get_modules
 
 
 from config import DEBUG
@@ -34,10 +34,7 @@ class AllActivationBuffer:
             self,
             data: Iterator[Union[str, t.Tensor]],
             model: 'LanguageModel',
-            submodules: Dict[str, Tuple['Module', str]],
-            initial_submodule: 'Module',
-            layernorm_submodules: Dict[str, 'Module'],
-            d_submodule: Union[Dict[str, int], int, None] = None,
+            model_name: str,
             n_ctxs: int = int(3e4),
             ctx_len: int = 128,
             refresh_batch_size: int = 512,
@@ -62,16 +59,13 @@ class AllActivationBuffer:
             device: Device to store tensors on
             dtype: Data type for stored tensors
         """
-        # Validate submodule IO types
-        for name, (_, io) in submodules.items():
-            if io not in ["in", "out", "in_and_out"]:
-                raise ValueError(f"io must be 'in', 'out', or 'in_and_out', got {io}")
-
         self.data = data
         self.model = model
-        self.submodules = submodules
+        initial_submodule, layernorm_submodules, submodules, d_submodule = get_modules(model, model_name)
         self.initial_submodule = initial_submodule
         self.layernorm_submodules = layernorm_submodules
+        self.submodules = submodules
+    
         self.n_ctxs = n_ctxs
         self.ctx_len = ctx_len
         self.refresh_batch_size = refresh_batch_size
@@ -96,7 +90,7 @@ class AllActivationBuffer:
         self.initial_activations = t.empty(0, self.d_submodule['initial'], device=device, dtype=dtype)
         self.ln_scales = {
             name: t.empty(0, device=device, dtype=dtype)
-            for name in layernorm_submodules
+            for name in self.layernorm_submodules
         }
         
         self.read = t.zeros(0, dtype=t.bool, device=device)

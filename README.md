@@ -41,3 +41,4 @@ TODOs
 - More informative errors (e.g. "if no repo_id_in provided, you must provide submodule_configs" etc)
 - Improve multi-GPU support
 - find_top_connections shouldn't look at attribs on BOS token
+- Use pythia-70m?
