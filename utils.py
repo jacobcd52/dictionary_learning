@@ -132,6 +132,10 @@ def get_modules(model, model_name : str):
 
         d_submodule = model.config.hidden_size
 
+        # match gpt2 for convenience
+        model.config.n_embd = model.config.hidden_size
+        model.config.n_layer = model.config.num_layers
+
     else:
         raise ValueError(f"Model {model_name} not supported")
 

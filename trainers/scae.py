@@ -77,10 +77,13 @@ class SCAESuite(nn.Module):
             initial_act: t.Tensor, # [batch, d_in]
             down_name: str, # e.g. 'mlp_5'
             down_indices: t.Tensor, # [batch, k_down + n_threshold + n_random]
+            return_l1_norm: bool = False # used for logging
     ):
         W_enc_FD = self.aes[down_name].encoder.weight
         contributions_BF = initial_act @ W_enc_FD.T
         contributions_BK = contributions_BF.gather(1, down_indices)
+        if return_l1_norm:
+            return contributions_BK, t.norm(contributions_BK, p=1, dim=1)
         return contributions_BK
 
     def get_initial_contributions_test(
@@ -100,6 +103,7 @@ class SCAESuite(nn.Module):
         up_indices: t.Tensor,  # [batch, k_up]
         down_indices: t.Tensor,  # [batch, k_down + n_threshold + n_random]
         up_vals: t.Tensor,  # [batch, k_up]
+        return_l1_norm: bool = False # used for logging
     ) -> t.Tensor:  # [batch, k_down + n_threshold + n_random]
         """Memory-efficient version that maintains GPU parallelism."""
         batch_size = up_indices.shape[0]
@@ -160,9 +164,11 @@ class SCAESuite(nn.Module):
         
         # Add bias terms for all selected features
         b_dec_contrib = self.aes[down_name].encoder.weight @ self.aes[up_name].b_dec
-        contributions = contributions + b_dec_contrib[down_indices]
+        contributions_with_b_dec = contributions + b_dec_contrib[down_indices]
         
-        return contributions
+        if return_l1_norm:
+            return contributions_with_b_dec, t.norm(contributions, p=1, dim=1)
+        return contributions_with_b_dec
 
     def get_pruned_contributions_test(
         self,
@@ -398,7 +404,7 @@ class SCAESuite(nn.Module):
         layernorm_scales: Dict[str, t.Tensor],
         n_threshold: int = 0,
         n_random: int = 0
-    ) -> Dict[str, Dict[str, t.Tensor]]:
+    ) -> Tuple[Dict[str, Dict[str, t.Tensor]], Dict[str, float]]:
         """
         Run modified forward pass that computes:
         - Top k features
@@ -416,14 +422,15 @@ class SCAESuite(nn.Module):
             n_random: Number of random features to compute
             
         Returns:
-            Dictionary with structure:
-            {module_name: {
+            Tuple of (outputs_dict, metrics_dict) where:
+            outputs_dict: {module_name: {
                 'topk': tensor of top-k feature activations,
                 'threshold': tensor of threshold feature activations,
                 'random': tensor of random feature activations,
                 'all_indices': tensor of concatenated indices [batch, k_down + n_threshold + n_random],
                 'pruned_reconstruction': reconstruction from pruned features (or vanilla for attention)
             }}
+            metrics_dict: Dictionary of L1 norms for logging
         """
         # First get vanilla features and topk info (just for indices)
         results, features, topk_info = self.vanilla_forward(
@@ -431,13 +438,13 @@ class SCAESuite(nn.Module):
         )
         
         outputs = {}
+        metrics = {}
         # Store pruned upstream info
         pruned_upstream_info = {}
         
         # Now compute features for each module
         for down_name, config in self.configs.items():
             if down_name not in inputs:
-                print(f"{down_name} not in inputs")
                 continue
                 
             if 'attn' in down_name:
@@ -494,10 +501,11 @@ class SCAESuite(nn.Module):
                 down_idxs_random
             ], dim=1)  # [batch, k_down + n_threshold + n_random]
             
-            # Get initial contributions
-            approx_acts = self.get_initial_contributions_train(
-                initial_acts, down_name, down_idxs_all
+            # Get initial contributions and their L1 norms
+            approx_acts, initial_l1_norms = self.get_initial_contributions_train(
+                initial_acts, down_name, down_idxs_all, return_l1_norm=True
             )
+            metrics[f'contributions/{down_name}/from_initial'] = initial_l1_norms.mean().item()
             
             # Get contributions from each upstream module
             for up_name in self.connections[down_name].keys():
@@ -527,9 +535,11 @@ class SCAESuite(nn.Module):
                     up_idxs = t.gather(up_indices, 1, top_idx)  # [batch, k_up]
                     up_vals = top_vals  # [batch, k_up]
                 
-                contributions = self.get_pruned_contributions_train(
-                    up_name, down_name, up_idxs, down_idxs_all, up_vals
+                # Get contributions and L1 norms from upstream module
+                contributions, up_l1_norms = self.get_pruned_contributions_train(
+                    up_name, down_name, up_idxs, down_idxs_all, up_vals, return_l1_norm=True
                 )
+                metrics[f'contributions/{down_name}/from_{up_name}'] = up_l1_norms.mean().item()
                 
                 approx_acts = approx_acts + contributions
             
@@ -587,7 +597,7 @@ class SCAESuite(nn.Module):
             outputs[down_name] = module_outputs
             pruned_upstream_info[down_name] = module_outputs
         
-        return outputs
+        return outputs, metrics
     
     def get_ce_loss(
         self,
@@ -890,7 +900,7 @@ class TrainerSCAESuite:
             reconstructions = self.suite.vanilla_forward(inputs=input_acts)
         else:
             # Get pruned forward pass results for MLP modules
-            pruned_results = self.suite.pruned_forward_train(
+            pruned_results, l1_norm_metrics = self.suite.pruned_forward_train(
                 initial_acts=initial_acts,
                 inputs=input_acts,
                 layernorm_scales=layernorm_scales,
@@ -919,7 +929,7 @@ class TrainerSCAESuite:
                 
             else:
                 # Original pruned training logic
-                if 'mlp' in name and int(name.split('_')[-1]) < 2 and name != 'mlp_0':
+                if 'mlp' in name: # and int(name.split('_')[-1]) < 2 and name != 'mlp_0':
                     module_results = pruned_results[name]
                     x_hat = module_results['pruned_reconstruction']
                     
@@ -944,7 +954,7 @@ class TrainerSCAESuite:
                     total_loss = total_loss + self.config.random_loss_coeff * random_loss
                     losses['random_penalty'][name] = random_loss.item()
                     
-                elif ('attn' in name and int(name.split('_')[-1]) < 2) or name == 'mlp_0':
+                elif ('attn' in name): # and int(name.split('_')[-1]) < 2) or name == 'mlp_0':
                     x_hat = vanilla_results[name]
                     
                     # Compute FVU loss
@@ -987,6 +997,10 @@ class TrainerSCAESuite:
             
             log_dict.update(lrs)
             log_dict['loss/total'] = total_loss.item()
+            
+            # Add L1 norm metrics from pruned forward pass
+            if not self.config.use_vanilla_training:
+                log_dict.update(l1_norm_metrics)
             
             # Add test metrics every log_steps
             if step % self.config.log_steps == 0 and buffer is not None:
