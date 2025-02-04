@@ -63,6 +63,19 @@ def load_model_with_folded_ln2(
 
         # assert t.allclose(logits_no_fold.value.logits, logits_with_fold.value.logits)
 
+    elif model_name == "roneneldan/TinyStories-33M":
+        for layer in range(model.config.num_layers):
+            g = model.transformer.h[layer].ln_2.weight.data.clone()
+            c = model.transformer.h[layer].ln_2.bias.data.clone()
+            W = model.transformer.h[layer].mlp.c_fc.weight.data.clone()
+            b = model.transformer.h[layer].mlp.c_fc.bias.data.clone()
+
+            model.transformer.h[layer].ln_2.weight.data = t.ones_like(g)
+            model.transformer.h[layer].ln_2.bias.data = t.zeros_like(c)
+
+            model.transformer.h[layer].mlp.c_fc.weight.data = (W.T * g.unsqueeze(1)).T
+            model.transformer.h[layer].mlp.c_fc.bias.data = b + W @ c
+
   
     else:
         raise ValueError(f"Model {model_name} not supported")
@@ -106,6 +119,18 @@ def get_modules(model, model_name : str):
             layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
 
         d_submodule = model.config.n_embd
+
+    elif model_name == "roneneldan/TinyStories-33M":
+        initial_submodule = model.transformer.h[0]
+        submodules = {}
+        layernorm_submodules = {}
+        for layer in range(model.config.num_layers):
+            submodules[f"mlp_{layer}"] = (model.transformer.h[layer].mlp, "in_and_out")
+            submodules[f"attn_{layer}"] = (model.transformer.h[layer].attn, "out")
+
+            layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
+
+        d_submodule = model.config.hidden_size
 
     else:
         raise ValueError(f"Model {model_name} not supported")

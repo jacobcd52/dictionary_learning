@@ -12,38 +12,44 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 
 #%%
 DTYPE = t.float32
-MODEL_NAME = "gpt2"
+MODEL_NAME = "roneneldan/TinyStories-33M"
 expansion = 16
 k = 128
 remove_bos = True
 
-out_batch_size = int(4*2048)
-num_tokens = int(4e8)
+out_batch_size = 4096 * 2
+num_tokens = int(2e8)
 
 
 #%%
 model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
-data = load_iterable_dataset('Skylion007/openwebtext')
-
-num_features = model.config.n_embd * expansion
-n_layer = model.config.n_layer
+data = load_iterable_dataset("roneneldan/TinyStories")
+# 'Skylion007/openwebtext'
+if MODEL_NAME == "gpt2":
+    n_embd = model.config.n_embd
+    num_features = n_embd * expansion
+    n_layer = model.config.n_layer
+elif MODEL_NAME == "roneneldan/TinyStories-33M":
+    n_embd = model.config.hidden_size
+    num_features = n_embd * expansion
+    n_layer = model.config.num_layers
 
 #%%
 buffer = AllActivationBuffer(
     data=data,
     model=model,
     model_name=MODEL_NAME,
-    n_ctxs=256,  # you can set this higher or lower depending on your available memory
+    n_ctxs=1024,  # you can set this higher or lower depending on your available memory
     device="cuda",
     out_batch_size = out_batch_size,
-    refresh_batch_size = 128,
+    refresh_batch_size = 512,
     remove_bos=remove_bos
 ) 
 
 #%%
 submodule_cfg = SubmoduleConfig(
             dict_size=num_features,
-            activation_dim=model.config.n_embd,
+            activation_dim=n_embd,
             k=k)
 submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
 
@@ -65,8 +71,8 @@ trainer = train_scae_suite(
     device=device,
     log_steps = 20,
     use_wandb = True,
-    repo_id_out = "jacobcd52/gpt2_suite_folded_ln_nobos",
+    repo_id_out = "jacobcd52/TinyStories-33M_suite",
     seed = 42,
-    wandb_project_name="gpt2_pretrain_nobos"
+    wandb_project_name="TinyStories-33m_pretrain"
 )
 # %%
