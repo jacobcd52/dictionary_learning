@@ -4,7 +4,9 @@ noteboooks/importance_scores
 
 # Saved connections tensor
 connections_100.pkl
+connections_TinyStories-33M_100.pkl
 /root/dictionary_learning/connections_100.pkl
+/root/dictionary_learning/connections_TinyStories-33M_100.pkl
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
