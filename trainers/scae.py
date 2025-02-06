@@ -22,7 +22,7 @@ class SCAESuite(nn.Module):
     def __init__(
         self,
         submodule_configs: Dict[str, SubmoduleConfig],
-        connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
+        connections: Optional[Union[Dict[str, Dict[str, t.Tensor]], str]] = None,
         dtype: t.dtype = t.float32,
         device: Optional[str] = None,
     ):
@@ -34,6 +34,7 @@ class SCAESuite(nn.Module):
                 where tensor has shape [num_down_features, C] and contains indices
                 of connected upstream features, padded with -1.
                 C is the maximum number of connections per downstream feature.
+                Can also be the string "all" to use all upstream features.
             dtype: Data type for the autoencoders
             device: Device to place the autoencoders on
         """
@@ -57,10 +58,11 @@ class SCAESuite(nn.Module):
         self.submodule_names = list(submodule_configs.keys())
 
         # Initialize and validate connections
-        self.connections = {}
-        if connections is not None:
+        self.connections = connections
+        if isinstance(connections, dict):
+            processed_connections = {}
             for down_name, up_dict in connections.items():
-                self.connections[down_name] = {}
+                processed_connections[down_name] = {}
                 for up_name, conn_tensor in up_dict.items():
                     # Verify shape
                     assert conn_tensor.shape[0] == self.configs[down_name].dict_size, \
@@ -70,8 +72,62 @@ class SCAESuite(nn.Module):
                     assert valid_indices.all(), \
                         f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
                     
-                    self.connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
+                    processed_connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
+            self.connections = processed_connections
+        elif connections is not None and connections != "all":
+            raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
 
+
+    def get_all_contributions_train(
+        self,
+        up_name: str,                 # name of upstream module
+        down_name: str,               # name of downstream module
+        up_indices: t.Tensor,         # [batch, k_up]
+        down_indices: t.Tensor,       # [batch, k_down + n_threshold + n_random]
+        up_vals: t.Tensor,            # [batch, k_up]
+        return_l1_norm: bool = False  # used for logging
+    ) -> t.Tensor:                    # [batch, k_down + n_threshold + n_random]
+        """Memory-efficient version that computes contributions from all upstream features
+        by summing reconstructions."""
+        batch_size = up_indices.shape[0]
+        k_up = up_indices.shape[1]
+        device = up_indices.device
+
+        # First compute reconstruction from upstream module
+        # Create sparse feature tensor
+        features = t.zeros(
+            (batch_size, self.configs[up_name].dict_size),
+            device=device,
+            dtype=self.dtype
+        )
+        features.scatter_(
+            dim=1,
+            index=up_indices,
+            src=up_vals
+        )
+        
+        # Get reconstruction
+        reconstruction = self.aes[up_name].decode(features)  # [batch, d_in]
+        
+        # Now compute downstream encoder output for selected features only
+        down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
+        b_enc = self.aes[down_name].encoder.bias  # [d_down]
+        
+        # Get encoder vectors for selected features
+        active_down_vectors = down_encoder[down_indices]  # [batch*(k_down + ...), d_in]
+        active_down_vectors = active_down_vectors.view(batch_size, -1, down_encoder.shape[1])  # [batch, k_down + ..., d_in]
+        
+        # Compute contributions for selected features
+        contributions = einops.einsum(
+            active_down_vectors, reconstruction,
+            "batch k_down d_in, batch d_in -> batch k_down"
+        )  # [batch, k_down + n_threshold + n_random]
+        
+        if return_l1_norm:
+            return contributions, t.norm(contributions, p=1, dim=1)
+        return contributions
+
+        
     def get_initial_contributions_train(
             self,
             initial_act: t.Tensor, # [batch, d_in]
@@ -464,9 +520,6 @@ class SCAESuite(nn.Module):
                     'topk': topk_info[down_name][1]  # [batch, k]
                 }
                 continue
-                
-            if down_name not in self.connections:
-                continue
             
             batch_size = inputs[down_name].shape[0]
             device = inputs[down_name].device
@@ -507,41 +560,76 @@ class SCAESuite(nn.Module):
             )
             metrics[f'contributions/{down_name}/from_initial'] = initial_l1_norms.mean().item()
             
-            # Get contributions from each upstream module
-            for up_name in self.connections[down_name].keys():
-                if up_name not in inputs:
-                    continue
-                
-                # Get upstream values - ensure we only use top k for both vanilla and pruned
-                k_up = self.configs[up_name].k
-                # For attention modules or vanilla values, use vanilla topk info
-                # For MLP modules with pruned results, get the reranked top k
-                if up_name not in pruned_upstream_info or 'attn' in up_name:
-                    up_idxs = topk_info[up_name][0][:, :k_up]  # [batch, k_up]
-                    up_vals = topk_info[up_name][1][:, :k_up]  # [batch, k_up]
-                else:
-                    # Concatenate topk and threshold from pruned results
-                    up_acts = t.cat([
-                        pruned_upstream_info[up_name]['topk'],
-                        pruned_upstream_info[up_name]['threshold']
-                    ], dim=1)  # [batch, k_up + n_threshold]
-                    up_indices = t.cat([
-                        pruned_upstream_info[up_name]['all_indices'][:, :k_up],
-                        pruned_upstream_info[up_name]['all_indices'][:, k_up:k_up + n_threshold]
-                    ], dim=1)  # [batch, k_up + n_threshold]
+            if self.connections == "all":
+                # Get contributions from each upstream module
+                down_layer = int(down_name.split('_')[1])
+                all_up_names = [f'mlp_{layer}' for layer in range(down_layer)] + [f'attn_{layer}' for layer in range(down_layer+1)]
+                for up_name in all_up_names:  # Only consider upstream modules
+                    if up_name not in inputs:
+                        continue
                     
-                    # Get top k from these
-                    top_vals, top_idx = up_acts.topk(k_up, dim=1)  # both [batch, k_up]
-                    up_idxs = t.gather(up_indices, 1, top_idx)  # [batch, k_up]
-                    up_vals = top_vals  # [batch, k_up]
-                
-                # Get contributions and L1 norms from upstream module
-                contributions, up_l1_norms = self.get_pruned_contributions_train(
-                    up_name, down_name, up_idxs, down_idxs_all, up_vals, return_l1_norm=True
-                )
-                metrics[f'contributions/{down_name}/from_{up_name}'] = up_l1_norms.mean().item()
-                
-                approx_acts = approx_acts + contributions
+                    # Get upstream values (same as before)
+                    k_up = self.configs[up_name].k
+                    if up_name not in pruned_upstream_info or 'attn' in up_name:
+                        up_idxs = topk_info[up_name][0][:, :k_up]  # [batch, k_up]
+                        up_vals = topk_info[up_name][1][:, :k_up]  # [batch, k_up]
+                    else:
+                        # Use pruned upstream values
+                        up_acts = t.cat([
+                            pruned_upstream_info[up_name]['topk'],
+                            pruned_upstream_info[up_name]['threshold']
+                        ], dim=1)
+                        up_indices = t.cat([
+                            pruned_upstream_info[up_name]['all_indices'][:, :k_up],
+                            pruned_upstream_info[up_name]['all_indices'][:, k_up:k_up + n_threshold]
+                        ], dim=1)
+                        top_vals, top_idx = up_acts.topk(k_up, dim=1)
+                        up_idxs = t.gather(up_indices, 1, top_idx)
+                        up_vals = top_vals
+                    
+                    # Get contributions using all-connections method
+                    contributions, up_l1_norms = self.get_all_contributions_train(
+                        up_name, down_name, up_idxs, down_idxs_all, up_vals, return_l1_norm=True
+                    )
+                    metrics[f'contributions/{down_name}/from_{up_name}'] = up_l1_norms.mean().item()
+                    
+                    approx_acts = approx_acts + contributions
+                    
+            elif isinstance(self.connections, dict):
+                if down_name not in self.connections:
+                    continue
+                    
+                # Get contributions from each upstream module
+                for up_name in self.connections[down_name].keys():
+                    if up_name not in inputs:
+                        continue
+                    
+                    # Get upstream values - ensure we only use top k for both vanilla and pruned
+                    k_up = self.configs[up_name].k
+                    if up_name not in pruned_upstream_info or 'attn' in up_name:
+                        up_idxs = topk_info[up_name][0][:, :k_up]  # [batch, k_up]
+                        up_vals = topk_info[up_name][1][:, :k_up]  # [batch, k_up]
+                    else:
+                        # Use pruned upstream values
+                        up_acts = t.cat([
+                            pruned_upstream_info[up_name]['topk'],
+                            pruned_upstream_info[up_name]['threshold']
+                        ], dim=1)
+                        up_indices = t.cat([
+                            pruned_upstream_info[up_name]['all_indices'][:, :k_up],
+                            pruned_upstream_info[up_name]['all_indices'][:, k_up:k_up + n_threshold]
+                        ], dim=1)
+                        top_vals, top_idx = up_acts.topk(k_up, dim=1)
+                        up_idxs = t.gather(up_indices, 1, top_idx)
+                        up_vals = top_vals
+                    
+                    # Get contributions and L1 norms from upstream module
+                    contributions, up_l1_norms = self.get_pruned_contributions_train(
+                        up_name, down_name, up_idxs, down_idxs_all, up_vals, return_l1_norm=True
+                    )
+                    metrics[f'contributions/{down_name}/from_{up_name}'] = up_l1_norms.mean().item()
+                    
+                    approx_acts = approx_acts + contributions
             
             # Apply layernorm scaling
             approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)

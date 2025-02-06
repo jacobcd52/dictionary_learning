@@ -3,6 +3,7 @@ from buffer import AllActivationBuffer
 from training import train_scae_suite
 from trainers.scae import TrainerConfig
 from utils import load_model_with_folded_ln2, load_iterable_dataset
+from find_top_connections import generate_fake_connections
 
 import torch as t
 from huggingface_hub import login
@@ -15,10 +16,10 @@ t.set_grad_enabled(True)
 
 
 #%%
-DTYPE = t.float32
+DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
 
-out_batch_size = 512
+out_batch_size = 256
 num_tokens = int(1e7)
 remove_bos = True # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
 
@@ -44,8 +45,8 @@ buffer = AllActivationBuffer(
 trainer_cfg = TrainerConfig(
     steps=num_tokens // out_batch_size,
     n_threshold=0,
-    n_random=0,
-    random_loss_coeff=0.0,
+    n_random=2000,
+    random_loss_coeff=0.0001,
     base_lr=2e-4
 )
 
@@ -53,6 +54,7 @@ trainer_cfg = TrainerConfig(
 with open("connections_TinyStories-33M_100.pkl", "rb") as f:
     connections = pickle.load(f)
 
+# connections = generate_fake_connections(connections, num_features=768*16)
 # If using random connections
 # fake_connections = generate_fake_connections(
 #     connections,
@@ -74,7 +76,7 @@ with open("connections_TinyStories-33M_100.pkl", "rb") as f:
 trainer = train_scae_suite(
     buffer,
     trainer_config=trainer_cfg,
-    connections=connections,
+    connections="all", #connections,
     steps=num_tokens // out_batch_size,
     save_steps = 1000,
     dtype = DTYPE,

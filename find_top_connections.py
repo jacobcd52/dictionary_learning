@@ -326,7 +326,6 @@ def get_top_c_indices(top_connections_dict: Dict[str, t.Tensor], c: int, chunk_s
 
 
 import torch
-import typing as t
 from collections import defaultdict
 
 def generate_fake_connections(
