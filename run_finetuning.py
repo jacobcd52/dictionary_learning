@@ -45,11 +45,12 @@ buffer = AllActivationBuffer(
 trainer_cfg = TrainerConfig(
     steps=num_tokens // out_batch_size,
     n_threshold=0,
-    n_random=2000,
-    random_loss_coeff=0.0001,
-    base_lr=2e-4
+    n_random=0,
+    base_lr=1e-4, 
+    feature_fvu_coeff=0.01
 )
 
+#%%
 # Load connections dict
 with open("connections_TinyStories-33M_100.pkl", "rb") as f:
     connections = pickle.load(f)
@@ -76,7 +77,7 @@ with open("connections_TinyStories-33M_100.pkl", "rb") as f:
 trainer = train_scae_suite(
     buffer,
     trainer_config=trainer_cfg,
-    connections="all", #connections,
+    connections=connections, # "all"
     steps=num_tokens // out_batch_size,
     save_steps = 1000,
     dtype = DTYPE,
@@ -85,7 +86,7 @@ trainer = train_scae_suite(
     use_wandb = True,
     repo_id_in='jacobcd52/TinyStories-33M_suite',
     repo_id_out = "jacobcd52/TinyStories-33M_scae",
-    wandb_project_name="tinystories33m_scae_finetuning",
+    wandb_project_name="tinystories33m_scae_2",
 )
 
 #%%

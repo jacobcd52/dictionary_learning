@@ -70,24 +70,51 @@ class AutoEncoderTopK(Dictionary, nn.Module):
 
         self.b_dec = nn.Parameter(t.zeros(activation_dim))
 
-    def encode(self, x: t.Tensor, return_topk: bool = False, n_threshold: int = 0):
-        """Standard encode function for inputs of shape [batch, d]"""
-        preact_BF = self.encoder(x - self.b_dec)
-        post_relu_feat_acts_BF = nn.functional.relu(preact_BF)
-        post_topk = post_relu_feat_acts_BF.topk(self.k + n_threshold, sorted=True, dim=-1)
+    def encode(
+            self, 
+            x: t.Tensor, 
+            return_topk: bool = False,
+            return_preact: bool = False,
+            n_threshold: int = 0
+        ):
+            """Standard encode function for inputs of shape [batch, d]
+            
+            Args:
+                x: Input tensor of shape [batch, d]
+                return_topk: Whether to return top-k indices and values
+                return_preact: Whether to return pre-activation values
+                n_threshold: Number of additional threshold features to return
+                
+            Returns:
+                If return_topk and return_preact:
+                    (encoded_acts_BF, preact_BF, top_acts_all, top_indices_all)
+                If return_topk only:
+                    (encoded_acts_BF, top_acts_all, top_indices_all)
+                If return_preact only:
+                    (encoded_acts_BF, preact_BF)
+                Otherwise:
+                    encoded_acts_BF
+            """
+            preact_BF = self.encoder(x - self.b_dec)
+            post_relu_feat_acts_BF = nn.functional.relu(preact_BF)
+            post_topk = post_relu_feat_acts_BF.topk(self.k + n_threshold, sorted=True, dim=-1)
 
-        top_acts_all = post_topk.values
-        top_indices_all = post_topk.indices
-        tops_acts_BK = post_topk.values[:, :self.k]
-        top_indices_BK = post_topk.indices[:, :self.k]
+            top_acts_all = post_topk.values
+            top_indices_all = post_topk.indices
+            tops_acts_BK = post_topk.values[:, :self.k]
+            top_indices_BK = post_topk.indices[:, :self.k]
 
-        buffer_BF = t.zeros_like(post_relu_feat_acts_BF)
-        encoded_acts_BF = buffer_BF.scatter_(dim=-1, index=top_indices_BK, src=tops_acts_BK)
+            buffer_BF = t.zeros_like(post_relu_feat_acts_BF)
+            encoded_acts_BF = buffer_BF.scatter_(dim=-1, index=top_indices_BK, src=tops_acts_BK)
 
-        if return_topk:
-            return encoded_acts_BF, top_acts_all, top_indices_all
-        else:
-            return encoded_acts_BF
+            if return_topk and return_preact:
+                return encoded_acts_BF, preact_BF, top_acts_all, top_indices_all
+            elif return_topk:
+                return encoded_acts_BF, top_acts_all, top_indices_all
+            elif return_preact:
+                return encoded_acts_BF, preact_BF
+            else:
+                return encoded_acts_BF
 
  
     def decode(self, x: t.Tensor) -> t.Tensor:
