@@ -59,20 +59,36 @@ class SCAESuite(nn.Module):
 
         # Initialize and validate connections
         self.connections = connections
+        self.connection_masks = {}  # Store precomputed connection masks
         if isinstance(connections, dict):
             processed_connections = {}
             for down_name, up_dict in connections.items():
                 processed_connections[down_name] = {}
+                self.connection_masks[down_name] = {}
                 for up_name, conn_tensor in up_dict.items():
                     # Verify shape
-                    assert conn_tensor.shape[0] == self.configs[down_name].dict_size, \
-                        f"Connection tensor for {down_name}->{up_name} has wrong shape. Expected first dim {self.configs[down_name].dict_size}, got {conn_tensor.shape[0]}"
+                    num_down_features = self.configs[down_name].dict_size
+                    num_up_features = self.configs[up_name].dict_size
+                    assert conn_tensor.shape[0] == num_down_features, \
+                        f"Connection tensor for {down_name}->{up_name} has wrong shape. Expected first dim {num_down_features}, got {conn_tensor.shape[0]}"
                     # Verify indices are valid
-                    valid_indices = (conn_tensor >= -1) & (conn_tensor < self.configs[up_name].dict_size)
+                    valid_indices = (conn_tensor >= -1) & (conn_tensor < num_up_features)
                     assert valid_indices.all(), \
                         f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
                     
                     processed_connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
+                    
+                    # Precompute connection mask
+                    connection_mask = t.zeros(num_down_features, num_up_features, device=self.device, dtype=t.bool)
+                    valid_connections = conn_tensor != -1  # [num_down, C]
+                    
+                    # For each downstream feature, scatter its valid connections
+                    for i in range(num_down_features):
+                        valid_mask = valid_connections[i]  # [C]
+                        valid_targets = conn_tensor[i][valid_mask]  # Get valid target indices
+                        connection_mask[i].scatter_(0, valid_targets, t.ones(len(valid_targets), device=self.device, dtype=t.bool))
+                    
+                    self.connection_masks[down_name][up_name] = connection_mask
             self.connections = processed_connections
         elif connections is not None and connections != "all":
             raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
@@ -81,408 +97,75 @@ class SCAESuite(nn.Module):
             self,
             inputs: Dict[str, t.Tensor],
             return_features: bool = False,
-            return_topk: bool = False,
-            return_preact: bool = False,
-            n_threshold: int = 0
         ) -> Union[Dict[str, t.Tensor], Tuple[Dict[str, t.Tensor], Dict[str, t.Tensor]]]:
-            """
-            Modified vanilla forward pass to support additional threshold features and pre-activations.
-            
-            Args:
-                inputs: Dictionary mapping submodule names to input tensors
-                return_features: Whether to return encoded features
-                return_topk: Whether to return top-k feature indices and values
-                return_preact: Whether to return pre-activation values
-                n_threshold: Optional number of additional threshold features to return
-            """
+            """Forward pass that outputs feature activations."""
             results = {}
             features = {}
-            preacts = {}
-            topk_info = {}
             
             for name, ae in self.aes.items():
                 if name not in inputs:
                     continue
                     
-                if return_topk and return_preact:
-                    feat, preact, top_vals, top_idxs = ae.encode(
-                        inputs[name], 
-                        return_topk=True, 
-                        return_preact=True,
-                        n_threshold=n_threshold
-                    )
-                    topk_info[name] = (top_idxs, top_vals)
-                    preacts[name] = preact
-                elif return_topk:
-                    feat, top_vals, top_idxs = ae.encode(
-                        inputs[name], 
-                        return_topk=True,
-                        n_threshold=n_threshold
-                    )
-                    topk_info[name] = (top_idxs, top_vals)
-                elif return_preact:
-                    feat, preact = ae.encode(
-                        inputs[name], 
-                        return_preact=True
-                    )
-                    preacts[name] = preact
-                else:
-                    feat = ae.encode(inputs[name])
-                    
+                feat = ae.encode(inputs[name])  # [batch, num_features]
                 recon = ae.decode(feat)
                 
                 results[name] = recon
                 if return_features:
                     features[name] = feat
             
-            returns = [results]
-            if return_features:
-                returns.append(features)
-            if return_topk:
-                returns.append(topk_info)
-            if return_preact:
-                returns.append(preacts)
-            
-            return tuple(returns) if len(returns) > 1 else returns[0]
+            return (results, features) if return_features else results
 
-    def get_initial_contributions_train(
-            self,
-            initial_act: t.Tensor, # [batch, d_in]
-            down_name: str, # e.g. 'mlp_5'
-            down_indices: t.Tensor, # [batch, k_down + n_threshold + n_random]
-            return_l1_norm: bool = False # used for logging
-    ):
-        W_enc_FD = self.aes[down_name].encoder.weight
-        contributions_BF = initial_act @ W_enc_FD.T
-        contributions_BK = contributions_BF.gather(1, down_indices)
-        if return_l1_norm:
-            return contributions_BK, t.norm(contributions_BK, p=1, dim=1)
-        return contributions_BK
-
-    def get_pruned_contributions_train(
-            self,
-            up_name: str,
-            down_name: str,
-            up_indices: t.Tensor,  # [batch, k_up]
-            down_indices: t.Tensor,  # [batch, k_down + n_threshold + n_random]
-            up_vals: t.Tensor,  # [batch, k_up]
-            return_l1_norm: bool = False # used for logging
-        ) -> t.Tensor:  # [batch, k_down + n_threshold + n_random]
-            """Memory-efficient version that maintains GPU parallelism.
-            Handles both "all" connections mode and sparse connections mode.
-            """
-            batch_size = up_indices.shape[0]
-            k_up = up_indices.shape[1]
-            total_down_features = down_indices.shape[1]  # k_down + n_threshold + n_random
-            device = up_indices.device
-            
-            # Get weights for the active features
-            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
-            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
-            
-            active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
-            active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
-            
-            # Get all relevant downstream vectors
-            active_down_vectors = down_encoder[down_indices.reshape(-1)]  # [batch*(k_down + n_threshold + n_random), d_in]
-            active_down_vectors = active_down_vectors.view(batch_size, total_down_features, -1)  # [batch, k_down + n_threshold + n_random, d_in]
-            
-            # Compute virtual weights between active features
-            virtual_weights = einops.einsum(
-                active_down_vectors, active_up_vectors,
-                "batch k_down d_in, batch k_up d_in -> batch k_down k_up"
-            )  # [batch, k_down + n_threshold + n_random, k_up]
-            
-            # Initialize contributions tensor for all selected downstream features
-            contributions = t.zeros((batch_size, total_down_features), device=device, dtype=up_vals.dtype)
-            
-            if self.connections == "all":
-                # For "all" mode, every downstream feature is connected to every upstream feature
-                contributions = virtual_weights @ up_vals.unsqueeze(-1)
-                contributions = contributions.squeeze(-1)
-            else:
-                # For sparse connections mode, use the connection tensor
-                connections = self.connections[down_name][up_name]  # [num_down, C]
-                C = connections.shape[1]
-                
-                chunk_size = 256
-                num_chunks = (C + chunk_size - 1) // chunk_size
-                
-                for chunk_idx in range(num_chunks):
-                    start_idx = chunk_idx * chunk_size
-                    end_idx = min((chunk_idx + 1) * chunk_size, C)
-                    
-                    # Get the current chunk of connections for ALL downstream features we care about
-                    chunk_connections = connections[down_indices.reshape(-1), start_idx:end_idx]  # [(batch*(k_down + n_threshold + n_random)), chunk_size]
-                    chunk_connections = chunk_connections.view(batch_size, total_down_features, -1)  # [batch, k_down + n_threshold + n_random, chunk_size]
-                    
-                    valid_mask = (chunk_connections != -1)  # [batch, k_down + n_threshold + n_random, chunk_size]
-                    
-                    # Match upstream features
-                    chunk_connections_expanded = chunk_connections.unsqueeze(-1)  # [batch, k_down + n_threshold + n_random, chunk_size, 1]
-                    up_indices_expanded = up_indices.unsqueeze(1).unsqueeze(2)  # [batch, 1, 1, k_up]
-                    connection_mask = (chunk_connections_expanded == up_indices_expanded) & valid_mask.unsqueeze(-1)
-                    
-                    # Apply mask and compute contributions
-                    chunk_contributions = t.where(
-                        connection_mask,
-                        virtual_weights.unsqueeze(2) * up_vals.unsqueeze(1).unsqueeze(2),
-                        t.zeros_like(virtual_weights[:, :, None, :])
-                    )
-                    
-                    contributions += chunk_contributions.sum(dim=(2, 3))
-            
-            # Add bias terms for all selected features
-            b_dec_contrib = self.aes[down_name].encoder.weight @ self.aes[up_name].b_dec
-            contributions_with_b_dec = contributions + b_dec_contrib[down_indices]
-            
-            if return_l1_norm:
-                return contributions_with_b_dec, t.norm(contributions, p=1, dim=1)
-            return contributions_with_b_dec
-   
-    def pruned_forward_train(
-            self,
-            initial_acts: t.Tensor,
-            inputs: Dict[str, t.Tensor],
-            layernorm_scales: Dict[str, t.Tensor],
-            n_threshold: int = 0,
-            n_random: int = 0
-        ) -> Tuple[Dict[str, Dict[str, t.Tensor]], Dict[str, float]]:
-            """
-            Run modified forward pass that computes:
-            - Top k features
-            - Additional n_threshold features
-            - n_random randomly selected features
-            
-            Uses pruned activations of upstream modules when computing downstream activations.
-            For attention modules, returns vanilla reconstructions.
-            """
-            # First get vanilla features and topk info (just for indices)
-            results, features, topk_info = self.vanilla_forward(
-                inputs, return_features=True, return_topk=True, n_threshold=n_threshold
-            )
-            
-            outputs = {}
-            metrics = {}
-            # Store pruned upstream info
-            pruned_upstream_info = {}
-            
-            # Now compute features for each module
-            for down_name, config in self.configs.items():
-                if down_name not in inputs:
-                    continue
-                    
-                if 'attn' in down_name:
-                    # For attention modules, just return vanilla reconstruction and empty values
-                    k_down = self.configs[down_name].k
-                    batch_size = inputs[down_name].shape[0]
-                    device = inputs[down_name].device
-                    
-                    # For attention modules, just return vanilla reconstruction
-                    module_outputs = {
-                        'pruned_reconstruction': results[down_name]  # Use vanilla reconstruction
-                    }
-                    outputs[down_name] = module_outputs
-                    # Store vanilla topk info for use as upstream module
-                    pruned_upstream_info[down_name] = {
-                        'all_indices': topk_info[down_name][0],  # [batch, k]
-                        'topk': topk_info[down_name][1]  # [batch, k]
-                    }
-                    continue
-                
-                batch_size = inputs[down_name].shape[0]
-                device = inputs[down_name].device
-                        
-                # Get top k + threshold indices and values
-                down_idxs_extended = topk_info[down_name][0]  # [batch, k + n_threshold]
-                k_down = self.configs[down_name].k
-                
-                # Split into topk and threshold
-                down_idxs_topk = down_idxs_extended[:, :k_down]
-                down_idxs_threshold = down_idxs_extended[:, k_down:]
-                
-                # Generate random indices (excluding those already selected)
-                all_indices = set(range(config.dict_size))
-                batch_random_indices = []
-                
-                for b in range(batch_size):
-                    used_indices = set(down_idxs_extended[b].cpu().numpy())
-                    available_indices = list(all_indices - used_indices)
-                    selected_random = t.tensor(
-                        np.random.choice(available_indices, n_random, replace=False),
-                        device=device
-                    )
-                    batch_random_indices.append(selected_random)
-                    
-                down_idxs_random = t.stack(batch_random_indices)  # [batch, n_random]
-                
-                # Combine all indices for computation
-                down_idxs_all = t.cat([
-                    down_idxs_topk,
-                    down_idxs_threshold,
-                    down_idxs_random
-                ], dim=1)  # [batch, k_down + n_threshold + n_random]
-                
-                # Get initial contributions and their L1 norms
-                approx_acts, initial_l1_norms = self.get_initial_contributions_train(
-                    initial_acts, down_name, down_idxs_all, return_l1_norm=True
-                )
-                metrics[f'contributions/{down_name}/from_initial'] = initial_l1_norms.mean().item()
-                
-                # Get upstream modules to consider based on connections type
-                if self.connections == "all":
-                    down_layer = int(down_name.split('_')[1])
-                    up_names = [f'mlp_{layer}' for layer in range(down_layer)] + [f'attn_{layer}' for layer in range(down_layer+1)]
-                elif isinstance(self.connections, dict) and down_name in self.connections:
-                    up_names = list(self.connections[down_name].keys())
-                else:
-                    up_names = []
-                
-                # Get contributions from each upstream module
-                for up_name in up_names:
-                    if up_name not in inputs:
-                        continue
-                    
-                    # Get upstream values (same as before)
-                    k_up = self.configs[up_name].k
-                    if up_name not in pruned_upstream_info or 'attn' in up_name:
-                        up_idxs = topk_info[up_name][0][:, :k_up]  # [batch, k_up]
-                        up_vals = topk_info[up_name][1][:, :k_up]  # [batch, k_up]
-                    else:
-                        # Use pruned upstream values
-                        up_acts = t.cat([
-                            pruned_upstream_info[up_name]['topk'],
-                            pruned_upstream_info[up_name]['threshold']
-                        ], dim=1)
-                        up_indices = t.cat([
-                            pruned_upstream_info[up_name]['all_indices'][:, :k_up],
-                            pruned_upstream_info[up_name]['all_indices'][:, k_up:k_up + n_threshold]
-                        ], dim=1)
-                        top_vals, top_idx = up_acts.topk(k_up, dim=1)
-                        up_idxs = t.gather(up_indices, 1, top_idx)
-                        up_vals = top_vals
-                    
-                    # Get contributions using the unified get_pruned_contributions_train method
-                    contributions, up_l1_norms = self.get_pruned_contributions_train(
-                        up_name, down_name, up_idxs, down_idxs_all, up_vals, return_l1_norm=True
-                    )
-                    metrics[f'contributions/{down_name}/from_{up_name}'] = up_l1_norms.mean().item()
-                    
-                    approx_acts = approx_acts + contributions
-                
-                # Apply layernorm scaling
-                approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)
-                
-                # Add encoder bias and subtract decoder bias contribution
-                b_enc = self.aes[down_name].encoder.bias[down_idxs_all]
-                approx_acts = approx_acts + b_enc
-                
-                W_enc = self.aes[down_name].encoder.weight[down_idxs_all]
-                approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec
-                
-                # Split results and get pruned reconstruction
-                topk_threshold_acts = t.cat([
-                    approx_acts[:, :k_down],
-                    approx_acts[:, k_down:k_down + n_threshold]
-                ], dim=1)  # [batch, k_down + n_threshold]
-                
-                topk_threshold_indices = t.cat([
-                    down_idxs_topk,
-                    down_idxs_threshold
-                ], dim=1)  # [batch, k_down + n_threshold]
-                
-                # Get top k features from the pruned activations
-                pruned_top_vals, pruned_top_idx = topk_threshold_acts.topk(k_down, dim=1)  # both [batch, k_down]
-                
-                # Get the actual feature indices these correspond to
-                pruned_top_indices = t.gather(topk_threshold_indices, 1, pruned_top_idx)  # [batch, k_down]
-                
-                # Create sparse feature tensor for reconstruction
-                pruned_features = t.zeros(
-                    (batch_size, config.dict_size),
-                    device=device,
-                    dtype=self.dtype
-                )
-                pruned_features.scatter_(
-                    dim=1,
-                    index=pruned_top_indices,
-                    src=pruned_top_vals
-                )
-                
-                # Get reconstruction from pruned features
-                pruned_reconstruction = self.aes[down_name].decode(pruned_features)
-                
-                module_outputs = {
-                    'topk': approx_acts[:, :k_down],
-                    'threshold': approx_acts[:, k_down:k_down + n_threshold],
-                    'random': approx_acts[:, k_down + n_threshold:],
-                    'all_indices': down_idxs_all,  # [batch, k_down + n_threshold + n_random]
-                    'pruned_reconstruction': pruned_reconstruction
-                }
-                
-                # Store outputs both for return and for use as upstream values
-                outputs[down_name] = module_outputs
-                pruned_upstream_info[down_name] = module_outputs
-            
-            return outputs, metrics
-    
-    def get_initial_contributions_test(
+    def get_initial_contributions(
             self,
             initial_act: t.Tensor, # [batch, d_in]
             down_name: str, # e.g. 'mlp_5'
     ):
-        """Compute initial contributions for all downstream features during test time."""
+        """Compute initial contributions for all downstream features."""
         W_enc_FD = self.aes[down_name].encoder.weight
         contributions_BF = initial_act @ W_enc_FD.T  # [batch, num_down_features]
         return contributions_BF
 
-    def get_pruned_contributions_test(
+    def get_pruned_contributions(
         self,
         up_name: str,
         down_name: str,
-        up_indices: t.Tensor,  # [batch, k_up]
-        up_vals: t.Tensor,  # [batch, k_up]
+        upstream_acts: t.Tensor,  # [batch, num_up_features]
     ) -> t.Tensor:  # [batch, num_down_features]
-        """Test-time version that computes contributions for all downstream features."""
-        batch_size = up_indices.shape[0]
-        k_up = up_indices.shape[1]
+        """Compute contributions for all downstream features using efficient matrix operations."""
+        batch_size = upstream_acts.shape[0]
         num_down_features = self.configs[down_name].dict_size
-        device = up_indices.device
+        device = upstream_acts.device
         
-        # Get connection tensor for this pair of modules
-        connections = self.connections[down_name][up_name]  # [num_down, C]
-        
-        # Get weights for the active features
-        up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
-        down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
-        
-        # Get active upstream vectors
-        active_up_vectors = up_decoder[:, up_indices.reshape(-1)].T  # [batch*k_up, d_in]
-        active_up_vectors = active_up_vectors.view(batch_size, k_up, -1)  # [batch, k_up, d_in]
-        
-        # Get all downstream vectors
-        down_vectors = down_encoder  # [num_down, d_in]
-        
-        # Compute virtual weights between all downstream and active upstream features
-        virtual_weights = einops.einsum(
-            down_vectors, active_up_vectors,
-            "num_down d_in, batch k_up d_in -> batch num_down k_up"
-        )  # [batch, num_down, k_up]
-        
-        # Initialize contributions tensor
-        contributions = t.zeros((batch_size, num_down_features), device=device, dtype=up_vals.dtype)
-        
-        # Expand connection tensor for broadcasting
-        connections_expanded = connections.unsqueeze(0)  # [1, num_down, C]
-        valid_mask = (connections_expanded != -1)  # [1, num_down, C]
-        
-        # For each valid connection, add contribution if upstream feature is active
-        up_indices_expanded = up_indices.unsqueeze(1)  # [batch, 1, k_up]
-        connections_match = (connections_expanded.unsqueeze(-1) == up_indices_expanded.unsqueeze(2))  # [batch, num_down, C, k_up]
-        connection_mask = connections_match & valid_mask.unsqueeze(-1)  # [batch, num_down, C, k_up]
-        
-        # Apply mask and compute all contributions at once
-        contributions = (connection_mask * virtual_weights.unsqueeze(2)).sum(dim=(2, 3))  # [batch, num_down]
+        if self.connections == "all":
+            # For "all" mode, every downstream feature is connected to every upstream feature
+            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
+            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
+            
+            # Compute full virtual weight matrix
+            virtual_weights = down_encoder @ up_decoder  # [num_down, num_up]
+            
+            # Compute contributions
+            contributions = upstream_acts @ virtual_weights.T  # [batch, num_down]
+            
+        else:
+            # Get connection tensor for this pair of modules
+            connections = self.connections[down_name][up_name]  # [num_down, C]
+            
+            # Get weights for computing virtual weights
+            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
+            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
+            
+            # Compute full virtual weight matrix
+            virtual_weights = down_encoder @ up_decoder  # [num_down, num_up]
+            
+            # Get precomputed connection mask
+            connection_mask = self.connection_masks[down_name][up_name]
+            
+            # Apply connection mask to virtual weights
+            masked_weights = virtual_weights * connection_mask  # [num_down, num_up]
+            
+            # Compute contributions
+            contributions = upstream_acts @ masked_weights.T  # [batch, num_down]
         
         # Add bias terms for all features
         b_dec_contrib = down_encoder @ self.aes[up_name].b_dec  # [num_down]
@@ -490,37 +173,19 @@ class SCAESuite(nn.Module):
         
         return contributions
 
-    def pruned_forward_test(
+    def pruned_forward(
         self,
         initial_acts: t.Tensor,
         inputs: Dict[str, t.Tensor],
         layernorm_scales: Dict[str, t.Tensor],
         return_topk: bool = False
     ) -> Union[Dict[str, t.Tensor], Tuple[Dict[str, t.Tensor], Dict[str, Dict[str, t.Tensor]]]]:
-        """
-        Test-time forward pass that computes activations for all features, then applies TopK.
-        
-        Args:
-            initial_acts: Initial activations
-            inputs: Dictionary mapping submodule names to input tensors
-            layernorm_scales: Dictionary of layernorm scales
-            return_topk: Whether to return top-k feature indices and values
-            
-        Returns:
-            If return_topk is False:
-                Dictionary mapping module names to pruned reconstructions
-            If return_topk is True:
-                Tuple of (reconstructions_dict, topk_info_dict) where topk_info_dict has structure:
-                {module_name: {
-                    'indices': tensor of top-k feature indices [batch, k],
-                    'values': tensor of top-k feature values [batch, k]
-                }}
-        """
+        """Forward pass that computes activations for all features, then applies TopK."""
         reconstructions = {}
         topk_info = {}
         
-        # Store pruned upstream info for progressive computation
-        pruned_upstream_info = {}
+        # Get vanilla forward features for all modules
+        results, features = self.vanilla_forward(inputs, return_features=True)
         
         for down_name, config in self.configs.items():
             if down_name not in inputs:
@@ -528,96 +193,82 @@ class SCAESuite(nn.Module):
                 
             if 'attn' in down_name:
                 # For attention modules, use vanilla forward pass
-                feat = self.aes[down_name].encode(inputs[down_name])
+                feat = features[down_name]
                 recon = self.aes[down_name].decode(feat)
                 reconstructions[down_name] = recon
                 
                 if return_topk:
-                    # Get top k features for upstream usage
                     k = self.configs[down_name].k
                     top_vals, top_idx = feat.topk(k, dim=1)
                     topk_info[down_name] = {
                         'indices': top_idx,
                         'values': top_vals
                     }
-                    pruned_upstream_info[down_name] = topk_info[down_name]
-                continue
-                
-            if down_name not in self.connections:
-                continue
-                
-            batch_size = inputs[down_name].shape[0]
-            device = inputs[down_name].device
-            k_down = self.configs[down_name].k
-            
-            # Get initial contributions for all features
-            approx_acts = self.get_initial_contributions_test(initial_acts, down_name)
-            
-            # Add contributions from each upstream module
-            for up_name in self.connections[down_name].keys():
-                if up_name not in inputs:
-                    continue
+            else:
+                # Handle MLP modules
+                if self.connections == 'all' or (isinstance(self.connections, dict) and down_name in self.connections):
+                    # Compute pruned reconstruction for connected MLPs
+                    batch_size = inputs[down_name].shape[0]
+                    device = inputs[down_name].device
+                    k_down = self.configs[down_name].k
                     
-                # Get upstream values (only use top k)
-                k_up = self.configs[up_name].k
-                if up_name not in pruned_upstream_info:
-                    # First layer or attention module - use vanilla forward
-                    feat = self.aes[up_name].encode(inputs[up_name])
-                    top_vals, top_idx = feat.topk(k_up, dim=1)
-                    up_indices = top_idx
-                    up_vals = top_vals
+                    # Get initial contributions for all features
+                    approx_acts = self.get_initial_contributions(initial_acts, down_name)
+                    
+                    # Add contributions from each upstream module
+                    for up_name in (self.connections[down_name].keys() if isinstance(self.connections, dict) else [n for n in self.submodule_names if n != down_name]):
+                        if up_name not in inputs:
+                            continue
+                        
+                        # Get contributions from this upstream module using full activations
+                        contributions = self.get_pruned_contributions(
+                            up_name, down_name, features[up_name]
+                        )
+                        
+                        approx_acts = approx_acts + contributions
+                    
+                    # Apply layernorm scaling
+                    approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)
+                    
+                    # Add encoder bias and subtract decoder bias contribution
+                    b_enc = self.aes[down_name].encoder.bias
+                    approx_acts = approx_acts + b_enc
+                    
+                    W_enc = self.aes[down_name].encoder.weight
+                    approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec
+                    
+                    # Get top k features
+                    top_vals, top_idx = approx_acts.topk(k_down, dim=1)  # both [batch, k_down]
+                    
+                    if return_topk:
+                        topk_info[down_name] = {
+                            'indices': top_idx,
+                            'values': top_vals
+                        }
+                    
+                    # Create sparse feature tensor for reconstruction
+                    feat = t.zeros(
+                        (batch_size, config.dict_size),
+                        device=device,
+                        dtype=self.dtype
+                    )
+                    feat.scatter_(
+                        dim=1,
+                        index=top_idx,
+                        src=top_vals
+                    )
+                    
+                    # Get reconstruction
+                    reconstruction = self.aes[down_name].decode(feat)
+                    reconstructions[down_name] = reconstruction
                 else:
-                    # Use previously computed pruned values
-                    up_indices = pruned_upstream_info[up_name]['indices']
-                    up_vals = pruned_upstream_info[up_name]['values']
-                
-                # Get contributions from this upstream module
-                contributions = self.get_pruned_contributions_test(
-                    up_name, down_name, up_indices, up_vals
-                )
-                
-                approx_acts = approx_acts + contributions
-            
-            # Apply layernorm scaling
-            approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)
-            
-            # Add encoder bias and subtract decoder bias contribution
-            b_enc = self.aes[down_name].encoder.bias
-            approx_acts = approx_acts + b_enc
-            
-            W_enc = self.aes[down_name].encoder.weight
-            approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec
-            
-            # Get top k features
-            top_vals, top_idx = approx_acts.topk(k_down, dim=1)  # both [batch, k_down]
-            
-            if return_topk:
-                topk_info[down_name] = {
-                    'indices': top_idx,
-                    'values': top_vals
-                }
-                pruned_upstream_info[down_name] = topk_info[down_name]
-            
-            # Create sparse feature tensor for reconstruction
-            features = t.zeros(
-                (batch_size, config.dict_size),
-                device=device,
-                dtype=self.dtype
-            )
-            features.scatter_(
-                dim=1,
-                index=top_idx,
-                src=top_vals
-            )
-            
-            # Get reconstruction
-            reconstruction = self.aes[down_name].decode(features)
-            reconstructions[down_name] = reconstruction
+                    # Use vanilla reconstruction for non-connected MLPs
+                    reconstructions[down_name] = results[down_name]
         
         if return_topk:
             return reconstructions, topk_info
         return reconstructions
-
+    
     # def get_ce_loss(
     #     self,
     #     initial_acts: t.Tensor,  # [batch, d_in] TODO: need to keep sequence position
@@ -650,6 +301,7 @@ class SCAESuite(nn.Module):
     def from_pretrained(
         cls,
         repo_id: str,
+        connections = None,
         device: Optional[str] = None,
         dtype: t.dtype = t.float32
     ) -> "SCAESuite":
@@ -693,12 +345,6 @@ class SCAESuite(nn.Module):
             for name, cfg in config["submodule_configs"].items()
         }
         
-        # Try to load connections if they exist
-        try:
-            connections_path = hf_hub_download(repo_id=repo_id, filename="connections.pt")
-            connections = t.load(connections_path, map_location='cpu')
-        except Exception:
-            connections = None
         
         # Initialize suite
         suite = cls(
@@ -736,14 +382,9 @@ class SCAESuite(nn.Module):
 @dataclass
 class TrainerConfig:
     steps: int
-    n_threshold: int = 100
-    n_random: int = 100
-    log_steps: int = 100
-    test_batch_size: int = 8
     base_lr: float = 2e-4
     lr_decay_start_proportion: float = 0.8
-    use_vanilla_training: bool = False
-    feature_fvu_coeff: float = 1.0  # Coefficient for feature FVU loss
+    log_steps: int = 100
 
 class TrainerSCAESuite:
     def __init__(
@@ -795,280 +436,100 @@ class TrainerSCAESuite:
         # Initialize metrics
         self.effective_l0s = {name: -1 for name in suite.submodule_names}
         self.dead_features = {name: -1 for name in suite.submodule_names}
-
-    def compute_test_metrics(
+    
+    def update(
         self,
+        step: int,
         initial_acts: t.Tensor,
         input_acts: Dict[str, t.Tensor],
         target_acts: Dict[str, t.Tensor],
         layernorm_scales: Dict[str, t.Tensor],
-    ) -> Dict[str, float]:
-        """Compute test-time metrics using both train and test forward passes."""
-        metrics = {}
+        buffer: Optional[Any] = None,
+        log_metrics: bool = False,
+    ) -> float:
+        """Single training step using pruned forward pass with FVU loss."""
+        # Move inputs to device
+        initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
+        input_acts = {
+            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+            for k, v in input_acts.items()
+        }
+        target_acts = {
+            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+            for k, v in target_acts.items()
+        }
         
-        with t.no_grad():
-            # Run test forward pass
-            test_reconstructions, test_topk_info = self.suite.pruned_forward_test(
-                initial_acts=initial_acts,
-                inputs=input_acts,
-                layernorm_scales=layernorm_scales,
-                return_topk=True
-            )
-            
-            # Run train forward pass for comparison
-            train_results = self.suite.pruned_forward_train(
-                initial_acts=initial_acts,
-                inputs=input_acts,
-                layernorm_scales=layernorm_scales,
-                n_threshold=self.config.n_threshold,
-                n_random=self.config.n_random
-            )
-            
-            # Compute metrics for each module
-            for name, ae in self.suite.aes.items():
-                if name not in input_acts or 'attn' in name:
-                    continue
-                
-                tgt = target_acts[name]
-                
-                # Compute test FVU using test reconstruction
-                test_recon = test_reconstructions[name]
-                total_variance = t.var(tgt, dim=0).sum()
-                test_residual_variance = t.var(tgt - test_recon, dim=0).sum()
-                metrics[f'pruned FVU test/{name}'] = (test_residual_variance / total_variance).item()
-                
-                # Compare train vs test activations
-                test_acts = test_topk_info[name]['values']  # [batch, k]
-                train_acts = train_results[name]['topk']  # [batch, k]
-                
-                # Ensure we're comparing the same features
-                test_indices = test_topk_info[name]['indices']
-                train_indices = train_results[name]['all_indices'][:, :ae.k]
-                
-                # Sort both sets of activations by feature index for fair comparison
-                test_sort_idx = test_indices.argsort(dim=1)
-                train_sort_idx = train_indices.argsort(dim=1)
-                
-                test_acts = t.gather(test_acts, 1, test_sort_idx)
-                train_acts = t.gather(train_acts, 1, train_sort_idx)
-                
-                # Compute activation FVU
-                act_fvu = (train_acts - test_acts).pow(2).sum() / test_acts.pow(2).sum()
-                metrics[f'train_vs_test_act_FVU/{name}'] = act_fvu.item()
+        # Initialize geometric median at step 0 only for non-pretrained SAEs
+        if step == 0 and not self.suite.is_pretrained:
+            for name, x in input_acts.items():
+                median = geometric_median(x)
+                self.suite.aes[name].b_dec.data = median
         
-        return metrics
-    
-    def update(
-            self,
-            step: int,
-            initial_acts: t.Tensor,
-            input_acts: Dict[str, t.Tensor],
-            target_acts: Dict[str, t.Tensor],
-            layernorm_scales: Dict[str, t.Tensor],
-            buffer: Optional[Any] = None,
-            log_metrics: bool = False,
-        ) -> float:
-            """
-            Single training step using either vanilla or pruned forward pass with FVU loss.
-            """
-            # Move inputs to device
-            initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
-            input_acts = {
-                k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-                for k, v in input_acts.items()
+        # Ensure decoder norms are unit
+        for ae in self.suite.aes.values():
+            ae.set_decoder_norm_to_unit_norm()
+        
+        self.optimizer.zero_grad()
+        total_loss = 0
+        
+        # Get forward pass results
+        reconstructions = self.suite.pruned_forward(
+            initial_acts=initial_acts,
+            inputs=input_acts,
+            layernorm_scales=layernorm_scales,
+            return_topk=False
+        )
+        
+        # Compute losses for each module
+        losses = {'reconstruction_FVU': {}}
+        for name, ae in self.suite.aes.items():
+            if name not in input_acts:
+                continue
+            
+            tgt = target_acts[name]
+            x_hat = reconstructions[name]
+            
+            # Compute FVU loss
+            total_variance = t.var(tgt, dim=0).sum()
+            residual_variance = t.var(tgt - x_hat, dim=0).sum()
+            fvu_loss = residual_variance / total_variance
+            total_loss = total_loss + fvu_loss
+            losses['reconstruction_FVU'][name] = fvu_loss.item()
+        
+        # Backward pass and optimization
+        total_loss.backward()
+        
+        # Clip gradients and remove parallel components
+        for ae in self.suite.aes.values():
+            if ae.decoder.weight.grad is not None:
+                t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
+                ae.remove_gradient_parallel_to_decoder_directions()
+        
+        self.optimizer.step()
+        self.scheduler.step()
+        
+        # Log metrics if requested
+        if log_metrics and self.wandb_name is not None:
+            import wandb
+            
+            # Log learning rates
+            lrs = {
+                f"lr/{name}": param_group['lr']
+                for name, param_group in zip(self.suite.aes.keys(), self.optimizer.param_groups)
             }
-            target_acts = {
-                k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-                for k, v in target_acts.items()
-            }
             
-            # Initialize geometric median at step 0 only for non-pretrained SAEs
-            if step == 0 and not self.suite.is_pretrained:
-                for name, x in input_acts.items():
-                    median = geometric_median(x)
-                    self.suite.aes[name].b_dec.data = median
+            # Flatten nested loss dict
+            log_dict = {}
+            for loss_type, loss_dict in losses.items():
+                for name, value in loss_dict.items():
+                    log_dict[f"{loss_type}/{name}"] = value
             
-            # Ensure decoder norms are unit
-            for ae in self.suite.aes.values():
-                ae.set_decoder_norm_to_unit_norm()
+            log_dict.update(lrs)
+            log_dict['loss/total'] = total_loss.item()
             
-            self.optimizer.zero_grad()
-            total_loss = 0
-            
-            # Track losses for logging
-            losses = {
-                'reconstruction_FVU': {},  # FVU between reconstructions and targets
-                'feature_FVU': {},        # FVU between vanilla and pruned feature activations
-                'feature_FVU_topk': {},   # Feature FVU for top-k features only
-                'feature_FVU_threshold': {},  # Feature FVU for threshold features only
-                'feature_FVU_random': {},  # Feature FVU for random features only
-            }
-            
-            if self.config.use_vanilla_training:
-                # Get vanilla forward pass results for all modules
-                reconstructions, features = self.suite.vanilla_forward(inputs=input_acts, return_features=True)
-                
-                # Compute losses for each module
-                for name, ae in self.suite.aes.items():
-                    if name not in input_acts:
-                        continue
-                    
-                    tgt = target_acts[name]
-                    x_hat = reconstructions[name]
-                    
-                    # Compute FVU loss
-                    total_variance = t.var(tgt, dim=0).sum()
-                    residual_variance = t.var(tgt - x_hat, dim=0).sum()
-                    fvu_loss = residual_variance / total_variance
-                    total_loss = total_loss + fvu_loss
-                    losses['reconstruction_FVU'][name] = fvu_loss.item()
-                    
-            else:
-                # Get vanilla forward pass first to get original feature activations and pre-activations
-                vanilla_results, vanilla_features, topk_info, vanilla_preacts = self.suite.vanilla_forward(
-                    inputs=input_acts, 
-                    return_features=True, 
-                    return_topk=True,
-                    return_preact=True,
-                    n_threshold=self.config.n_threshold
-                )
-                
-                # Get pruned forward pass results
-                pruned_results, _ = self.suite.pruned_forward_train(
-                    initial_acts=initial_acts,
-                    inputs=input_acts,
-                    layernorm_scales=layernorm_scales,
-                    n_threshold=self.config.n_threshold,
-                    n_random=self.config.n_random
-                )
-                
-                # Compute losses for each module
-                for name, ae in self.suite.aes.items():
-                    if name not in input_acts:
-                        continue
-                    
-                    tgt = target_acts[name]
-                    
-                    if 'mlp' in name:
-                        module_results = pruned_results[name]
-                        x_hat = module_results['pruned_reconstruction']
-                        down_idxs_all = module_results['all_indices']
-                        k_down = self.suite.configs[name].k
-                        
-                        # Compute reconstruction FVU loss
-                        total_variance = t.var(tgt, dim=0).sum()
-                        residual_variance = t.var(tgt - x_hat, dim=0).sum()
-                        fvu_loss = residual_variance / total_variance
-                        total_loss = total_loss + fvu_loss
-                        losses['reconstruction_FVU'][name] = fvu_loss.item()
-                        
-                        # Get vanilla pre-activations for the same indices
-                        vanilla_acts = vanilla_preacts[name].gather(1, down_idxs_all)
-                        pruned_acts = t.cat([
-                            module_results['topk'],
-                            module_results['threshold'],
-                            module_results['random']
-                        ], dim=1)
-                        
-                        # Compute feature FVU loss using pre-activations (only for threshold and random features)
-                        non_topk_vanilla = vanilla_acts[:, k_down:]  # Skip the top k features
-                        non_topk_pruned = t.cat([
-                            module_results['threshold'],
-                            module_results['random']
-                        ], dim=1)
-                        
-                        feat_total_variance = t.var(non_topk_vanilla, dim=0).sum()
-                        feat_residual_variance = t.var(non_topk_vanilla - non_topk_pruned, dim=0).sum()
-                        feature_fvu = feat_residual_variance / feat_total_variance
-                        total_loss = total_loss + self.config.feature_fvu_coeff * feature_fvu
-                        losses['feature_FVU'][name] = feature_fvu.item()
-                        
-                        # Still log separate FVUs for different feature groups (including top-k for monitoring)
-                        # Top-k features (for monitoring only, not used in loss)
-                        topk_vanilla = vanilla_acts[:, :k_down]
-                        topk_pruned = module_results['topk']
-                        topk_var = t.var(topk_vanilla, dim=0).sum()
-                        topk_resid = t.var(topk_vanilla - topk_pruned, dim=0).sum()
-                        losses['feature_FVU_topk'][name] = (topk_resid / topk_var).item()
-                        
-                        # Threshold features
-                        thresh_vanilla = vanilla_acts[:, k_down:k_down + self.config.n_threshold]
-                        thresh_pruned = module_results['threshold']
-                        thresh_var = t.var(thresh_vanilla, dim=0).sum()
-                        thresh_resid = t.var(thresh_vanilla - thresh_pruned, dim=0).sum()
-                        losses['feature_FVU_threshold'][name] = (thresh_resid / thresh_var).item()
-                        
-                        # Random features
-                        random_vanilla = vanilla_acts[:, k_down + self.config.n_threshold:]
-                        random_pruned = module_results['random']
-                        random_var = t.var(random_vanilla, dim=0).sum()
-                        random_resid = t.var(random_vanilla - random_pruned, dim=0).sum()
-                        losses['feature_FVU_random'][name] = (random_resid / random_var).item()
-                        
-                    elif 'attn' in name:
-                        x_hat = vanilla_results[name]  # Use reconstruction from vanilla forward pass
-                        
-                        # Compute reconstruction FVU loss only for attention
-                        total_variance = t.var(tgt, dim=0).sum()
-                        residual_variance = t.var(tgt - x_hat, dim=0).sum()
-                        fvu_loss = residual_variance / total_variance
-                        total_loss = total_loss + fvu_loss
-                        losses['reconstruction_FVU'][name] = fvu_loss.item()
-                    
-                    else:
-                        continue
-            
-            # Backward pass and optimization
-            total_loss.backward()
-            
-            # Clip gradients and remove parallel components
-            for ae in self.suite.aes.values():
-                if ae.decoder.weight.grad is not None:
-                    t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
-                    ae.remove_gradient_parallel_to_decoder_directions()
-            
-            self.optimizer.step()
-            self.scheduler.step()
-            
-            # Log metrics if requested
-            if log_metrics and self.wandb_name is not None:
-                import wandb
-                
-                # Log learning rates
-                lrs = {
-                    f"lr/{name}": param_group['lr']
-                    for name, param_group in zip(self.suite.aes.keys(), self.optimizer.param_groups)
-                }
-                
-                # Flatten nested loss dict
-                log_dict = {}
-                for loss_type, loss_dict in losses.items():
-                    for name, value in loss_dict.items():
-                        log_dict[f"{loss_type}/{name}"] = value
-                
-                log_dict.update(lrs)
-                log_dict['loss/total'] = total_loss.item()
-                
-                # Add test metrics every log_steps
-                if step % self.config.log_steps == 0 and buffer is not None:
-                    # Get a test batch from buffer
-                    orig_batch_size = buffer.out_batch_size
-                    buffer.out_batch_size = self.config.test_batch_size
-                    test_batch = buffer.get_batch()
-                    buffer.out_batch_size = orig_batch_size
-                    
-                    # Compute and add test metrics
-                    test_metrics = self.compute_test_metrics(
-                        initial_acts=test_batch['initial_acts'],
-                        input_acts=test_batch['input_acts'],
-                        target_acts=test_batch['target_acts'],
-                        layernorm_scales=test_batch['layernorm_scales']
-                    )
-                    log_dict.update(test_metrics)
-                
-                wandb.log(log_dict, step=step)
-            
-            return total_loss.item()
+            wandb.log(log_dict, step=step)
+        
+        return total_loss.item()
 
 def geometric_median(x: t.Tensor, num_iterations: int = 20) -> t.Tensor:
     """Compute geometric median of points."""

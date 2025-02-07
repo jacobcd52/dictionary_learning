@@ -90,6 +90,7 @@ def train_scae_suite(
         # Load pretrained
         suite = SCAESuite.from_pretrained(
             repo_id=repo_id_in,
+            connections=connections,
             device=device,
             dtype=dtype,
         )
@@ -98,7 +99,6 @@ def train_scae_suite(
         config_dict = {
             "is_pretrained": True
         }
-    suite.connections = connections
     
     # Initialize trainer
     trainer = TrainerSCAESuite(

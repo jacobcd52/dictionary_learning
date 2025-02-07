@@ -16,11 +16,11 @@ t.set_grad_enabled(True)
 
 
 #%%
-DTYPE = t.bfloat16
+DTYPE = t.float32
 MODEL_NAME = "roneneldan/TinyStories-33M"
 
-out_batch_size = 256
-num_tokens = int(1e7)
+out_batch_size = 2048 * 2
+num_tokens = int(100e6)
 remove_bos = True # don't train on BOS activations: they lead to weird loss spikes, especially with bf16.
 
 
@@ -44,11 +44,8 @@ buffer = AllActivationBuffer(
 #%%
 trainer_cfg = TrainerConfig(
     steps=num_tokens // out_batch_size,
-    n_threshold=0,
-    n_random=0,
-    base_lr=1e-4, 
-    feature_fvu_coeff=0.01
-)
+    base_lr=2e-4, 
+    )
 
 #%%
 # Load connections dict
@@ -61,16 +58,6 @@ with open("connections_TinyStories-33M_100.pkl", "rb") as f:
 #     connections,
 #     num_features=num_features,
 # )
-
-#%%
-# Special connections for mlp_1
-
-# for k in connections['mlp_1'].keys():
-#     connections['mlp_1'][k] = t.arange(0, num_features).unsqueeze(0).repeat(num_features, 1).cuda()
-
-# for k in connections['mlp_0'].keys():
-#     connections['mlp_0'][k] = t.arange(0, num_features).unsqueeze(0).repeat(num_features, 1).cuda()
-
 
 
 #%%
@@ -86,7 +73,7 @@ trainer = train_scae_suite(
     use_wandb = True,
     repo_id_in='jacobcd52/TinyStories-33M_suite',
     repo_id_out = "jacobcd52/TinyStories-33M_scae",
-    wandb_project_name="tinystories33m_scae_2",
+    wandb_project_name="tinystories33m_scae_3",
 )
 
 #%%
