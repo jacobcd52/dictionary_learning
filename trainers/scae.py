@@ -98,7 +98,17 @@ class SCAESuite(nn.Module):
             inputs: Dict[str, t.Tensor],
             return_features: bool = False,
         ) -> Union[Dict[str, t.Tensor], Tuple[Dict[str, t.Tensor], Dict[str, t.Tensor]]]:
-            """Forward pass that outputs feature activations."""
+            """Forward pass that outputs feature activations.
+            
+            Args:
+                inputs: Dictionary mapping module names to tensors of shape 
+                       [batch, d] or [batch, seq, d]
+                return_features: Whether to return feature activations
+                
+            Returns:
+                Dictionary of reconstructions and optionally features, 
+                matching input batch dimensions
+            """
             results = {}
             features = {}
             
@@ -106,7 +116,7 @@ class SCAESuite(nn.Module):
                 if name not in inputs:
                     continue
                     
-                feat = ae.encode(inputs[name])  # [batch, num_features]
+                feat = ae.encode(inputs[name])
                 recon = ae.decode(feat)
                 
                 results[name] = recon
@@ -117,72 +127,73 @@ class SCAESuite(nn.Module):
 
     def get_initial_contributions(
             self,
-            initial_act: t.Tensor, # [batch, d_in]
-            down_name: str, # e.g. 'mlp_5'
+            initial_act: t.Tensor,  # [batch, d_in] or [batch, seq, d_in]
+            down_name: str,  # e.g. 'mlp_5'
     ):
-        """Compute initial contributions for all downstream features."""
+        """Compute initial contributions, supporting sequence dimension."""
+        orig_shape = initial_act.shape
+        if len(orig_shape) == 3:
+            initial_act = initial_act.reshape(-1, orig_shape[-1])
+            
         W_enc_FD = self.aes[down_name].encoder.weight
-        contributions_BF = initial_act @ W_enc_FD.T  # [batch, num_down_features]
+        contributions_BF = initial_act @ W_enc_FD.T  # [batch(*seq), num_down_features]
+        
+        if len(orig_shape) == 3:
+            contributions_BF = contributions_BF.reshape(orig_shape[0], orig_shape[1], -1)
+            
         return contributions_BF
 
     def get_pruned_contributions(
         self,
         up_name: str,
         down_name: str,
-        upstream_acts: t.Tensor,  # [batch, num_up_features]
-    ) -> t.Tensor:  # [batch, num_down_features]
-        """Compute contributions for all downstream features using efficient matrix operations."""
+        upstream_acts: t.Tensor,  # [batch, num_up_features] or [batch, seq, num_up_features]
+    ) -> t.Tensor:
+        """Compute contributions, supporting sequence dimension."""
+        orig_shape = upstream_acts.shape
+        if len(orig_shape) == 3:
+            upstream_acts = upstream_acts.reshape(-1, orig_shape[-1])
+            
         batch_size = upstream_acts.shape[0]
         num_down_features = self.configs[down_name].dict_size
         device = upstream_acts.device
         
         if self.connections == "all":
-            # For "all" mode, every downstream feature is connected to every upstream feature
-            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
-            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
-            
-            # Compute full virtual weight matrix
-            virtual_weights = down_encoder @ up_decoder  # [num_down, num_up]
-            
-            # Compute contributions
-            contributions = upstream_acts @ virtual_weights.T  # [batch, num_down]
+            up_decoder = self.aes[up_name].decoder.weight
+            down_encoder = self.aes[down_name].encoder.weight
+            virtual_weights = down_encoder @ up_decoder
+            contributions = upstream_acts @ virtual_weights.T
             
         else:
-            # Get connection tensor for this pair of modules
-            connections = self.connections[down_name][up_name]  # [num_down, C]
-            
-            # Get weights for computing virtual weights
-            up_decoder = self.aes[up_name].decoder.weight  # [d_in, d_up]
-            down_encoder = self.aes[down_name].encoder.weight  # [d_down, d_in]
-            
-            # Compute full virtual weight matrix
-            virtual_weights = down_encoder @ up_decoder  # [num_down, num_up]
-            
-            # Get precomputed connection mask
+            connections = self.connections[down_name][up_name]
+            up_decoder = self.aes[up_name].decoder.weight
+            down_encoder = self.aes[down_name].encoder.weight
+            virtual_weights = down_encoder @ up_decoder
             connection_mask = self.connection_masks[down_name][up_name]
-            
-            # Apply connection mask to virtual weights
-            masked_weights = virtual_weights * connection_mask  # [num_down, num_up]
-            
-            # Compute contributions
-            contributions = upstream_acts @ masked_weights.T  # [batch, num_down]
+            masked_weights = virtual_weights * connection_mask
+            contributions = upstream_acts @ masked_weights.T
         
-        # Add bias terms for all features
-        b_dec_contrib = down_encoder @ self.aes[up_name].b_dec  # [num_down]
-        contributions = contributions + b_dec_contrib.unsqueeze(0)  # [batch, num_down]
+        b_dec_contrib = down_encoder @ self.aes[up_name].b_dec
+        contributions = contributions + b_dec_contrib.unsqueeze(0)
         
+        if len(orig_shape) == 3:
+            contributions = contributions.reshape(orig_shape[0], orig_shape[1], -1)
+            
         return contributions
 
     def pruned_forward(
         self,
-        initial_acts: t.Tensor,
-        inputs: Dict[str, t.Tensor],
-        layernorm_scales: Dict[str, t.Tensor],
+        initial_acts: t.Tensor,  # [batch, d_in] or [batch, seq, d_in]
+        inputs: Dict[str, t.Tensor],  # tensors of shape [batch, d] or [batch, seq, d]
+        layernorm_scales: Dict[str, t.Tensor],  # tensors of shape [batch] or [batch, seq]
         return_topk: bool = False
     ) -> Union[Dict[str, t.Tensor], Tuple[Dict[str, t.Tensor], Dict[str, Dict[str, t.Tensor]]]]:
-        """Forward pass that computes activations for all features, then applies TopK."""
+        """Forward pass supporting sequence dimension in inputs."""
         reconstructions = {}
         topk_info = {}
+        
+        # Check if we have sequence dimension
+        has_seq = len(initial_acts.shape) == 3
         
         # Get vanilla forward features for all modules
         results, features = self.vanilla_forward(inputs, return_features=True)
@@ -192,53 +203,85 @@ class SCAESuite(nn.Module):
                 continue
                 
             if 'attn' in down_name:
-                # For attention modules, use vanilla forward pass
                 feat = features[down_name]
                 recon = self.aes[down_name].decode(feat)
                 reconstructions[down_name] = recon
                 
                 if return_topk:
                     k = self.configs[down_name].k
-                    top_vals, top_idx = feat.topk(k, dim=1)
+                    # Handle topk for sequence dimension
+                    if has_seq:
+                        feat_flat = feat.reshape(-1, feat.shape[-1])
+                        top_vals, top_idx = feat_flat.topk(k, dim=1)
+                        top_vals = top_vals.reshape(feat.shape[0], feat.shape[1], -1)
+                        top_idx = top_idx.reshape(feat.shape[0], feat.shape[1], -1)
+                    else:
+                        top_vals, top_idx = feat.topk(k, dim=1)
                     topk_info[down_name] = {
                         'indices': top_idx,
                         'values': top_vals
                     }
             else:
-                # Handle MLP modules
                 if self.connections == 'all' or (isinstance(self.connections, dict) and down_name in self.connections):
-                    # Compute pruned reconstruction for connected MLPs
                     batch_size = inputs[down_name].shape[0]
                     device = inputs[down_name].device
                     k_down = self.configs[down_name].k
                     
-                    # Get initial contributions for all features
                     approx_acts = self.get_initial_contributions(initial_acts, down_name)
                     
-                    # Add contributions from each upstream module
                     for up_name in (self.connections[down_name].keys() if isinstance(self.connections, dict) else [n for n in self.submodule_names if n != down_name]):
                         if up_name not in inputs:
                             continue
                         
-                        # Get contributions from this upstream module using full activations
                         contributions = self.get_pruned_contributions(
                             up_name, down_name, features[up_name]
                         )
                         
                         approx_acts = approx_acts + contributions
                     
-                    # Apply layernorm scaling
-                    approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(1)
+                    # Handle layernorm scaling with sequence dimension
+                    if has_seq:
+                        approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(-1).unsqueeze(-1)
+                    else:
+                        approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(-1)
                     
-                    # Add encoder bias and subtract decoder bias contribution
                     b_enc = self.aes[down_name].encoder.bias
                     approx_acts = approx_acts + b_enc
                     
                     W_enc = self.aes[down_name].encoder.weight
                     approx_acts = approx_acts - W_enc @ self.aes[down_name].b_dec
                     
-                    # Get top k features
-                    top_vals, top_idx = approx_acts.topk(k_down, dim=1)  # both [batch, k_down]
+                    # Handle topk with sequence dimension
+                    if has_seq:
+                        approx_acts_flat = approx_acts.reshape(-1, approx_acts.shape[-1])
+                        top_vals, top_idx = approx_acts_flat.topk(k_down, dim=1)
+                        top_vals = top_vals.reshape(approx_acts.shape[0], approx_acts.shape[1], -1)
+                        top_idx = top_idx.reshape(approx_acts.shape[0], approx_acts.shape[1], -1)
+                        
+                        feat = t.zeros(
+                            (batch_size, approx_acts.shape[1], config.dict_size),
+                            device=device,
+                            dtype=self.dtype
+                        )
+                        # Need to handle scatter for sequence dimension
+                        feat_flat = feat.reshape(-1, config.dict_size)
+                        feat_flat.scatter_(
+                            dim=1,
+                            index=top_idx.reshape(-1, k_down),
+                            src=top_vals.reshape(-1, k_down)
+                        )
+                    else:
+                        top_vals, top_idx = approx_acts.topk(k_down, dim=1)
+                        feat = t.zeros(
+                            (batch_size, config.dict_size),
+                            device=device,
+                            dtype=self.dtype
+                        )
+                        feat.scatter_(
+                            dim=1,
+                            index=top_idx,
+                            src=top_vals
+                        )
                     
                     if return_topk:
                         topk_info[down_name] = {
@@ -246,56 +289,55 @@ class SCAESuite(nn.Module):
                             'values': top_vals
                         }
                     
-                    # Create sparse feature tensor for reconstruction
-                    feat = t.zeros(
-                        (batch_size, config.dict_size),
-                        device=device,
-                        dtype=self.dtype
-                    )
-                    feat.scatter_(
-                        dim=1,
-                        index=top_idx,
-                        src=top_vals
-                    )
-                    
-                    # Get reconstruction
                     reconstruction = self.aes[down_name].decode(feat)
                     reconstructions[down_name] = reconstruction
                 else:
-                    # Use vanilla reconstruction for non-connected MLPs
                     reconstructions[down_name] = results[down_name]
         
         if return_topk:
             return reconstructions, topk_info
         return reconstructions
     
-    # def get_ce_loss(
-    #     self,
-    #     initial_acts: t.Tensor,  # [batch, d_in] TODO: need to keep sequence position
-    #     pruned_results: Dict[str, Dict[str, t.Tensor]],  # output from pruned_forward_train
-    # ) -> t.Tensor:  # [batch, d_in]
-    #     """
-    #     Compute residual final activation from initial acts and all reconstructions.
+    def get_ce_loss(
+        self,
+        tokens,
+        initial_acts: t.Tensor,  # [batch, seq, d_in]
+        reconstructions: Dict[str, t.Tensor],  # output from forward pass
+        ln_final,
+        unembed
+    ) -> t.Tensor:  # [batch, seq, d_in]
+        """
+        Compute residual final activation from initial acts and all reconstructions.
         
-    #     Args:
-    #         initial_acts: Initial activations
-    #         pruned_results: Dictionary of results from pruned_forward_train
-    #             For MLP modules: contains pruned reconstructions
-    #             For attention modules: contains vanilla reconstructions
+        Args:
+            initial_acts: Initial activations of shape [batch, seq, d_in]
+            reconstructions: Dictionary mapping module names to reconstruction tensors,
+                           each of shape [batch, seq, d_in]
                 
-    #     Returns:
-    #         resid_final_act: Sum of initial activations and all reconstructions
-    #     """
+        Returns:
+            resid_final: Sum of initial activations and all reconstructions
+        """
+        # Check shapes
+        assert len(initial_acts.shape) == 3, f"initial_acts should have shape [batch, seq, d_in], got {initial_acts.shape}"
+        batch_size, seq_len, d_in = initial_acts.shape
         
-    #     # Start with initial acts
-    #     resid_final_act = initial_acts
+        # Start with initial acts
+        resid_final = initial_acts
         
-    #     # Add all reconstructions
-    #     for name in self.submodule_names:
-    #         if name in pruned_results:
-    #             resid_final_act = resid_final_act + pruned_results[name]['pruned_reconstruction']
+        # Add all reconstructions
+        for name, recon in reconstructions.items():
+            assert len(recon.shape) == 3, f"reconstruction for {name} should have shape [batch, seq, d_in], got {recon.shape}"
+            assert recon.shape == initial_acts.shape, f"reconstruction for {name} has shape {recon.shape}, expected {initial_acts.shape}"
+            resid_final = resid_final + recon
+            
+        logits = unembed(ln_final(resid_final))
+
+        loss = t.nn.functional.cross_entropy(logits.permute(0, 2, 1), tokens, reduction='mean')
+
+        return loss
+
         
-    #     pass # TODO finish this
+        
 
     @classmethod
     def from_pretrained(
@@ -483,6 +525,7 @@ class TrainerSCAESuite:
         # Compute losses for each module
         losses = {'reconstruction_FVU': {}}
         for name, ae in self.suite.aes.items():
+            layer = int(name.split('_')[1])
             if name not in input_acts:
                 continue
             
@@ -493,7 +536,7 @@ class TrainerSCAESuite:
             total_variance = t.var(tgt, dim=0).sum()
             residual_variance = t.var(tgt - x_hat, dim=0).sum()
             fvu_loss = residual_variance / total_variance
-            total_loss = total_loss + fvu_loss
+            total_loss = total_loss + fvu_loss * 2**(9-3*layer)
             losses['reconstruction_FVU'][name] = fvu_loss.item()
         
         # Backward pass and optimization

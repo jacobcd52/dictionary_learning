@@ -61,10 +61,12 @@ class AllActivationBuffer:
         """
         self.data = data
         self.model = model
-        initial_submodule, layernorm_submodules, submodules, d_submodule = get_modules(model, model_name)
+        initial_submodule, layernorm_submodules, submodules, d_submodule, ln_final, unembed = get_modules(model, model_name)
         self.initial_submodule = initial_submodule
         self.layernorm_submodules = layernorm_submodules
         self.submodules = submodules
+        self.ln_final = ln_final
+        self.unembed = unembed
     
         self.n_ctxs = n_ctxs
         self.ctx_len = ctx_len
@@ -305,6 +307,78 @@ class AllActivationBuffer:
                 if all(len(acts) == 0 for acts in self.activations.values()):
                     raise StopIteration("No data available to process")
                 break
+
+    def get_seq_activations(self, batch_size: int = 32) -> Tuple[ActivationBatch, t.Tensor]:
+            """Return a batch of activations preserving batch and sequence dimensions, along with input tokens.
+            
+            Args:
+                batch_size (int): Number of sequences in each batch
+                
+            Returns:
+                Tuple[ActivationBatch, t.Tensor]: 
+                    - ActivationBatch with activations of shape [batch_size, seq_len, hidden_dim]
+                    - Input tokens of shape [batch_size, seq_len]
+            """
+            with t.no_grad():
+                # Get fresh tokens and run them through the model
+                tokens = self.token_batch(batch_size)
+                
+                with self.model.trace(tokens) as trace:
+                    # Save all required activation states
+                    initial_input = self.initial_submodule.input.save()
+                    saved_inputs = {
+                        name: submodule.input.save()
+                        for name, (submodule, _) in self.submodules.items()
+                    }
+                    saved_outputs = {
+                        name: submodule.output.save()
+                        for name, (submodule, _) in self.submodules.items()
+                    }
+                    ln_inputs = {
+                        name: submodule.input.save()
+                        for name, submodule in self.layernorm_submodules.items()
+                    }
+                    output = trace.output
+
+                # Process initial activations
+                initial_state = self._process_states(initial_input).to(dtype=self.dtype)[:, self.start_pos:]
+                
+                # Process layernorm inputs and compute scales
+                ln_scales = {}
+                for name, ln_input in ln_inputs.items():
+                    ln_state = self._process_states(ln_input).to(dtype=self.dtype)[:, self.start_pos:]
+                    ln_scales[name] = self._compute_ln_scale(
+                        ln_state, 
+                        self.layernorm_submodules[name].eps
+                    )
+                
+                # Process submodule activations
+                input_acts = {}
+                target_acts = {}
+                for name, (submodule, io) in self.submodules.items():
+                    raw_in = self._process_states(saved_inputs[name]).to(dtype=self.dtype)[:, self.start_pos:]
+                    raw_out = self._process_states(saved_outputs[name]).to(dtype=self.dtype)[:, self.start_pos:]
+                    
+                    # Set inputs/outputs based on IO type
+                    if io == "in":
+                        input_acts[name] = raw_in
+                        target_acts[name] = raw_in
+                    elif io == "out":
+                        input_acts[name] = raw_out
+                        target_acts[name] = raw_out
+                    else:  # io == "both"
+                        input_acts[name] = raw_in
+                        target_acts[name] = raw_out
+
+                return (
+                    ActivationBatch(
+                        initial=initial_state,
+                        src=input_acts,
+                        tgt=target_acts,
+                        layernorm_scale=ln_scales
+                    ),
+                    tokens[:, self.start_pos:]
+                )
             
     def __iter__(self):
         return self

@@ -120,6 +120,8 @@ def get_modules(model, model_name : str):
 
         d_submodule = model.config.n_embd
 
+        # TODO: need ln_final and unebed
+
     elif model_name == "roneneldan/TinyStories-33M":
         initial_submodule = model.transformer.h[0]
         submodules = {}
@@ -130,6 +132,9 @@ def get_modules(model, model_name : str):
 
             layernorm_submodules[f"mlp_{layer}"] = model.transformer.h[layer].ln_2
 
+        ln_final = model.transformer.ln_f
+        unembed = model.lm_head
+
         d_submodule = model.config.hidden_size
 
         # match gpt2 for convenience
@@ -139,4 +144,4 @@ def get_modules(model, model_name : str):
     else:
         raise ValueError(f"Model {model_name} not supported")
 
-    return initial_submodule, layernorm_submodules, submodules, d_submodule
+    return initial_submodule, layernorm_submodules, submodules, d_submodule, ln_final, unembed
