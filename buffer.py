@@ -39,6 +39,7 @@ class AllActivationBuffer:
             ctx_len: int = 128,
             refresh_batch_size: int = 512,
             out_batch_size: int = 8192,
+            ce_batch_size: int = 4,
             device: str = "cpu",
             dtype: t.dtype = t.float32,
             remove_bos=False
@@ -56,6 +57,7 @@ class AllActivationBuffer:
             ctx_len: Maximum context length
             refresh_batch_size: Batch size for refreshing buffer
             out_batch_size: Batch size for outputs
+            ce_batch_size: Batch size for cross-entropy training
             device: Device to store tensors on
             dtype: Data type for stored tensors
         """
@@ -72,6 +74,7 @@ class AllActivationBuffer:
         self.ctx_len = ctx_len
         self.refresh_batch_size = refresh_batch_size
         self.out_batch_size = out_batch_size
+        self.ce_batch_size = ce_batch_size
         self.device = device
         self.dtype = dtype
         self.start_pos = 1 if remove_bos else 0
@@ -308,20 +311,17 @@ class AllActivationBuffer:
                     raise StopIteration("No data available to process")
                 break
 
-    def get_seq_activations(self, batch_size: int = 32) -> Tuple[ActivationBatch, t.Tensor]:
+    def get_seq_activations(self) -> Tuple[ActivationBatch, t.Tensor]:
             """Return a batch of activations preserving batch and sequence dimensions, along with input tokens.
-            
-            Args:
-                batch_size (int): Number of sequences in each batch
-                
+                    
             Returns:
                 Tuple[ActivationBatch, t.Tensor]: 
-                    - ActivationBatch with activations of shape [batch_size, seq_len, hidden_dim]
-                    - Input tokens of shape [batch_size, seq_len]
+                    - ActivationBatch with activations of shape [ce_batch_size, seq_len, hidden_dim]
+                    - Input tokens of shape [ce_batch_size, seq_len]
             """
             with t.no_grad():
                 # Get fresh tokens and run them through the model
-                tokens = self.token_batch(batch_size)
+                tokens = self.token_batch(self.ce_batch_size)
                 
                 with self.model.trace(tokens) as trace:
                     # Save all required activation states
@@ -392,6 +392,7 @@ class AllActivationBuffer:
             "ctx_len": self.ctx_len,
             "refresh_batch_size": self.refresh_batch_size,
             "out_batch_size": self.out_batch_size,
+            "ce_batch_size": self.ce_batch_size,
             "device": self.device,
             "needs_tokenization": self.needs_tokenization
         }

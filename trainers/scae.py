@@ -239,11 +239,8 @@ class SCAESuite(nn.Module):
                         
                         approx_acts = approx_acts + contributions
                     
-                    # Handle layernorm scaling with sequence dimension
-                    if has_seq:
-                        approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(-1).unsqueeze(-1)
-                    else:
-                        approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(-1)
+                    # Handle layernorm scaling 
+                    approx_acts = approx_acts / layernorm_scales[down_name].unsqueeze(-1)
                     
                     b_enc = self.aes[down_name].encoder.bias
                     approx_acts = approx_acts + b_enc
@@ -332,12 +329,9 @@ class SCAESuite(nn.Module):
             
         logits = unembed(ln_final(resid_final))
 
-        loss = t.nn.functional.cross_entropy(logits.permute(0, 2, 1), tokens, reduction='mean')
+        loss = t.nn.functional.cross_entropy(logits[:, :-1].permute(0, 2, 1), tokens[:, 1:], reduction='mean')
 
         return loss
-
-        
-        
 
     @classmethod
     def from_pretrained(
@@ -375,18 +369,10 @@ class SCAESuite(nn.Module):
             config = json.load(f)
         
         # Extract submodule configs
-        if config.get("is_pretrained", False):
-            # Handle nested pretrained case (though this shouldn't happen in practice)
-            raise ValueError(
-                f"Model {repo_id} was initialized from pretrained weights. "
-                "Please load from the original source."
-            )
-        
         submodule_configs = {
             name: SubmoduleConfig(**cfg)
             for name, cfg in config["submodule_configs"].items()
         }
-        
         
         # Initialize suite
         suite = cls(
@@ -421,158 +407,158 @@ class SCAESuite(nn.Module):
 
 
 
-@dataclass
-class TrainerConfig:
-    steps: int
-    base_lr: float = 2e-4
-    lr_decay_start_proportion: float = 0.8
-    log_steps: int = 100
+# @dataclass
+# class TrainerConfig:
+#     steps: int
+#     base_lr: float = 2e-4
+#     lr_decay_start_proportion: float = 0.8
+#     log_steps: int = 100
 
-class TrainerSCAESuite:
-    def __init__(
-        self,
-        suite: SCAESuite,
-        config: TrainerConfig,
-        seed: Optional[int] = None,
-        wandb_name: Optional[str] = None,
-    ):
-        """
-        Trainer for Sparse Connected Autoencoder Suite.
+# class TrainerSCAESuite:
+#     def __init__(
+#         self,
+#         suite: SCAESuite,
+#         config: TrainerConfig,
+#         seed: Optional[int] = None,
+#         wandb_name: Optional[str] = None,
+#     ):
+#         """
+#         Trainer for Sparse Connected Autoencoder Suite.
         
-        Args:
-            suite: SCAESuite object to train
-            config: Training configuration
-            seed: Random seed for reproducibility
-            wandb_name: Optional W&B run name
-        """
-        self.suite = suite
-        self.config = config
-        self.wandb_name = wandb_name
+#         Args:
+#             suite: SCAESuite object to train
+#             config: Training configuration
+#             seed: Random seed for reproducibility
+#             wandb_name: Optional W&B run name
+#         """
+#         self.suite = suite
+#         self.config = config
+#         self.wandb_name = wandb_name
         
-        if seed is not None:
-            t.manual_seed(seed)
-            t.cuda.manual_seed_all(seed)
+#         if seed is not None:
+#             t.manual_seed(seed)
+#             t.cuda.manual_seed_all(seed)
         
-        # Initialize learning rates
-        self.lrs = {
-            name: config.base_lr / (ae.dict_size / 2**14)**0.5
-            for name, ae in suite.aes.items()
-        }
+#         # Initialize learning rates
+#         self.lrs = {
+#             name: config.base_lr / (ae.dict_size / 2**14)**0.5
+#             for name, ae in suite.aes.items()
+#         }
         
-        # Initialize optimizer with per-module learning rates
-        self.optimizer = t.optim.Adam([
-            {'params': ae.parameters(), 'lr': self.lrs[name]}
-            for name, ae in suite.aes.items()
-        ], betas=(0.9, 0.999))
+#         # Initialize optimizer with per-module learning rates
+#         self.optimizer = t.optim.Adam([
+#             {'params': ae.parameters(), 'lr': self.lrs[name]}
+#             for name, ae in suite.aes.items()
+#         ], betas=(0.9, 0.999))
         
-        # Learning rate scheduler
-        def lr_fn(step):
-            if step < config.lr_decay_start_proportion * config.steps:
-                return 1.0
-            return (config.steps - step) / (config.steps - config.lr_decay_start_proportion * config.steps)
+#         # Learning rate scheduler
+#         def lr_fn(step):
+#             if step < config.lr_decay_start_proportion * config.steps:
+#                 return 1.0
+#             return (config.steps - step) / (config.steps - config.lr_decay_start_proportion * config.steps)
         
-        self.scheduler = t.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=lr_fn
-        )
+#         self.scheduler = t.optim.lr_scheduler.LambdaLR(
+#             self.optimizer, lr_lambda=lr_fn
+#         )
         
-        # Initialize metrics
-        self.effective_l0s = {name: -1 for name in suite.submodule_names}
-        self.dead_features = {name: -1 for name in suite.submodule_names}
+#         # Initialize metrics
+#         self.effective_l0s = {name: -1 for name in suite.submodule_names}
+#         self.dead_features = {name: -1 for name in suite.submodule_names}
     
-    def update(
-        self,
-        step: int,
-        initial_acts: t.Tensor,
-        input_acts: Dict[str, t.Tensor],
-        target_acts: Dict[str, t.Tensor],
-        layernorm_scales: Dict[str, t.Tensor],
-        buffer: Optional[Any] = None,
-        log_metrics: bool = False,
-    ) -> float:
-        """Single training step using pruned forward pass with FVU loss."""
-        # Move inputs to device
-        initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
-        input_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-            for k, v in input_acts.items()
-        }
-        target_acts = {
-            k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
-            for k, v in target_acts.items()
-        }
+#     def update(
+#         self,
+#         step: int,
+#         initial_acts: t.Tensor,
+#         input_acts: Dict[str, t.Tensor],
+#         target_acts: Dict[str, t.Tensor],
+#         layernorm_scales: Dict[str, t.Tensor],
+#         buffer: Optional[Any] = None,
+#         log_metrics: bool = False,
+#     ) -> float:
+#         """Single training step using pruned forward pass with FVU loss."""
+#         # Move inputs to device
+#         initial_acts = initial_acts.to(device=self.suite.device, dtype=self.suite.dtype)
+#         input_acts = {
+#             k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+#             for k, v in input_acts.items()
+#         }
+#         target_acts = {
+#             k: v.to(device=self.suite.device, dtype=self.suite.dtype) 
+#             for k, v in target_acts.items()
+#         }
         
-        # Initialize geometric median at step 0 only for non-pretrained SAEs
-        if step == 0 and not self.suite.is_pretrained:
-            for name, x in input_acts.items():
-                median = geometric_median(x)
-                self.suite.aes[name].b_dec.data = median
+#         # Initialize geometric median at step 0 only for non-pretrained SAEs
+#         if step == 0 and not self.suite.is_pretrained:
+#             for name, x in input_acts.items():
+#                 median = geometric_median(x)
+#                 self.suite.aes[name].b_dec.data = median
         
-        # Ensure decoder norms are unit
-        for ae in self.suite.aes.values():
-            ae.set_decoder_norm_to_unit_norm()
+#         # Ensure decoder norms are unit
+#         for ae in self.suite.aes.values():
+#             ae.set_decoder_norm_to_unit_norm()
         
-        self.optimizer.zero_grad()
-        total_loss = 0
+#         self.optimizer.zero_grad()
+#         total_loss = 0
         
-        # Get forward pass results
-        reconstructions = self.suite.pruned_forward(
-            initial_acts=initial_acts,
-            inputs=input_acts,
-            layernorm_scales=layernorm_scales,
-            return_topk=False
-        )
+#         # Get forward pass results
+#         reconstructions = self.suite.pruned_forward(
+#             initial_acts=initial_acts,
+#             inputs=input_acts,
+#             layernorm_scales=layernorm_scales,
+#             return_topk=False
+#         )
         
-        # Compute losses for each module
-        losses = {'reconstruction_FVU': {}}
-        for name, ae in self.suite.aes.items():
-            layer = int(name.split('_')[1])
-            if name not in input_acts:
-                continue
+#         # Compute losses for each module
+#         losses = {'reconstruction_FVU': {}}
+#         for name, ae in self.suite.aes.items():
+#             layer = int(name.split('_')[1])
+#             if name not in input_acts:
+#                 continue
             
-            tgt = target_acts[name]
-            x_hat = reconstructions[name]
+#             tgt = target_acts[name]
+#             x_hat = reconstructions[name]
             
-            # Compute FVU loss
-            total_variance = t.var(tgt, dim=0).sum()
-            residual_variance = t.var(tgt - x_hat, dim=0).sum()
-            fvu_loss = residual_variance / total_variance
-            total_loss = total_loss + fvu_loss * 2**(9-3*layer)
-            losses['reconstruction_FVU'][name] = fvu_loss.item()
+#             # Compute FVU loss
+#             total_variance = t.var(tgt, dim=0).sum()
+#             residual_variance = t.var(tgt - x_hat, dim=0).sum()
+#             fvu_loss = residual_variance / total_variance
+#             total_loss = total_loss + fvu_loss * 2**(9-3*layer)
+#             losses['reconstruction_FVU'][name] = fvu_loss.item()
         
-        # Backward pass and optimization
-        total_loss.backward()
+#         # Backward pass and optimization
+#         total_loss.backward()
         
-        # Clip gradients and remove parallel components
-        for ae in self.suite.aes.values():
-            if ae.decoder.weight.grad is not None:
-                t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
-                ae.remove_gradient_parallel_to_decoder_directions()
+#         # Clip gradients and remove parallel components
+#         for ae in self.suite.aes.values():
+#             if ae.decoder.weight.grad is not None:
+#                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
+#                 ae.remove_gradient_parallel_to_decoder_directions()
         
-        self.optimizer.step()
-        self.scheduler.step()
+#         self.optimizer.step()
+#         self.scheduler.step()
         
-        # Log metrics if requested
-        if log_metrics and self.wandb_name is not None:
-            import wandb
+#         # Log metrics if requested
+#         if log_metrics and self.wandb_name is not None:
+#             import wandb
             
-            # Log learning rates
-            lrs = {
-                f"lr/{name}": param_group['lr']
-                for name, param_group in zip(self.suite.aes.keys(), self.optimizer.param_groups)
-            }
+#             # Log learning rates
+#             lrs = {
+#                 f"lr/{name}": param_group['lr']
+#                 for name, param_group in zip(self.suite.aes.keys(), self.optimizer.param_groups)
+#             }
             
-            # Flatten nested loss dict
-            log_dict = {}
-            for loss_type, loss_dict in losses.items():
-                for name, value in loss_dict.items():
-                    log_dict[f"{loss_type}/{name}"] = value
+#             # Flatten nested loss dict
+#             log_dict = {}
+#             for loss_type, loss_dict in losses.items():
+#                 for name, value in loss_dict.items():
+#                     log_dict[f"{loss_type}/{name}"] = value
             
-            log_dict.update(lrs)
-            log_dict['loss/total'] = total_loss.item()
+#             log_dict.update(lrs)
+#             log_dict['loss/total'] = total_loss.item()
             
-            wandb.log(log_dict, step=step)
+#             wandb.log(log_dict, step=step)
         
-        return total_loss.item()
+#         return total_loss.item()
 
 def geometric_median(x: t.Tensor, num_iterations: int = 20) -> t.Tensor:
     """Compute geometric median of points."""
