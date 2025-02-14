@@ -23,6 +23,8 @@ class SimpleBuffer:
 
         self.data = data
         self.model = HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype)
+        for param in self.model.parameters():
+            param.requires_grad = False
     
         self.ctx_len = ctx_len
         self.refresh_batch_size = refresh_batch_size
@@ -54,7 +56,7 @@ class SimpleBuffer:
                 return_type="loss",
                 names_filter=self.hook_list
             )
-        return cache, tokens
+        return cache.to(self.dtype), tokens
     
             
     def __iter__(self):
