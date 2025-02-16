@@ -163,6 +163,7 @@ class SCAESuite(nn.Module):
             up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
             scaled = up_facts_selected * values[None, None, :]  # [B, S, M]
             
+            # Replace inplace scatter_add_ with functional scatter_add
             contributions = t.zeros(
                 up_facts.shape[0], 
                 up_facts.shape[1], 
@@ -170,9 +171,14 @@ class SCAESuite(nn.Module):
                 device=up_facts.device, 
                 dtype=up_facts.dtype
             )
-            contributions.scatter_add_(-1, i_indices[None, None, :].expand_as(scaled), scaled)
-        
-        return contributions
+            contributions = t.scatter_add(
+                input=contributions,
+                dim=-1,
+                index=i_indices[None, None, :].expand_as(scaled),
+                src=scaled
+            )
+            
+            return contributions
     
     def get_initial_contribs_attn(
             self,
@@ -217,169 +223,140 @@ class SCAESuite(nn.Module):
         up_facts: t.Tensor,
     ) -> t.Tensor:
         from einops import einsum
-        print(f"\nStarting get_pruned_contribs_attn for up_name={up_name}, down_name={down_name}")
-        print(f"up_facts shape: {up_facts.shape}")  # [batch, seq, n_up_features]
-        
         layer = int(down_name.split('_')[1])
         
         # Compute necessary components (W_OV, temp, etc.)
-        W_O = self.model.W_O[layer]  # [n_heads, d_head, d_out]
-        W_V = self.model.W_V[layer]  # [n_heads, d_model, d_head]
-        print(f"W_O shape: {W_O.shape}")
-        print(f"W_V shape: {W_V.shape}")
-        
+        W_O = self.model.W_O[layer]
+        W_V = self.model.W_V[layer]
         W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-        print(f"W_OV shape: {W_OV.shape}")  # [n_heads, d_in, d_out]
-        
         temp = einsum(self.aes[down_name].encoder.weight, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
-        print(f"temp shape: {temp.shape}")  # [n_heads, f_down, d_in]
+        up_decoder = self.aes[up_name].decoder.weight
         
-        up_decoder = self.aes[up_name].decoder.weight  # [d_in, f_up]
-        print(f"up_decoder shape: {up_decoder.shape}")
-        
-        connection_mask = self.connection_masks[down_name][up_name]  # [f_down, f_up]
-        print(f"connection_mask shape: {connection_mask.shape}")
-        
-        indices = connection_mask.nonzero(as_tuple=False)  # [M, 2]
+        connection_mask = self.connection_masks[down_name][up_name]
+        indices = connection_mask.nonzero(as_tuple=False)
         i_indices, j_indices = indices[:, 0], indices[:, 1]
-        print(f"i_indices shape: {i_indices.shape}, j_indices shape: {j_indices.shape}")
         
         # Compute virtual_weights values for each head and mask entry
         selected_temp = temp[:, i_indices, :]  # [n_heads, M, d_in]
         selected_up = up_decoder[:, j_indices]  # [d_in, M]
-        print(f"selected_temp shape: {selected_temp.shape}")
-        print(f"selected_up shape: {selected_up.shape}")
-        
         values = einsum(selected_temp, selected_up, "n_heads m d_in, d_in m -> n_heads m")
-        print(f"values shape: {values.shape}")  # [n_heads, M]
         
         # Gather up_facts and scatter-add contributions per head
         up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
-        print(f"up_facts_selected shape: {up_facts_selected.shape}")
-        
         n_heads, m = values.shape
         contributions = t.zeros(up_facts.shape[0], up_facts.shape[1], n_heads, temp.shape[1], 
-                        device=up_facts.device, dtype=up_facts.dtype)
-        print(f"contributions shape before scatter_add: {contributions.shape}")
+                            device=up_facts.device, dtype=up_facts.dtype)
         
         for h in range(n_heads):
-            scaled = up_facts_selected * values[h][None, None, :]  # [B, S, M]
-            print(f"scaled shape for head {h}: {scaled.shape}")
-            contributions[:, :, h].scatter_add_(-1, i_indices[None, None, :].expand_as(scaled), scaled)
-        
-        print(f"contributions shape after scatter_add: {contributions.shape}")
-        
+            scaled = up_facts_selected * values[h][None, None, :]
+            contributions_h = t.scatter_add(
+                input=contributions[:, :, h],
+                dim=-1,
+                index=i_indices[None, None, :].expand_as(scaled),
+                src=scaled
+            )
+            contributions[:, :, h] = contributions_h  # Assignment is not inplace
+                
         # Apply attention pattern mixing
-        probs = cache[f'blocks.{layer}.attn.hook_pattern']  # [batch, n_heads, qpos, kpos]
-        print(f"probs shape: {probs.shape}")
-        
+        probs = cache[f'blocks.{layer}.attn.hook_pattern']
         final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
-        print(f"final_contribs shape: {final_contribs.shape}")
-        
         return final_contribs
     
     def forward_pruned(
-            self,
-            cache: ActivationCache,
-        ) -> Dict[str, t.Tensor]:
-            """Forward pass computing sparse reconstructions."""
-            reconstructions = {}
-            pruned_features = {}  # Store pruned features for each module
+        self,
+        cache: ActivationCache,
+    ) -> Dict[str, t.Tensor]:
+        """Forward pass computing sparse reconstructions."""
+        reconstructions = {}
+        pruned_features = {}  # Store pruned features for each module
+        
+        def parse_name(name: str) -> Tuple[int, str]:
+            type_, layer = name.split('_')
+            return int(layer), type_
+        
+        # Pre-allocate tensors without inplace reuse
+        first_cache_tensor = next(iter(cache.values()))
+        batch_size, seq_len = first_cache_tensor.shape[:2]
+        device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
+        
+        # Initialize feat_buffer (no inplace reuse)
+        feat_buffer = t.zeros(
+            (batch_size, seq_len, self.n_features),
+            device=device,
+            dtype=dtype
+        )
+        
+        for down_name in self.submodule_names:
+            down_layer, down_type = parse_name(down_name)
             
-            def parse_name(name: str) -> Tuple[int, str]:
-                type_, layer = name.split('_')
-                return int(layer), type_
+            # Initialize approx_acts (out-of-place)
+            if down_type == 'attn':
+                approx_acts = self.get_initial_contribs_attn(cache, down_name)
+            else:  # mlp
+                approx_acts = self.get_initial_contribs_mlp(cache, down_name)
             
-            # Pre-allocate tensors that will be reused
-            first_cache_tensor = next(iter(cache.values()))
-            batch_size, seq_len = first_cache_tensor.shape[:2]
-            device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
+            # Initialize upstream_bias (out-of-place)
+            upstream_bias = t.zeros(self.model.cfg.d_model, device=device, dtype=dtype)
             
-            feat_buffer = t.zeros(
-                (batch_size, seq_len, self.n_features),
-                device=device,
-                dtype=dtype
-            )
-            
-            for down_name in self.submodule_names:
-                print("down_name", down_name)
-                down_layer, down_type = parse_name(down_name)
+            for up_name in self.submodule_names:
+                up_layer, up_type = parse_name(up_name)
                 
-                # Initialize approx_acts based on module type
-                if down_type == 'attn':
-                    approx_acts = self.get_initial_contribs_attn(cache, down_name)
-                else:  # mlp
-                    approx_acts = self.get_initial_contribs_mlp(cache, down_name)
-                
-                # Initialize accumulated upstream bias
-                upstream_bias = t.zeros(self.model.cfg.d_model, device=device, dtype=dtype)
-                
-                for up_name in self.submodule_names:
-                    up_layer, up_type = parse_name(up_name)
+                if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
+                    continue
                     
-                    if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
-                        continue
-                    print("up_name", up_name)
-                        
-                    if self.connections is None or (isinstance(self.connections, dict) 
-                        and down_name in self.connections 
-                        and up_name in self.connections[down_name]):
-                        
-                        # Use the pruned features from previous modules
-                        up_feats = pruned_features[up_name]  # These are already the top-k selected features
-                        
-                        # Update upstream bias inplace
-                        upstream_bias.add_(self.aes[up_name].b_dec)
-                        
-                        # Get contributions based on module type
-                        if down_type == 'attn':
-                            contributions = self.get_pruned_contribs_attn(cache, up_name, down_name, up_feats)
-                        else:  # mlp
-                            contributions = self.get_pruned_contribs_mlp(cache, up_name, down_name, up_feats)
-                        
-                        # Add contributions inplace and free memory
-                        approx_acts.add_(contributions)
-                        del contributions
-                        t.cuda.empty_cache()
-                
-                # Apply layernorm scale inplace
-                ln_name = 'ln1' if down_type == 'attn' else 'ln2'
-                ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
-                while ln_scale.dim() < approx_acts.dim():
-                    ln_scale = ln_scale.unsqueeze(-1)
-                approx_acts.div_(ln_scale)
-                
-                # Add biases inplace
-                bias = self.aes[down_name].encoder.bias
-                while bias.dim() < approx_acts.dim():
-                    bias = bias.unsqueeze(0)
-                approx_acts.add_(bias)
-                
-                projected_bias = self.aes[down_name].encoder.weight @ upstream_bias
-                while projected_bias.dim() < approx_acts.dim():
-                    projected_bias = projected_bias.unsqueeze(0)
-                approx_acts.add_(projected_bias)
-                
-                # Get top k features
-                top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
-                
-                # Reuse feat_buffer by zeroing it
-                feat_buffer.zero_()
-                
-                # Scatter top k values into buffer
-                feat_buffer.scatter_(-1, top_idx, top_vals)
-                
-                # Store pruned features for use in later modules
-                pruned_features[down_name] = feat_buffer.clone()  # Need to clone since feat_buffer will be reused
-                
-                # Decode and store reconstruction
-                reconstructions[down_name] = self.aes[down_name].decode(feat_buffer)
-                
-                # Clean up
-                del top_vals, top_idx
-                t.cuda.empty_cache()
+                if self.connections is None or (isinstance(self.connections, dict) 
+                    and down_name in self.connections 
+                    and up_name in self.connections[down_name]):
+                    
+                    up_feats = pruned_features[up_name]
+                    
+                    # Avoid inplace: upstream_bias = upstream_bias + ...
+                    upstream_bias = upstream_bias + self.aes[up_name].b_dec
+                    
+                    if down_type == 'attn':
+                        contributions = self.get_pruned_contribs_attn(cache, up_name, down_name, up_feats)
+                    else:
+                        contributions = self.get_pruned_contribs_mlp(cache, up_name, down_name, up_feats)
+                    
+                    # Avoid inplace: approx_acts = approx_acts + contributions
+                    approx_acts = approx_acts + contributions
+                    del contributions
+                    t.cuda.empty_cache()
             
-            return reconstructions
+            # Avoid inplace division: approx_acts = approx_acts / ln_scale
+            ln_name = 'ln1' if down_type == 'attn' else 'ln2'
+            ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
+            ln_scale = ln_scale.unsqueeze(-1) if ln_scale.dim() < approx_acts.dim() else ln_scale
+            approx_acts = approx_acts / ln_scale
+            
+            # Avoid inplace addition for biases
+            bias = self.aes[down_name].encoder.bias
+            bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
+            approx_acts = approx_acts + bias
+            
+            projected_bias = self.aes[down_name].encoder.weight @ upstream_bias
+            projected_bias = projected_bias.unsqueeze(0) if projected_bias.dim() < approx_acts.dim() else projected_bias
+            approx_acts = approx_acts + projected_bias
+            
+            # Get top k features (no inplace scatter)
+            top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
+            
+            # Avoid inplace zeroing: create a new feat_buffer
+            feat_buffer = t.zeros_like(feat_buffer)
+            
+            # Avoid inplace scatter: create a new tensor
+            feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
+            
+            # Store pruned features (clone to avoid accidental inplace later)
+            pruned_features[down_name] = feat_buffer.clone()
+            
+            # Decode and store reconstruction
+            reconstructions[down_name] = self.aes[down_name].decode(feat_buffer)
+            
+            del top_vals, top_idx
+            t.cuda.empty_cache()
+        
+        return reconstructions
 
     def upload_to_hf(self, repo_id: str):
         """
