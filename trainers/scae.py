@@ -39,9 +39,8 @@ class SCAESuite(nn.Module):
         self.k = k
         self.n_features = n_features
         
-        # Get module names from model
         n_layers = model.cfg.n_layers
-        self.submodule_names = [f'attn_{i}' for i in range(n_layers)] + [f'mlp_{i}' for i in range(n_layers)]
+        self.submodule_names = [f'{type_}_{i}' for i in range(n_layers) for type_ in ['attn', 'mlp']]
         
         # Initialize autoencoders
         self.aes = nn.ModuleDict({
@@ -138,33 +137,40 @@ class SCAESuite(nn.Module):
         self,
         cache: ActivationCache,
         up_name: str,
-        down_name: str,  # e.g. 'mlp_0'
-        up_facts: t.Tensor,  # [batch, seq, n_up_features]
-    ) -> t.Tensor:  # [batch, seq, n_down_features]
-        """Compute contributions from upstream to downstream MLP autoencoder.
-        
-        Args:
-            cache: TransformerLens activation cache
-            up_name: Name of upstream autoencoder
-            down_name: Name of downstream autoencoder (must be MLP type)
-            up_facts: Upstream features/activations
-            
-        Returns:
-            Tensor of contributions from upstream to downstream features
-        """
+        down_name: str,
+        up_facts: t.Tensor,
+    ) -> t.Tensor:
         if self.connections is None:
-            up_decoder = self.aes[up_name].decoder.weight  # [d_model, f_up]
-            down_encoder = self.aes[down_name].encoder.weight  # [f_down, d_model]
-            virtual_weights = down_encoder @ up_decoder  # [f_down, f_up]
-            contributions = up_facts @ virtual_weights.T
-            
-        else:
             up_decoder = self.aes[up_name].decoder.weight
             down_encoder = self.aes[down_name].encoder.weight
             virtual_weights = down_encoder @ up_decoder
+            contributions = up_facts @ virtual_weights.T
+        else:
+            up_decoder = self.aes[up_name].decoder.weight
+            down_encoder = self.aes[down_name].encoder.weight
             connection_mask = self.connection_masks[down_name][up_name]
-            masked_weights = virtual_weights * connection_mask
-            contributions = up_facts @ masked_weights.T
+            
+            # Get non-zero indices from the connection mask
+            indices = connection_mask.nonzero(as_tuple=False).t()  # [2, M]
+            i_indices, j_indices = indices[0], indices[1]
+            
+            # Compute only the necessary elements of virtual_weights
+            down_selected = down_encoder[i_indices]  # [M, d_model]
+            up_selected = up_decoder[:, j_indices]   # [d_model, M]
+            values = (down_selected * up_selected.t()).sum(dim=1)  # [M]
+            
+            # Gather relevant up_facts and compute contributions via scatter-add
+            up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
+            scaled = up_facts_selected * values[None, None, :]  # [B, S, M]
+            
+            contributions = t.zeros(
+                up_facts.shape[0], 
+                up_facts.shape[1], 
+                down_encoder.shape[0], 
+                device=up_facts.device, 
+                dtype=up_facts.dtype
+            )
+            contributions.scatter_add_(-1, i_indices[None, None, :].expand_as(scaled), scaled)
         
         return contributions
     
@@ -207,53 +213,70 @@ class SCAESuite(nn.Module):
         self,
         cache: ActivationCache,
         up_name: str,
-        down_name: str,  # e.g. 'attn_1'
-        up_facts: t.Tensor,  # [batch, seq, n_up_features]
-    ) -> t.Tensor:  # [batch, qpos, n_down_features]
-        """Compute contributions from upstream to downstream attention autoencoder."""
+        down_name: str,
+        up_facts: t.Tensor,
+    ) -> t.Tensor:
         from einops import einsum
+        print(f"\nStarting get_pruned_contribs_attn for up_name={up_name}, down_name={down_name}")
+        print(f"up_facts shape: {up_facts.shape}")  # [batch, seq, n_up_features]
         
         layer = int(down_name.split('_')[1])
         
-        # Get attention weights
+        # Compute necessary components (W_OV, temp, etc.)
         W_O = self.model.W_O[layer]  # [n_heads, d_head, d_out]
         W_V = self.model.W_V[layer]  # [n_heads, d_model, d_head]
+        print(f"W_O shape: {W_O.shape}")
+        print(f"W_V shape: {W_V.shape}")
         
-        # Break down the computation into smaller steps with cleanup
         W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-        del W_O, W_V
-        t.cuda.empty_cache()
+        print(f"W_OV shape: {W_OV.shape}")  # [n_heads, d_in, d_out]
+        
+        temp = einsum(self.aes[down_name].encoder.weight, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
+        print(f"temp shape: {temp.shape}")  # [n_heads, f_down, d_in]
         
         up_decoder = self.aes[up_name].decoder.weight  # [d_in, f_up]
-        down_encoder = self.aes[down_name].encoder.weight  # [f_down, d_out]
+        print(f"up_decoder shape: {up_decoder.shape}")
         
-        # Break down the three-way einsum into two steps
-        temp = einsum(down_encoder, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
-        del W_OV
-        t.cuda.empty_cache()
+        connection_mask = self.connection_masks[down_name][up_name]  # [f_down, f_up]
+        print(f"connection_mask shape: {connection_mask.shape}")
         
-        virtual_weights = einsum(temp, up_decoder, "n_heads f_down d_in, d_in f_up -> n_heads f_down f_up")
-        del temp
-        t.cuda.empty_cache()
+        indices = connection_mask.nonzero(as_tuple=False)  # [M, 2]
+        i_indices, j_indices = indices[:, 0], indices[:, 1]
+        print(f"i_indices shape: {i_indices.shape}, j_indices shape: {j_indices.shape}")
         
-        # Apply connection mask if using sparse connections
-        if self.connections is not None:
-            connection_mask = self.connection_masks[down_name][up_name]
-            virtual_weights *= connection_mask.unsqueeze(0)
+        # Compute virtual_weights values for each head and mask entry
+        selected_temp = temp[:, i_indices, :]  # [n_heads, M, d_in]
+        selected_up = up_decoder[:, j_indices]  # [d_in, M]
+        print(f"selected_temp shape: {selected_temp.shape}")
+        print(f"selected_up shape: {selected_up.shape}")
         
-        contribs_pre_moving = einsum(virtual_weights, up_facts, 
-                                    "n_heads f_down f_up, batch kpos f_up -> batch kpos n_heads f_down")
-        del virtual_weights
-        t.cuda.empty_cache()
+        values = einsum(selected_temp, selected_up, "n_heads m d_in, d_in m -> n_heads m")
+        print(f"values shape: {values.shape}")  # [n_heads, M]
         
-        # Mix between positions using attention pattern
+        # Gather up_facts and scatter-add contributions per head
+        up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
+        print(f"up_facts_selected shape: {up_facts_selected.shape}")
+        
+        n_heads, m = values.shape
+        contributions = t.zeros(up_facts.shape[0], up_facts.shape[1], n_heads, temp.shape[1], 
+                        device=up_facts.device, dtype=up_facts.dtype)
+        print(f"contributions shape before scatter_add: {contributions.shape}")
+        
+        for h in range(n_heads):
+            scaled = up_facts_selected * values[h][None, None, :]  # [B, S, M]
+            print(f"scaled shape for head {h}: {scaled.shape}")
+            contributions[:, :, h].scatter_add_(-1, i_indices[None, None, :].expand_as(scaled), scaled)
+        
+        print(f"contributions shape after scatter_add: {contributions.shape}")
+        
+        # Apply attention pattern mixing
         probs = cache[f'blocks.{layer}.attn.hook_pattern']  # [batch, n_heads, qpos, kpos]
-        contribs = einsum(probs, contribs_pre_moving,
-                        "batch n_heads qpos kpos, batch kpos n_heads f_down -> batch qpos f_down")
-        del contribs_pre_moving
-        t.cuda.empty_cache()
+        print(f"probs shape: {probs.shape}")
         
-        return contribs
+        final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
+        print(f"final_contribs shape: {final_contribs.shape}")
+        
+        return final_contribs
     
     def forward_pruned(
             self,
@@ -261,8 +284,8 @@ class SCAESuite(nn.Module):
         ) -> Dict[str, t.Tensor]:
             """Forward pass computing sparse reconstructions."""
             reconstructions = {}
+            pruned_features = {}  # Store pruned features for each module
             
-            # Helper to extract layer number and type from module name
             def parse_name(name: str) -> Tuple[int, str]:
                 type_, layer = name.split('_')
                 return int(layer), type_
@@ -279,6 +302,7 @@ class SCAESuite(nn.Module):
             )
             
             for down_name in self.submodule_names:
+                print("down_name", down_name)
                 down_layer, down_type = parse_name(down_name)
                 
                 # Initialize approx_acts based on module type
@@ -293,16 +317,16 @@ class SCAESuite(nn.Module):
                 for up_name in self.submodule_names:
                     up_layer, up_type = parse_name(up_name)
                     
-                    if up_layer > down_layer or (up_layer == down_layer and up_type == 'mlp'):
+                    if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
                         continue
+                    print("up_name", up_name)
                         
                     if self.connections is None or (isinstance(self.connections, dict) 
                         and down_name in self.connections 
                         and up_name in self.connections[down_name]):
                         
-                        # Get cached activation and encode
-                        cache_key = f'blocks.{up_layer}.{"ln1" if up_type == "attn" else "ln2"}.hook_normalized'
-                        up_feats = self.aes[up_name].encode(cache[cache_key])
+                        # Use the pruned features from previous modules
+                        up_feats = pruned_features[up_name]  # These are already the top-k selected features
                         
                         # Update upstream bias inplace
                         upstream_bias.add_(self.aes[up_name].b_dec)
@@ -316,20 +340,17 @@ class SCAESuite(nn.Module):
                         # Add contributions inplace and free memory
                         approx_acts.add_(contributions)
                         del contributions
-                        del up_feats
                         t.cuda.empty_cache()
                 
                 # Apply layernorm scale inplace
                 ln_name = 'ln1' if down_type == 'attn' else 'ln2'
                 ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
-                # Ensure ln_scale has the right shape for broadcasting
                 while ln_scale.dim() < approx_acts.dim():
                     ln_scale = ln_scale.unsqueeze(-1)
                 approx_acts.div_(ln_scale)
                 
                 # Add biases inplace
                 bias = self.aes[down_name].encoder.bias
-                # Ensure bias has the right shape for broadcasting
                 while bias.dim() < approx_acts.dim():
                     bias = bias.unsqueeze(0)
                 approx_acts.add_(bias)
@@ -347,6 +368,9 @@ class SCAESuite(nn.Module):
                 
                 # Scatter top k values into buffer
                 feat_buffer.scatter_(-1, top_idx, top_vals)
+                
+                # Store pruned features for use in later modules
+                pruned_features[down_name] = feat_buffer.clone()  # Need to clone since feat_buffer will be reused
                 
                 # Decode and store reconstruction
                 reconstructions[down_name] = self.aes[down_name].decode(feat_buffer)
