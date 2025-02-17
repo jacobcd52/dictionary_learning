@@ -4,7 +4,8 @@ import einops
 from typing import Dict, Tuple, Optional, List, Union, Any
 from dataclasses import dataclass
 import numpy as np
-import json 
+import json
+from einops import einsum
 
 from trainers.top_k import AutoEncoderTopK
 from transformer_lens import ActivationCache
@@ -68,20 +69,35 @@ class SCAESuite(nn.Module):
                     
                     processed_connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
                     
-                    # Precompute connection mask
-                    connection_mask = t.zeros(n_features, n_features, device=self.device, dtype=t.bool)
-                    valid_connections = conn_tensor != -1  # [num_down, C]
+                    # Vectorized connection mask creation (3B)
+                    valid_connections = conn_tensor != -1
+                    n_features = conn_tensor.shape[0]
                     
-                    # For each downstream feature, scatter its valid connections
-                    for i in range(n_features):
-                        valid_mask = valid_connections[i]  # [C]
-                        valid_targets = conn_tensor[i][valid_mask]  # Get valid target indices
-                        connection_mask[i].scatter_(0, valid_targets, t.ones(len(valid_targets), device=self.device, dtype=t.bool))
+                    # Get all valid (i,j) pairs
+                    i_indices, j_indices = valid_connections.nonzero(as_tuple=True)
+                    targets = conn_tensor[i_indices, j_indices]
+                    
+                    # Create mask using vectorized scatter
+                    connection_mask = t.zeros(n_features, n_features, 
+                                            device=self.device, dtype=t.bool)
+                    connection_mask[i_indices, targets] = True
                     
                     self.connection_masks[down_name][up_name] = connection_mask
             self.connections = processed_connections
         elif connections is not None and connections != "all":
             raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
+
+        # Precompute W_OV matrices if model is frozen (3E)
+        self.W_OVs = None
+        if not any(p.requires_grad for p in model.parameters()):
+            self.W_OVs = []
+            for layer in range(model.cfg.n_layers):
+                W_O = model.W_O[layer]
+                W_V = model.W_V[layer]
+                W_OV = einsum(W_O, W_V,
+                    "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
+                ).to(device=self.device, dtype=self.dtype)
+                self.W_OVs.append(W_OV)
 
     def vanilla_forward(
         self,
@@ -145,6 +161,7 @@ class SCAESuite(nn.Module):
             down_encoder = self.aes[down_name].encoder.weight
             virtual_weights = down_encoder @ up_decoder
             contributions = up_facts @ virtual_weights.T
+            return contributions  # Added return statement here!
         else:
             up_decoder = self.aes[up_name].decoder.weight
             down_encoder = self.aes[down_name].encoder.weight
@@ -222,45 +239,83 @@ class SCAESuite(nn.Module):
         down_name: str,
         up_facts: t.Tensor,
     ) -> t.Tensor:
+        """Compute pruned contributions for attention autoencoder."""
         from einops import einsum
+
         layer = int(down_name.split('_')[1])
         
-        # Compute necessary components (W_OV, temp, etc.)
-        W_O = self.model.W_O[layer]
-        W_V = self.model.W_V[layer]
-        W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-        temp = einsum(self.aes[down_name].encoder.weight, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
-        up_decoder = self.aes[up_name].decoder.weight
+        # Add condition for when connections is None
+        if self.connections is None:
+            # Get precomputed W_OV if available (3E)
+            if self.W_OVs is not None:
+                W_OV = self.W_OVs[layer]
+            else:
+                W_O = self.model.W_O[layer]
+                W_V = self.model.W_V[layer]
+                W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
+            
+            up_decoder = self.aes[up_name].decoder.weight
+            down_encoder = self.aes[down_name].encoder.weight
+            
+            # Compute virtual weights and contributions
+            temp = einsum(down_encoder, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
+            values = einsum(temp, up_decoder, "n_heads f_down d_in, d_in f_up -> n_heads f_down f_up")
+            contributions = einsum(up_facts, values, "b s f_up, n_heads f_down f_up -> b s n_heads f_down")
+            
+            # Apply attention pattern mixing
+            probs = cache[f'blocks.{layer}.attn.hook_pattern']
+            final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
+            return final_contribs
         
-        connection_mask = self.connection_masks[down_name][up_name]
-        indices = connection_mask.nonzero(as_tuple=False)
-        i_indices, j_indices = indices[:, 0], indices[:, 1]
-        
-        # Compute virtual_weights values for each head and mask entry
-        selected_temp = temp[:, i_indices, :]  # [n_heads, M, d_in]
-        selected_up = up_decoder[:, j_indices]  # [d_in, M]
-        values = einsum(selected_temp, selected_up, "n_heads m d_in, d_in m -> n_heads m")
-        
-        # Gather up_facts and scatter-add contributions per head
-        up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
-        n_heads, m = values.shape
-        contributions = t.zeros(up_facts.shape[0], up_facts.shape[1], n_heads, temp.shape[1], 
-                            device=up_facts.device, dtype=up_facts.dtype)
-        
-        for h in range(n_heads):
-            scaled = up_facts_selected * values[h][None, None, :]
-            contributions_h = t.scatter_add(
-                input=contributions[:, :, h],
+        else:
+            # Rest of the code for when connections is not None
+            # Get precomputed W_OV if available (3E)
+            if self.W_OVs is not None:
+                W_OV = self.W_OVs[layer]
+            else:
+                W_O = self.model.W_O[layer]
+                W_V = self.model.W_V[layer]
+                W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
+            
+            # Compute temp tensor
+            temp = einsum(
+                self.aes[down_name].encoder.weight, W_OV,
+                "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in"
+            )
+            
+            # Get connection mask and indices
+            connection_mask = self.connection_masks[down_name][up_name]
+            indices = connection_mask.nonzero(as_tuple=False)
+            i_indices, j_indices = indices[:, 0], indices[:, 1]
+            
+            # Vectorized computation (3A)
+            selected_temp = temp[:, i_indices, :]  # [n_heads, M, d_in]
+            selected_up = self.aes[up_name].decoder.weight[:, j_indices]  # [d_in, M]
+            values = einsum(selected_temp, selected_up, "n_heads m d_in, d_in m -> n_heads m")
+            
+            # Gather relevant up_facts
+            up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
+            
+            # Expand dimensions for vectorized scatter
+            scaled = up_facts_selected[:, :, None, :] * values[None, None, :, :]  # [B, S, n_heads, M]
+            
+            # Initialize contributions tensor
+            contributions = t.zeros(
+                up_facts.shape[0], up_facts.shape[1], temp.shape[0], temp.shape[1],
+                device=up_facts.device, dtype=up_facts.dtype
+            )
+            
+            # Vectorized scatter add
+            contributions.scatter_add_(
                 dim=-1,
-                index=i_indices[None, None, :].expand_as(scaled),
+                index=i_indices[None, None, None, :].expand_as(scaled),
                 src=scaled
             )
-            contributions[:, :, h] = contributions_h  # Assignment is not inplace
-                
-        # Apply attention pattern mixing
-        probs = cache[f'blocks.{layer}.attn.hook_pattern']
-        final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
-        return final_contribs
+            
+            # Apply attention pattern mixing
+            probs = cache[f'blocks.{layer}.attn.hook_pattern']
+            final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
+            return final_contribs
     
     def forward_pruned(
         self,
@@ -357,6 +412,39 @@ class SCAESuite(nn.Module):
             t.cuda.empty_cache()
         
         return reconstructions
+
+    def get_ce_loss(
+            self,
+            reconstructions: Dict[str, t.Tensor],
+            tokens: t.Tensor,  # shape: [batch, seq]
+        ) -> t.Tensor:
+        """Compute cross entropy loss from reconstructions.
+        
+        Args:
+            reconstructions: Dictionary mapping layer names to reconstruction tensors
+            tokens: Integer tensor of target tokens
+            
+        Returns:
+            Cross entropy loss between predicted logits and target tokens
+        """
+        resid_final = sum(reconstructions.values())
+        logits = self.model.unembed(self.model.ln_final(resid_final))  # [batch, seq, n_vocab]
+        
+        # Shift sequences by 1
+        logits = logits[:, :-1, :]  # Remove last position
+        tokens = tokens[:, 1:]  # Remove first position
+        
+        # Flatten batch and sequence dimensions
+        logits = logits.reshape(-1, logits.size(-1))  # [batch*seq, n_vocab]
+        tokens = tokens.reshape(-1)  # [batch*seq]
+        
+        loss = nn.functional.cross_entropy(
+            logits,
+            tokens,
+            reduction='mean'
+        )
+        return loss
+            
 
     def upload_to_hf(self, repo_id: str):
         """

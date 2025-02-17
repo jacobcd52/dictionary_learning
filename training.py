@@ -1,5 +1,5 @@
 """
-Training dictionaries
+Training for Sparsely-Connected AutoEncoder Suite
 """
 
 import json
@@ -7,31 +7,17 @@ import os
 from queue import Empty
 import torch as t
 from typing import Union, Dict, Optional, TypeVar
-from dataclasses import asdict
 import tempfile
 from tqdm.auto import tqdm
 import wandb
 
-from trainers.scae import SubmoduleConfig, SCAESuite
-
-def new_wandb_process(config, log_queue, entity, project):
-    wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"])
-    while True:
-        try:
-            log = log_queue.get(timeout=1)
-            if log == "DONE":
-                break
-            wandb.log(log)
-        except Empty:
-            continue
-    wandb.finish()
-
+from trainers.scae import SCAESuite
 
 def initialize_optimizers(suite, base_lr):
-    """Initialize optimizers with custom learning rates based on dictionary sizes"""
+    """Initialize optimizers with custom learning rates based on feature counts"""
     lrs = {
-        name: base_lr / (ae.dict_size / 2**14)**0.5
-        for name, ae in suite.aes.items()
+        name: base_lr / (suite.n_features / 2**14)**0.5
+        for name in suite.aes.keys()
     }
     optimizer = t.optim.Adam([
         {'params': ae.parameters(), 'lr': lrs[name]}
@@ -40,7 +26,7 @@ def initialize_optimizers(suite, base_lr):
     return optimizer, lrs
 
 def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
-    """Create learning rate scheduler"""
+    """Create learning rate scheduler with linear decay"""
     def lr_fn(step):
         if step < lr_decay_start_proportion * steps:
             return 1.0
@@ -48,41 +34,14 @@ def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
     
     return t.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
 
-def compute_mse_loss(suite, initial_acts, input_acts, target_acts, layernorm_scales):
-    """Compute MSE loss using FVU (Fraction of Variance Unexplained)"""
-    reconstructions = suite.pruned_forward(
-        initial_acts=initial_acts,
-        inputs=input_acts,
-        layernorm_scales=layernorm_scales,
-        return_topk=False
-    )
-    
-    total_loss = 0
-    losses = {}
-    
-    for name, ae in suite.aes.items():
-        if name not in input_acts:
-            continue
-        
-        tgt = target_acts[name]
-        x_hat = reconstructions[name]
-        
-        # Compute FVU loss
-        total_variance = t.var(tgt, dim=0).sum()
-        residual_variance = t.var(tgt - x_hat, dim=0).sum()
-        fvu_loss = residual_variance / total_variance
-        layer = int(name.split('_')[1])
-        total_loss = total_loss + fvu_loss * 2**(9-3*layer)
-        losses[name] = fvu_loss.item()
-        
-    return total_loss, losses, reconstructions
-
 def train_scae_suite(
     buffer,
+    model,
+    k: int,
+    n_features: int,
     loss_type: str = "mse",
     base_lr: float = 2e-4,
     steps: Optional[int] = None,
-    submodule_configs: Optional[Dict[str, SubmoduleConfig]]=None,
     connections: Optional[Dict[str, Dict[str, t.Tensor]]] = None,
     save_steps: Optional[int] = None,
     save_dir: Optional[str] = None,
@@ -95,15 +54,15 @@ def train_scae_suite(
     seed: Optional[int] = None,
     wandb_project_name: str = "scae",
     lr_decay_start_proportion: float = 0.8,
-    ln_final: Optional[t.nn.Module] = None,
-    unembed: Optional[t.nn.Module] = None,
 ):
     """
     Train a Sparse Connected Autoencoder Suite.
     
     Args:
         buffer: Dataset iterator providing training data
-        submodule_configs: Dictionary mapping names to SubmoduleConfigs for fresh initialization
+        model: TransformerLens model
+        k: Number of features to select for each autoencoder
+        n_features: Dictionary size for each autoencoder
         connections: Optional sparse connections between modules
         steps: Number of training steps
         save_steps: Steps between checkpoints (None for no intermediate saves)
@@ -119,16 +78,10 @@ def train_scae_suite(
         loss_type: Type of loss to use ("mse" or "ce")
         base_lr: Base learning rate
         lr_decay_start_proportion: When to start learning rate decay
-        ln_final: Final layer norm for CE loss (required if loss_type="ce")
-        unembed: Unembedding matrix for CE loss (required if loss_type="ce")
     """
     if loss_type not in ["mse", "ce"]:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'mse' or 'ce'")
         
-    if loss_type == "ce":
-        if any(x is None for x in [ln_final, unembed]):
-            raise ValueError("ln_final and unembed are required when loss_type='ce'")
-            
     device = device or ('cuda' if t.cuda.is_available() else 'cpu')
     
     # Set random seed if provided
@@ -136,41 +89,33 @@ def train_scae_suite(
         t.manual_seed(seed)
         t.cuda.manual_seed_all(seed)
     
-    # Move CE components to device if needed
-    if loss_type == "ce":
-        ln_final.to(device)
-        unembed.to(device)
-    
     # Initialize or load pretrained suite
     if repo_id_in is None:
         suite = SCAESuite(
-            submodule_configs=submodule_configs,
+            model=model,
+            k=k,
+            n_features=n_features,
+            connections=connections,
             dtype=dtype,
             device=device,
-            connections=connections
         )
         config_dict = {
-            "submodule_configs": {
-                name: asdict(cfg) for name, cfg in submodule_configs.items()
-            },
+            "k": k,
+            "n_features": n_features,
             "is_pretrained": False
         }
     else:      
         suite = SCAESuite.from_pretrained(
             repo_id=repo_id_in,
-            connections=connections,
+            model=model,
             device=device,
             dtype=dtype,
         )
         config_dict = {
-            "submodule_configs": {
-                name: asdict(config) for name, config in suite.configs.items()
-            },
+            "k": suite.k,
+            "n_features": suite.n_features,
             "is_pretrained": True
         }
-    print("W_dec attn_0:", suite.aes['attn_0'].decoder.weight.shape, suite.aes['attn_0'].decoder.weight.dtype)
-    print("W_dec mlp_0:", suite.aes['mlp_0'].decoder.weight.shape)
-    print(suite.aes.keys())
     
     # Initialize optimizer and scheduler
     optimizer, lrs = initialize_optimizers(suite, base_lr)
@@ -186,7 +131,6 @@ def train_scae_suite(
             "ctx_len": buffer.ctx_len,
             "refresh_batch_size": buffer.refresh_batch_size,
             "out_batch_size": buffer.out_batch_size,
-            "ce_batch_size": buffer.ce_batch_size,
         },
         "loss_type": loss_type
     })
@@ -199,7 +143,6 @@ def train_scae_suite(
     
     # Initialize wandb if requested
     if use_wandb:
-        import wandb
         wandb.init(
             project=wandb_project_name,
             config=config_dict,
@@ -213,22 +156,29 @@ def train_scae_suite(
         if steps is not None and step >= steps:
             break
             
-        # Ensure decoder norms are unit
-        for ae in suite.aes.values():
-            ae.set_decoder_norm_to_unit_norm()
-            
         optimizer.zero_grad()
         
         if loss_type == "mse":
-            batch = next(buffer)
-            initial_acts, input_acts, target_acts, layernorm_scales = batch
-            loss, losses, _ = compute_mse_loss(
-                suite=suite,
-                initial_acts=initial_acts,
-                input_acts=input_acts,
-                target_acts=target_acts,
-                layernorm_scales=layernorm_scales
-            )
+            cache = next(buffer)
+            reconstructions = suite.forward_pruned(cache)
+            
+            # Compute MSE loss using FVU
+            total_loss = 0
+            losses = {}
+            
+            for name, recon in reconstructions.items():
+                ln_name = 'ln1' if 'attn' in name else 'ln2'
+                layer = int(name.split('_')[1])
+                target = cache[f'blocks.{layer}.{ln_name}.hook_normalized']
+                
+                # Compute FVU loss
+                total_variance = t.var(target, dim=0).sum()
+                residual_variance = t.var(target - recon, dim=0).sum()
+                fvu_loss = residual_variance / total_variance
+                total_loss = total_loss + fvu_loss * 2**(9-3*layer)
+                losses[name] = fvu_loss.item()
+            
+            loss = total_loss
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
@@ -240,22 +190,10 @@ def train_scae_suite(
                 }, step=step)
                 
         else:  # ce loss
-            acts, tokens = buffer.get_seq_activations()
+            cache, tokens = buffer.get_seq_activations()
             tokens = tokens.to(device)
-            initial_acts, input_acts, target_acts, layernorm_scales = acts
-            reconstructions = suite.pruned_forward(
-                initial_acts=initial_acts,
-                inputs=input_acts,
-                layernorm_scales=layernorm_scales,
-                return_topk=False
-            )
-            loss = suite.get_ce_loss(
-                tokens=tokens,
-                initial_acts=initial_acts,
-                reconstructions=reconstructions,
-                ln_final=ln_final,
-                unembed=unembed
-            )
+            reconstructions = suite.forward_pruned(cache)
+            loss = suite.get_ce_loss(reconstructions, tokens)
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
@@ -270,7 +208,6 @@ def train_scae_suite(
         for ae in suite.aes.values():
             if ae.decoder.weight.grad is not None:
                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
-                ae.remove_gradient_parallel_to_decoder_directions()
         optimizer.step()
         scheduler.step()
 
@@ -290,12 +227,6 @@ def train_scae_suite(
                 },
                 os.path.join(checkpoint_dir, "checkpoint.pt")
             )
-            
-            if connections is not None:
-                t.save(
-                    connections,
-                    os.path.join(checkpoint_dir, "connections.pt")
-                )
     
     # Save final model
     if save_dir is not None:
@@ -311,60 +242,10 @@ def train_scae_suite(
             },
             os.path.join(final_dir, "checkpoint.pt")
         )
-        
-        if connections is not None:
-            t.save(
-                connections,
-                os.path.join(final_dir, "connections.pt")
-            )
     
     # Upload to HuggingFace if requested
     if repo_id_out is not None:
-        try:
-            from huggingface_hub import HfApi
-            
-            print(f"\nUploading models to HuggingFace repo: {repo_id_out}")
-            api = HfApi()
-            
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
-                json.dump(config_dict, f, indent=4)
-                f.flush()
-                api.upload_file(
-                    path_or_fileobj=f.name,
-                    path_in_repo="config.json",
-                    repo_id=repo_id_out,
-                    repo_type="model",
-                )
-            
-            with tempfile.NamedTemporaryFile(suffix='.pt') as f:
-                t.save({
-                    'suite_state': suite.state_dict(),
-                    'step': step if step is not None else -1,
-                }, f.name)
-                api.upload_file(
-                    path_or_fileobj=f.name,
-                    path_in_repo="checkpoint.pt",
-                    repo_id=repo_id_out,
-                    repo_type="model",
-                )
-            
-            if connections is not None:
-                with tempfile.NamedTemporaryFile(suffix='.pt') as f:
-                    t.save(connections, f.name)
-                    api.upload_file(
-                        path_or_fileobj=f.name,
-                        path_in_repo="connections.pt",
-                        repo_id=repo_id_out,
-                        repo_type="model",
-                    )
-            
-            print("Successfully uploaded all models to HuggingFace!")
-            
-        except ImportError:
-            print("Warning: huggingface_hub package not found. Skipping HuggingFace upload.")
-            print("To upload to HuggingFace, install with: pip install huggingface_hub")
-        except Exception as e:
-            print(f"Error uploading to HuggingFace: {str(e)}")
+        suite.upload_to_hf(repo_id_out)
     
     if use_wandb:
         wandb.finish()

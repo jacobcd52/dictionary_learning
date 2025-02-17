@@ -1,7 +1,6 @@
 #%%
-from buffer import AllActivationBuffer
+from buffer import SimpleBuffer
 from training import train_scae_suite
-from trainers.scae import TrainerConfig
 from utils import load_model_with_folded_ln2, load_iterable_dataset
 from find_top_connections import generate_fake_connections
 
