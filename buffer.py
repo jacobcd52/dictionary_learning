@@ -15,8 +15,7 @@ class SimpleBuffer:
             data: Iterator[Union[str, t.Tensor]],
             model_name: str,
             ctx_len: int = 128,
-            refresh_batch_size: int = 512,
-            out_batch_size: int = 8192,
+            batch_size: int = 512,
             device: str = "cpu",
             dtype: t.dtype = t.float32,
         ):
@@ -27,8 +26,7 @@ class SimpleBuffer:
             param.requires_grad = False
     
         self.ctx_len = ctx_len
-        self.refresh_batch_size = refresh_batch_size
-        self.out_batch_size = out_batch_size
+        self.batch_size = batch_size
         self.device = device
         self.dtype = dtype        
 
@@ -48,7 +46,7 @@ class SimpleBuffer:
     def __next__(self) -> Tuple[ActivationCache, t.Tensor]:
         """Return a batch of activations as a named tuple."""
 
-        batch = [next(self.data) for _ in range(self.refresh_batch_size)]
+        batch = [next(self.data) for _ in range(self.batch_size)]
         tokens = self.model.to_tokens(batch, prepend_bos=True)[:, :self.ctx_len]
         with t.no_grad():
             loss, cache = self.model.run_with_cache(
@@ -69,8 +67,7 @@ class SimpleBuffer:
         return {
             "d_submodule": self.d_submodule,
             "ctx_len": self.ctx_len,
-            "refresh_batch_size": self.refresh_batch_size,
-            "out_batch_size": self.out_batch_size,
+            "batch_size": self.batch_size,
             "device": self.device,
             "needs_tokenization": self.needs_tokenization
         }

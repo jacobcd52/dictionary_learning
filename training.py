@@ -10,6 +10,7 @@ from typing import Union, Dict, Optional, TypeVar
 import tempfile
 from tqdm.auto import tqdm
 import wandb
+from transformer_lens import HookedTransformer
 
 from trainers.scae import SCAESuite
 
@@ -36,7 +37,7 @@ def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
 
 def train_scae_suite(
     buffer,
-    model,
+    model_name,
     k: int,
     n_features: int,
     loss_type: str = "mse",
@@ -92,7 +93,7 @@ def train_scae_suite(
     # Initialize or load pretrained suite
     if repo_id_in is None:
         suite = SCAESuite(
-            model=model,
+            model=HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype),
             k=k,
             n_features=n_features,
             connections=connections,
@@ -107,7 +108,7 @@ def train_scae_suite(
     else:      
         suite = SCAESuite.from_pretrained(
             repo_id=repo_id_in,
-            model=model,
+            model=HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype),
             device=device,
             dtype=dtype,
         )
@@ -129,8 +130,7 @@ def train_scae_suite(
         "dtype": str(dtype),
         "buffer_config": {
             "ctx_len": buffer.ctx_len,
-            "refresh_batch_size": buffer.refresh_batch_size,
-            "out_batch_size": buffer.out_batch_size,
+            "batch_size": buffer.batch_size,
         },
         "loss_type": loss_type
     })
@@ -159,7 +159,7 @@ def train_scae_suite(
         optimizer.zero_grad()
         
         if loss_type == "mse":
-            cache = next(buffer)
+            cache, tokens = next(buffer)
             reconstructions = suite.forward_pruned(cache)
             
             # Compute MSE loss using FVU
@@ -183,14 +183,12 @@ def train_scae_suite(
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
                 wandb.log({
-                    **{f"loss/fvu/{name}": value for name, value in losses.items()},
-                    **{f"lr/{name}": param_group['lr'] 
-                       for name, param_group in zip(suite.aes.keys(), optimizer.param_groups)},
-                    "loss/total": loss.item()
+                    **{f"fvu/{name}": value for name, value in losses.items()},
+                    "loss": loss.item()
                 }, step=step)
                 
         else:  # ce loss
-            cache, tokens = buffer.get_seq_activations()
+            cache, tokens = next(buffer)
             tokens = tokens.to(device)
             reconstructions = suite.forward_pruned(cache)
             loss = suite.get_ce_loss(reconstructions, tokens)
@@ -198,9 +196,7 @@ def train_scae_suite(
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
                 wandb.log({
-                    "loss/ce": loss.item(),
-                    **{f"lr/{name}": param_group['lr'] 
-                       for name, param_group in zip(suite.aes.keys(), optimizer.param_groups)}
+                    "ce": loss.item(),
                 }, step=step)
         
         # Backward pass and optimization

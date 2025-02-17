@@ -330,7 +330,7 @@ class SCAESuite(nn.Module):
             return int(layer), type_
         
         # Pre-allocate tensors without inplace reuse
-        first_cache_tensor = next(iter(cache.values()))
+        first_cache_tensor = cache['blocks.0.hook_resid_pre']
         batch_size, seq_len = first_cache_tensor.shape[:2]
         device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
         
