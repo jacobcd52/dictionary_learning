@@ -33,7 +33,11 @@ class SCAESuite(nn.Module):
             device: Device to place the autoencoders on
         """
         super().__init__()
+        
+        for p in model.parameters():
+            p.requires_grad = False
         self.model = model
+
         self.device = device or ('cuda' if t.cuda.is_available() else 'cpu')
         self.dtype = dtype
         self.is_pretrained = False
@@ -87,17 +91,15 @@ class SCAESuite(nn.Module):
         elif connections is not None and connections != "all":
             raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
 
-        # Precompute W_OV matrices if model is frozen (3E)
-        self.W_OVs = None
-        if not any(p.requires_grad for p in model.parameters()):
-            self.W_OVs = []
-            for layer in range(model.cfg.n_layers):
-                W_O = model.W_O[layer]
-                W_V = model.W_V[layer]
-                W_OV = einsum(W_O, W_V,
-                    "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
-                ).to(device=self.device, dtype=self.dtype)
-                self.W_OVs.append(W_OV)
+        # Precompute W_OV matrices
+        self.W_OVs = []
+        for layer in range(model.cfg.n_layers):
+            W_O = model.W_O[layer]
+            W_V = model.W_V[layer]
+            W_OV = einsum(W_O, W_V,
+                "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
+            ).to(device=self.device, dtype=self.dtype)
+            self.W_OVs.append(W_OV)
 
     def vanilla_forward(
         self,
@@ -208,20 +210,13 @@ class SCAESuite(nn.Module):
             layer = int(down_name.split('_')[1])
             initial_act = cache['blocks.0.hook_resid_pre']
             
-            # Get attention weights and combine W_O and W_V
-            W_O = self.model.W_O[layer]  # [n_heads, d_head, d_out]
-            W_V = self.model.W_V[layer]  # [n_heads, d_model, d_head]
-            
             # Break down the einsum operations and clean up intermediates
-            W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-            del W_O, W_V
+            W_OV = self.W_OVs[layer]  # [n_heads, d_model, d_out]
             t.cuda.empty_cache()
             
             down_encoder = self.aes[down_name].encoder.weight  # [f_down, d_out]
             initial_contrib_pre_moving = einsum(initial_act, W_OV, down_encoder,
                                             "batch pos d_in, n_heads d_in d_out, f_down d_out -> batch pos n_heads f_down")
-            del W_OV
-            t.cuda.empty_cache()
             
             # Mix between positions using attention pattern
             probs = cache[f'blocks.{layer}.attn.hook_pattern']  # [batch, n_heads, qpos, kpos]
@@ -243,40 +238,19 @@ class SCAESuite(nn.Module):
         from einops import einsum
 
         layer = int(down_name.split('_')[1])
-        
-        # Add condition for when connections is None
+        W_OV = self.W_OVs[layer]     
+
+        # # Add condition for when connections is None
         if self.connections is None:
-            # Get precomputed W_OV if available (3E)
-            if self.W_OVs is not None:
-                W_OV = self.W_OVs[layer]
-            else:
-                W_O = self.model.W_O[layer]
-                W_V = self.model.W_V[layer]
-                W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-            
-            up_decoder = self.aes[up_name].decoder.weight
-            down_encoder = self.aes[down_name].encoder.weight
-            
-            # Compute virtual weights and contributions
-            temp = einsum(down_encoder, W_OV, "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in")
-            values = einsum(temp, up_decoder, "n_heads f_down d_in, d_in f_up -> n_heads f_down f_up")
-            contributions = einsum(up_facts, values, "b s f_up, n_heads f_down f_up -> b s n_heads f_down")
-            
-            # Apply attention pattern mixing
+            up_recons = self.aes[up_name].decode(up_facts) # [B, S, d_model]
+            post_ov = einsum(up_recons, W_OV, "b s d_model, n_heads d_model d_out -> b s n_heads d_out")
             probs = cache[f'blocks.{layer}.attn.hook_pattern']
-            final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
-            return final_contribs
+            post_moving = einsum(post_ov, probs, "b k h d_out, b h q k -> b q d_out")
+            contribs = self.aes[down_name].encode(post_moving)
+            return contribs
+
         
-        else:
-            # Rest of the code for when connections is not None
-            # Get precomputed W_OV if available (3E)
-            if self.W_OVs is not None:
-                W_OV = self.W_OVs[layer]
-            else:
-                W_O = self.model.W_O[layer]
-                W_V = self.model.W_V[layer]
-                W_OV = einsum(W_O, W_V, "n_heads d_head d_out, n_heads d_in d_head -> n_heads d_in d_out")
-            
+        else:         
             # Compute temp tensor
             temp = einsum(
                 self.aes[down_name].encoder.weight, W_OV,
