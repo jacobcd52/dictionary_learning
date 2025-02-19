@@ -35,11 +35,48 @@ def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
     
     return t.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
 
+"""
+Training for Sparsely-Connected AutoEncoder Suite
+"""
+
+import json
+import os
+from queue import Empty
+import torch as t
+from typing import Union, Dict, Optional, TypeVar
+import tempfile
+from tqdm.auto import tqdm
+import wandb
+from transformer_lens import HookedTransformer
+
+from trainers.scae import SCAESuite
+
+def initialize_optimizers(suite, base_lr):
+    """Initialize optimizers with custom learning rates based on feature counts"""
+    lrs = {
+        name: base_lr / (suite.n_features / 2**14)**0.5
+        for name in suite.aes.keys()
+    }
+    optimizer = t.optim.Adam([
+        {'params': ae.parameters(), 'lr': lrs[name]}
+        for name, ae in suite.aes.items()
+    ], betas=(0.9, 0.999))
+    return optimizer, lrs
+
+def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
+    """Create learning rate scheduler with linear decay"""
+    def lr_fn(step):
+        if step < lr_decay_start_proportion * steps:
+            return 1.0
+        return (steps - step) / (steps - lr_decay_start_proportion * steps)
+    
+    return t.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
+
 def train_scae_suite(
     buffer,
     model_name,
-    k: int,
-    n_features: int,
+    k: Optional[int] = None,
+    expansion: Optional[int] = None,  # Changed from n_features to expansion
     loss_type: str = "mse",
     base_lr: float = 2e-4,
     steps: Optional[int] = None,
@@ -55,30 +92,17 @@ def train_scae_suite(
     seed: Optional[int] = None,
     wandb_project_name: str = "scae",
     lr_decay_start_proportion: float = 0.8,
+    vanilla: bool = False,
 ):
     """
     Train a Sparse Connected Autoencoder Suite.
     
     Args:
         buffer: Dataset iterator providing training data
-        model: TransformerLens model
-        k: Number of features to select for each autoencoder
-        n_features: Dictionary size for each autoencoder
-        connections: Optional sparse connections between modules
-        steps: Number of training steps
-        save_steps: Steps between checkpoints (None for no intermediate saves)
-        save_dir: Directory to save checkpoints and final model
-        log_steps: Steps between logging (None for no logging)
-        use_wandb: Whether to use Weights & Biases logging
-        repo_id_in: Optional HuggingFace repo ID to load pretrained model from
-        repo_id_out: Optional HuggingFace repo ID to upload trained models to
-        dtype: Data type for model parameters
-        device: Device to train on
-        seed: Random seed for reproducibility
-        wandb_project_name: Name of the wandb project
-        loss_type: Type of loss to use ("mse" or "ce")
-        base_lr: Base learning rate
-        lr_decay_start_proportion: When to start learning rate decay
+        model_name: Name of the transformer model to use
+        k: Number of features to select for each autoencoder (required if repo_id_in not provided)
+        expansion: Factor to multiply model.cfg.d_model by to get n_features (required if repo_id_in not provided)
+        ...
     """
     if loss_type not in ["mse", "ce"]:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'mse' or 'ce'")
@@ -91,9 +115,15 @@ def train_scae_suite(
         t.cuda.manual_seed_all(seed)
     
     # Initialize or load pretrained suite
+    model = HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype)
+    
     if repo_id_in is None:
+        if k is None or expansion is None:
+            raise ValueError("k and expansion must be provided when not loading a pretrained model")
+        
+        n_features = expansion * model.cfg.d_model
         suite = SCAESuite(
-            model=HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype),
+            model=model,
             k=k,
             n_features=n_features,
             connections=connections,
@@ -102,18 +132,21 @@ def train_scae_suite(
         )
         config_dict = {
             "k": k,
+            "expansion": expansion,
             "n_features": n_features,
             "is_pretrained": False
         }
     else:      
         suite = SCAESuite.from_pretrained(
             repo_id=repo_id_in,
-            model=HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype),
+            model=model,
             device=device,
             dtype=dtype,
         )
+        # Calculate expansion from loaded n_features
         config_dict = {
             "k": suite.k,
+            "expansion": suite.n_features // model.cfg.d_model,
             "n_features": suite.n_features,
             "is_pretrained": True
         }
@@ -132,7 +165,8 @@ def train_scae_suite(
             "ctx_len": buffer.ctx_len,
             "batch_size": buffer.batch_size,
         },
-        "loss_type": loss_type
+        "loss_type": loss_type,
+        "vanilla": vanilla  # Add vanilla to config
     })
     
     # Save initial config if requested
@@ -160,7 +194,7 @@ def train_scae_suite(
         
         if loss_type == "mse":
             cache, tokens = next(buffer)
-            reconstructions = suite.forward_pruned(cache)
+            reconstructions = suite.vanilla_forward(cache) if vanilla else suite.forward_pruned(cache)
             
             # Compute MSE loss using FVU
             total_loss = 0
@@ -183,14 +217,14 @@ def train_scae_suite(
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
                 wandb.log({
-                    **{f"fvu/{name}": value for name, value in losses.items()},
+                    **{f"FVU/{name}": value for name, value in losses.items()},
                     "loss": loss.item()
                 }, step=step)
                 
         else:  # ce loss
             cache, tokens = next(buffer)
             tokens = tokens.to(device)
-            reconstructions = suite.forward_pruned(cache)
+            reconstructions = suite.vanilla_forward(cache) if vanilla else suite.forward_pruned(cache)
             loss = suite.get_ce_loss(reconstructions, tokens)
             
             # Log metrics if requested

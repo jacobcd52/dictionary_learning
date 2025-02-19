@@ -1,78 +1,55 @@
 #%%
-from buffer import AllActivationBuffer
+from buffer import SimpleBuffer
 from training import train_scae_suite
-from trainers.scae import TrainerConfig, SubmoduleConfig
-from utils import load_model_with_folded_ln2, load_iterable_dataset
+from utils import load_iterable_dataset
+from find_top_connections import generate_fake_connections
 
 import torch as t
 from huggingface_hub import login
+
+# Jacob's token but feel free to use
 login("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")
 device = "cuda:0" if t.cuda.is_available() else "cpu"
-
 
 #%%
 DTYPE = t.float32
 MODEL_NAME = "roneneldan/TinyStories-33M"
-expansion = 16
-k = 128
-remove_bos = True
-
-out_batch_size = 4096 * 2
-num_tokens = int(2e8)
+num_tokens = int(100e6)
+batch_size = 256
+expansion = 4
+ctx_len = 128
 
 
 #%%
-model = load_model_with_folded_ln2(MODEL_NAME, device=device, torch_dtype=DTYPE)
-data = load_iterable_dataset("roneneldan/TinyStories")
-# 'Skylion007/openwebtext'
-if MODEL_NAME == "gpt2":
-    n_embd = model.config.n_embd
-    num_features = n_embd * expansion
-    n_layer = model.config.n_layer
-elif MODEL_NAME == "roneneldan/TinyStories-33M":
-    n_embd = model.config.hidden_size
-    num_features = n_embd * expansion
-    n_layer = model.config.num_layers
+data = load_iterable_dataset('roneneldan/TinyStories')
 
-#%%
-buffer = AllActivationBuffer(
+buffer = SimpleBuffer(
     data=data,
-    model=model,
     model_name=MODEL_NAME,
-    n_ctxs=1024,  # you can set this higher or lower depending on your available memory
     device="cuda",
-    out_batch_size = out_batch_size,
-    refresh_batch_size = 512,
-    remove_bos=remove_bos
+    batch_size=batch_size,
+    dtype=DTYPE,
+    ctx_len=ctx_len
 ) 
 
-#%%
-submodule_cfg = SubmoduleConfig(
-            dict_size=num_features,
-            activation_dim=n_embd,
-            k=k)
-submodule_configs = {f'{module}_{down_layer}' : submodule_cfg for down_layer in range(n_layer) for module in ['attn', 'mlp']}
-
-print("total steps = ", num_tokens // out_batch_size)
-trainer_cfg = TrainerConfig(
-    steps=num_tokens // out_batch_size,
-    use_vanilla_training=True,
-    base_lr=5e-4
-)
 
 #%%
 trainer = train_scae_suite(
     buffer,
-    submodule_configs=submodule_configs,
-    trainer_config=trainer_cfg,
-    steps=num_tokens // out_batch_size,
+    vanilla=True,
+    model_name=MODEL_NAME,
+    k=128,
+    expansion=expansion,
+    loss_type="mse",
+    connections=None,
+    steps=num_tokens // (batch_size * ctx_len),
     save_steps = 1000,
-    dtype=DTYPE,
+    dtype = DTYPE,
     device=device,
     log_steps = 20,
     use_wandb = True,
-    repo_id_out = "jacobcd52/TinyStories-33M_suite",
-    seed = 42,
-    wandb_project_name="TinyStories-33m_pretrain"
+    repo_id_in=None,
+    repo_id_out = "jacobcd52/TinyStories-33M_suite_4",
+    wandb_project_name="TinyStories-33m_pretrain",
 )
 # %%

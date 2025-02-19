@@ -15,9 +15,10 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(4096*5000)
+num_tokens = int(1e6)
 batch_size = 2
 expansion = 4
+ctx_len = 128
 
 
 #%%
@@ -29,6 +30,7 @@ buffer = SimpleBuffer(
     device="cuda",
     batch_size=batch_size,
     dtype=DTYPE,
+    ctx_len=ctx_len
 ) 
 
 
@@ -51,21 +53,23 @@ fake_connections = generate_fake_connections(
     num_features=768*expansion
 )
 
+
+
 #%%
 trainer = train_scae_suite(
     buffer,
     model_name=MODEL_NAME,
     k=128,
-    n_features=768*expansion,
+    expansion=expansion,
     loss_type="mse",
-    connections=fake_connections, # "all"
+    connections=fake_connections,
     steps=num_tokens // batch_size,
     save_steps = 1000,
     dtype = DTYPE,
     device=device,
     log_steps = 20,
     use_wandb = True,
-    repo_id_in=None, #'jacobcd52/TinyStories-33M_suite',
+    repo_id_in=None, #'jacobcd52/TinyStories-33M_suite_4',
     repo_id_out = "jacobcd52/TinyStories-33M_scae",
     wandb_project_name="tinystories33m_scae_3",
 )
