@@ -15,8 +15,8 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(1e6)
-batch_size = 2
+num_tokens = int(100e6)
+batch_size = 64
 expansion = 4
 ctx_len = 128
 
@@ -36,22 +36,8 @@ buffer = SimpleBuffer(
 
 
 #%%
-# Use some dumb fake connections for now
-with open("/root/dictionary_learning/connections_TinyStories-33M_100.pkl", "rb") as f:
+with open("/root/dictionary_learning/top_connections_100.pkl", "rb") as f:
     connections = pickle.load(f)
-
-for layer in range(buffer.model.cfg.n_layers):
-    connections[f'attn_{layer}'] = {k: v for (k, v) in connections[f'mlp_{layer}'].items() 
-                                    if int(k.split('_')[1]) < layer}
-
-for down_name in connections.keys():
-    for up_name in connections[down_name].keys():
-        connections[down_name][up_name] = connections[down_name][up_name][:768*expansion]
-
-fake_connections = generate_fake_connections(
-    connections,
-    num_features=768*expansion
-)
 
 
 
@@ -60,17 +46,18 @@ trainer = train_scae_suite(
     buffer,
     model_name=MODEL_NAME,
     k=128,
+    base_lr=1e-3,
     expansion=expansion,
     loss_type="mse",
-    connections=fake_connections,
-    steps=num_tokens // batch_size,
+    connections=connections,
+    steps=num_tokens // (batch_size * ctx_len),
     save_steps = 1000,
     dtype = DTYPE,
     device=device,
     log_steps = 20,
     use_wandb = True,
-    repo_id_in=None, #'jacobcd52/TinyStories-33M_suite_4',
+    repo_id_in='jacobcd52/TinyStories-33M_suite_4',
     repo_id_out = "jacobcd52/TinyStories-33M_scae",
-    wandb_project_name="tinystories33m_scae_3",
+    wandb_project_name="tinystories33m_scae_4",
 )
 # %%
