@@ -76,7 +76,7 @@ def train_scae_suite(
     buffer,
     model_name,
     k: Optional[int] = None,
-    expansion: Optional[int] = None,  # Changed from n_features to expansion
+    expansion: Optional[int] = None, 
     loss_type: str = "mse",
     base_lr: float = 2e-4,
     steps: Optional[int] = None,
@@ -142,6 +142,7 @@ def train_scae_suite(
             model=model,
             device=device,
             dtype=dtype,
+            connections=connections
         )
         # Calculate expansion from loaded n_features
         config_dict = {
@@ -209,7 +210,7 @@ def train_scae_suite(
                 total_variance = t.var(target, dim=0).sum()
                 residual_variance = t.var(target - recon, dim=0).sum()
                 fvu_loss = residual_variance / total_variance
-                total_loss = total_loss + fvu_loss * 2**(9-3*layer)
+                total_loss = total_loss + fvu_loss #* 2**(9-3*layer) # weight early layers higher
                 losses[name] = fvu_loss.item()
             
             loss = total_loss

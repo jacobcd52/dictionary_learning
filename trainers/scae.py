@@ -470,6 +470,7 @@ class SCAESuite(nn.Module):
         cls,
         repo_id: str,
         model,
+        connections: Optional[Union[Dict[str, Dict[str, t.Tensor]], str]] = None,
         device: Optional[str] = None,
         dtype: t.dtype = t.float32
     ) -> "SCAESuite":
@@ -498,12 +499,15 @@ class SCAESuite(nn.Module):
         with open(config_path, 'r') as f:
             config = json.load(f)
         
+        if config["connections"]:
+            connections = config["connections"]
+
         # Initialize suite
         suite = cls(
             model=model,
             k=config["k"],
             n_features=config["n_features"],
-            connections=config["connections"],
+            connections=connections,
             dtype=dtype,
             device=device
         )
