@@ -33,7 +33,7 @@ def get_avg_contribs(
         }
         
         # Process batches with tqdm
-        for batch_idx in range(n_batches):
+        for batch_idx in tqdm(range(n_batches)):
             cache, tokens = next(buffer)
             
             # For each downstream autoencoder
@@ -373,7 +373,7 @@ if __name__ == "__main__":
     DTYPE = t.bfloat16
     MODEL_NAME = "roneneldan/TinyStories-33M"
     num_tokens = int(10e6)
-    batch_size = 32
+    batch_size = 64
     expansion = 4
     ctx_len = 128
 
@@ -400,13 +400,13 @@ if __name__ == "__main__":
     )
 
     #%%
-    avg_contribs = get_avg_contribs(suite, buffer, n_batches=1000)
+    avg_contribs = get_avg_contribs(suite, buffer, n_batches=100)
 
 
     #%%
     from tqdm import tqdm
     for c in tqdm([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300, 400, 600, 800]):
-        top_connections = get_top_connections(avg_contribs, c=10)
+        top_connections = get_top_connections(avg_contribs, c=c)
         # save as pickle file
-        with open(f"top_connections_{c}.pkl", "wb") as f:
+        with open(f"tinystories_connections/top_connections_{c}.pkl", "wb") as f:
             pickle.dump(top_connections, f)

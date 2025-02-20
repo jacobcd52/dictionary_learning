@@ -2,6 +2,8 @@
 sae_checkpoints/
 noteboooks/importance_scores
 
+tinystories_connections
+
 # Saved connections tensor
 connections_100.pkl
 connections_TinyStories-33M_100.pkl

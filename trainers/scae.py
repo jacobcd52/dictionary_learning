@@ -149,7 +149,8 @@ class SCAESuite(nn.Module):
         initial_act = cache['blocks.0.hook_resid_pre']  # [batch, seq, d_model]
         W_enc = self.aes[down_name].encoder.weight  # [n_features, d_model]
         
-        return initial_act @ W_enc.T  # [batch, seq, n_features]
+        initial_act_post_ln = initial_act / cache[f'blocks.0.ln2.hook_scale']
+        return initial_act_post_ln @ W_enc.T  # [batch, seq, n_features]
 
     def get_pruned_contribs_mlp(
         self,
@@ -162,7 +163,8 @@ class SCAESuite(nn.Module):
             up_decoder = self.aes[up_name].decoder.weight
             down_encoder = self.aes[down_name].encoder.weight
             virtual_weights = down_encoder @ up_decoder
-            contributions = up_facts @ virtual_weights.T
+            up_facts_post_ln = up_facts / cache[f'blocks.0.ln2.hook_scale']
+            contributions = up_facts_post_ln @ virtual_weights.T
             return contributions  # Added return statement here!
         else:
             up_decoder = self.aes[up_name].decoder.weight
@@ -181,6 +183,8 @@ class SCAESuite(nn.Module):
             # Gather relevant up_facts and compute contributions via scatter-add
             up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
             scaled = up_facts_selected * values[None, None, :]  # [B, S, M]
+
+            scaled_post_ln = scaled / cache[f'blocks.0.ln2.hook_scale']
             
             # Replace inplace scatter_add_ with functional scatter_add
             contributions = t.zeros(
@@ -193,8 +197,8 @@ class SCAESuite(nn.Module):
             contributions = t.scatter_add(
                 input=contributions,
                 dim=-1,
-                index=i_indices[None, None, :].expand_as(scaled),
-                src=scaled
+                index=i_indices[None, None, :].expand_as(scaled_post_ln),
+                src=scaled_post_ln
             )
             
             return contributions
@@ -208,14 +212,15 @@ class SCAESuite(nn.Module):
             from einops import einsum
             
             layer = int(down_name.split('_')[1])
-            initial_act = cache['blocks.0.hook_resid_pre']
+            initial_act = cache['blocks.0.hook_resid_pre'] # [batch, seq, d_model]
+            initial_act_post_ln = initial_act / cache[f'blocks.{layer}.ln1.hook_scale']
             
             # Break down the einsum operations and clean up intermediates
             W_OV = self.W_OVs[layer]  # [n_heads, d_model, d_out]
             t.cuda.empty_cache()
             
             down_encoder = self.aes[down_name].encoder.weight  # [f_down, d_out]
-            initial_contrib_pre_moving = einsum(initial_act, W_OV, down_encoder,
+            initial_contrib_pre_moving = einsum(initial_act_post_ln, W_OV, down_encoder,
                                             "batch pos d_in, n_heads d_in d_out, f_down d_out -> batch pos n_heads f_down")
             
             # Mix between positions using attention pattern
@@ -238,12 +243,17 @@ class SCAESuite(nn.Module):
         from einops import einsum
 
         layer = int(down_name.split('_')[1])
-        W_OV = self.W_OVs[layer]     
+        W_OV = self.W_OVs[layer]   
+ 
 
         # # Add condition for when connections is None
         if self.connections is None:
             up_recons = self.aes[up_name].decode(up_facts) # [B, S, d_model]
-            post_ov = einsum(up_recons, W_OV, "b s d_model, n_heads d_model d_out -> b s n_heads d_out")
+
+            # Divide by layer norm scale
+            up_recons_post_ln = up_recons / cache[f'blocks.{layer}.ln1.hook_scale']
+
+            post_ov = einsum(up_recons_post_ln, W_OV, "b s d_model, n_heads d_model d_out -> b s n_heads d_out")
             probs = cache[f'blocks.{layer}.attn.hook_pattern']
             post_moving = einsum(post_ov, probs, "b k h d_out, b h q k -> b q d_out")
             contribs = self.aes[down_name].encode(post_moving)
@@ -269,6 +279,9 @@ class SCAESuite(nn.Module):
             
             # Gather relevant up_facts
             up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
+            
+            # Divide by layer norm scale
+            up_facts_selected = up_facts_selected / cache[f'blocks.{layer}.ln1.hook_scale']
             
             # Expand dimensions for vectorized scatter
             scaled = up_facts_selected[:, :, None, :] * values[None, None, :, :]  # [B, S, n_heads, M]
@@ -352,19 +365,23 @@ class SCAESuite(nn.Module):
                     del contributions
                     t.cuda.empty_cache()
             
-            # Avoid inplace division: approx_acts = approx_acts / ln_scale
-            ln_name = 'ln1' if down_type == 'attn' else 'ln2'
-            ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
-            ln_scale = ln_scale.unsqueeze(-1) if ln_scale.dim() < approx_acts.dim() else ln_scale
-            approx_acts = approx_acts / ln_scale
+            # # Avoid inplace division: approx_acts = approx_acts / ln_scale
+            # ln_name = 'ln1' if down_type == 'attn' else 'ln2'
+            # ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
+            # ln_scale = ln_scale.unsqueeze(-1) if ln_scale.dim() < approx_acts.dim() else ln_scale
+            # approx_acts = approx_acts / ln_scale
             
-            # Avoid inplace addition for biases
+            # Add b_enc 
             bias = self.aes[down_name].encoder.bias
             bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
             approx_acts = approx_acts + bias
             
-            projected_bias = self.aes[down_name].encoder.weight @ upstream_bias
-            projected_bias = projected_bias.unsqueeze(0) if projected_bias.dim() < approx_acts.dim() else projected_bias
+            # Add upstream b_dec contributions
+            ln_name = 'ln1' if down_type == 'attn' else 'ln2'
+            upstream_bias_post_ln = upstream_bias.unsqueeze(0).unsqueeze(0) / cache[f'blocks.0.{ln_name}.hook_scale']
+            projected_bias = einsum(self.aes[down_name].encoder.weight,
+                                     upstream_bias_post_ln,
+                                     "f d, b s d -> b s f")
             approx_acts = approx_acts + projected_bias
             
             # Get top k features (no inplace scatter)

@@ -15,8 +15,8 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(100e6)
-batch_size = 64
+num_tokens = int(200e6)
+batch_size = 32
 expansion = 4
 ctx_len = 128
 
@@ -36,7 +36,7 @@ buffer = SimpleBuffer(
 
 
 #%%
-with open("/root/dictionary_learning/top_connections_100.pkl", "rb") as f:
+with open("/root/dictionary_learning/tinystories_connections/top_connections_20.pkl", "rb") as f:
     connections = pickle.load(f)
 
 
