@@ -5,6 +5,16 @@ from trainers.scae import SCAESuite
 from buffer import SimpleBuffer
 from tqdm import tqdm
 import einops
+from huggingface_hub import login
+import pickle
+from transformer_lens import HookedTransformer
+import psutil
+
+from buffer import SimpleBuffer
+from training import train_scae_suite
+from utils import load_model_with_folded_ln2, load_iterable_dataset
+from trainers.scae import SCAESuite
+
 
 def get_avg_contribs(
         suite: SCAESuite,
@@ -23,7 +33,7 @@ def get_avg_contribs(
         }
         
         # Process batches with tqdm
-        for batch_idx in tqdm(range(n_batches), desc="Computing contributions"):
+        for batch_idx in range(n_batches):
             cache, tokens = next(buffer)
             
             # For each downstream autoencoder
@@ -123,6 +133,13 @@ def get_avg_contribs(
                             # Flatten batch and k dimensions for scatter_add_
                             scaled = scaled.reshape(-1, scaled.shape[-1])  # [batch*seq*k, f_down]
                             scatter_inds = flat_inds.reshape(-1)  # [batch*seq*k]
+
+                            # Use scatter_add to accumulate contributions for this head
+                            contribution_tensor.scatter_add_(
+                                0,
+                                scatter_inds.unsqueeze(-1).expand(-1, head_weights.shape[1]),
+                                scaled
+                            )
                         
                         contribution_tensor = contribution_tensor / (batch_size * seq_len)
                         
@@ -141,12 +158,7 @@ def get_avg_contribs(
             t.cuda.empty_cache()
         
         return avg_contribs
-        
 
-
-from tqdm import tqdm
-import psutil
-import sys
 
 def get_top_c_indices(top_connections_dict: Dict[str, t.Tensor], c: int, chunk_size: int = 100, 
                       memory_threshold_gb: float = 32) -> Dict[str, t.Tensor]:
@@ -274,11 +286,11 @@ def get_top_connections(avg_contribs, c):
         to tensors of shape [f_up, c] containing the indices of the top connections
     """
     top_connections = {}
-    for down_name, contrib_dict in avg_contribs.items():
-        top_connections[down_name] = {}
-        for up_name, contrib_tensor in contrib_dict.items():
-            top_indices = contrib_tensor.abs().topk(c, dim=0).indices
-            top_connections[down_name][up_name] = top_indices
+    for down_name, contrib_dict in tqdm(avg_contribs.items()):
+        if len(contrib_dict) == 0:
+            top_connections[down_name] = {}
+        else:
+            top_connections[down_name] = get_top_c_indices(contrib_dict, c)
     return top_connections
 
 
@@ -350,3 +362,51 @@ def generate_fake_connections(
     
     return fake_connections
 
+
+if __name__ == "__main__":
+    login("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")
+    device = "cuda:0" if t.cuda.is_available() else "cpu"
+
+    t.set_grad_enabled(False)
+
+    #%%
+    DTYPE = t.bfloat16
+    MODEL_NAME = "roneneldan/TinyStories-33M"
+    num_tokens = int(10e6)
+    batch_size = 32
+    expansion = 4
+    ctx_len = 128
+
+
+    #%%
+    data = load_iterable_dataset('roneneldan/TinyStories')
+
+    buffer = SimpleBuffer(
+        data=data,
+        model_name=MODEL_NAME,
+        ctx_len=ctx_len,
+        device="cuda",
+        batch_size=batch_size,
+        dtype=DTYPE,
+    ) 
+
+    #%%
+    model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=DTYPE)
+    suite = SCAESuite.from_pretrained(
+        "jacobcd52/TinyStories-33M_suite_4",
+        model,
+        device=device,
+        dtype=DTYPE,
+    )
+
+    #%%
+    avg_contribs = get_avg_contribs(suite, buffer, n_batches=1000)
+
+
+    #%%
+    from tqdm import tqdm
+    for c in tqdm([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300, 400, 600, 800]):
+        top_connections = get_top_connections(avg_contribs, c=10)
+        # save as pickle file
+        with open(f"top_connections_{c}.pkl", "wb") as f:
+            pickle.dump(top_connections, f)
