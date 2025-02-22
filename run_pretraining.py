@@ -11,10 +11,9 @@ from huggingface_hub import login
 login("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")
 device = "cuda:0" if t.cuda.is_available() else "cpu"
 
-#%%
 DTYPE = t.float32
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(100e6)
+num_tokens = int(500e6)
 batch_size = 256
 expansion = 4
 ctx_len = 128
@@ -22,6 +21,7 @@ ctx_len = 128
 
 #%%
 data = load_iterable_dataset('roneneldan/TinyStories')
+
 
 buffer = SimpleBuffer(
     data=data,

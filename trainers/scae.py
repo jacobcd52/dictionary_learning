@@ -115,10 +115,10 @@ class SCAESuite(nn.Module):
         """
         results = {}
         
-        for layer in range(len(self.submodule_names) // 2):  # Divide by 2 since we have both attn and mlp for each layer
+        for layer in range(self.model.cfg.n_layers):  # Divide by 2 since we have both attn and mlp for each layer
             # Attention
             attn_name = f'attn_{layer}'
-            attn_input = cache[f'blocks.{layer}.ln1.hook_normalized']
+            attn_input = cache[f'blocks.{layer}.hook_attn_out']
             feat = self.aes[attn_name].encode(attn_input)
             recon = self.aes[attn_name].decode(feat)
             results[attn_name] = recon
@@ -371,14 +371,17 @@ class SCAESuite(nn.Module):
             # ln_scale = ln_scale.unsqueeze(-1) if ln_scale.dim() < approx_acts.dim() else ln_scale
             # approx_acts = approx_acts / ln_scale
             
-            # Add b_enc 
+            # Add downstream b_enc 
             bias = self.aes[down_name].encoder.bias
             bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
             approx_acts = approx_acts + bias
+
+            # Subtract downstream b_dec contribution
+            approx_acts = approx_acts - self.aes[down_name].encoder.weight @ self.aes[down_name].b_dec
             
             # Add upstream b_dec contributions
             ln_name = 'ln1' if down_type == 'attn' else 'ln2'
-            upstream_bias_post_ln = upstream_bias.unsqueeze(0).unsqueeze(0) / cache[f'blocks.0.{ln_name}.hook_scale']
+            upstream_bias_post_ln = upstream_bias.unsqueeze(0).unsqueeze(0) / cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
             projected_bias = einsum(self.aes[down_name].encoder.weight,
                                      upstream_bias_post_ln,
                                      "f d, b s d -> b s f")

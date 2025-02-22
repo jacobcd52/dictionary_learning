@@ -102,7 +102,12 @@ def load_iterable_dataset(
             return self
 
         def __next__(self):
-            return next(self.data)['text']
+            try:
+                return next(self.data)['text']
+            except StopIteration:
+                print("Resetting CustomData iterator")
+                self.data = iter(dataset)
+                return next(self.data)['text']
 
     return  CustomData(dataset)
 

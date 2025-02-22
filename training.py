@@ -202,9 +202,13 @@ def train_scae_suite(
             losses = {}
             
             for name, recon in reconstructions.items():
-                ln_name = 'ln1' if 'attn' in name else 'ln2'
                 layer = int(name.split('_')[1])
-                target = cache[f'blocks.{layer}.{ln_name}.hook_normalized']
+                if 'attn' in name:  
+                    target = cache[f'blocks.{layer}.hook_attn_out']
+                elif 'mlp' in name:
+                    target = cache[f'blocks.{layer}.hook_mlp_out']
+                else:
+                    RuntimeError(f"Invalid layer name: {name}")
                 
                 # Compute FVU loss
                 total_variance = t.var(target, dim=0).sum()
