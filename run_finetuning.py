@@ -15,10 +15,11 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(200e6)
+num_tokens = int(10e6)
 batch_size = 32
 expansion = 4
 ctx_len = 128
+num_connections = 20
 
 
 #%%
@@ -36,7 +37,7 @@ buffer = SimpleBuffer(
 
 
 #%%
-with open("/root/dictionary_learning/tinystories_connections/top_connections_20.pkl", "rb") as f:
+with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
     connections = pickle.load(f)
 
 
@@ -46,10 +47,10 @@ trainer = train_scae_suite(
     buffer,
     model_name=MODEL_NAME,
     k=128,
-    base_lr=1e-3,
+    base_lr=1e-4,
     expansion=expansion,
     loss_type="mse",
-    connections=None, #connections,
+    connections=connections,
     steps=num_tokens // (batch_size * ctx_len),
     save_steps = 1000,
     dtype = DTYPE,
@@ -57,7 +58,7 @@ trainer = train_scae_suite(
     log_steps = 20,
     use_wandb = True,
     repo_id_in='jacobcd52/TinyStories-33M_suite_4',
-    repo_id_out = "jacobcd52/TinyStories-33M_scae",
+    repo_id_out = f"jacobcd52/TinyStories-33M_scae_{num_connections}_mse",
     wandb_project_name="tinystories33m_scae_4",
 )
 # %%

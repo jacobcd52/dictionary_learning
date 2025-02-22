@@ -101,36 +101,36 @@ class SCAESuite(nn.Module):
             ).to(device=self.device, dtype=self.dtype)
             self.W_OVs.append(W_OV)
 
-    def vanilla_forward(
-        self,
-        cache: Dict[str, t.Tensor],
-    ) -> Dict[str, t.Tensor]:
-        """Forward pass that outputs reconstructions.
+    # def vanilla_forward(
+    #     self,
+    #     cache: Dict[str, t.Tensor],
+    # ) -> Dict[str, t.Tensor]:
+    #     """Forward pass that outputs reconstructions.
         
-        Args:
-            cache: Dictionary mapping hook points to activation tensors
+    #     Args:
+    #         cache: Dictionary mapping hook points to activation tensors
             
-        Returns:
-            Dictionary of reconstructions matching input dimensions
-        """
-        results = {}
+    #     Returns:
+    #         Dictionary of reconstructions matching input dimensions
+    #     """
+    #     results = {}
         
-        for layer in range(self.model.cfg.n_layers):  # Divide by 2 since we have both attn and mlp for each layer
-            # Attention
-            attn_name = f'attn_{layer}'
-            attn_input = cache[f'blocks.{layer}.hook_attn_out']
-            feat = self.aes[attn_name].encode(attn_input)
-            recon = self.aes[attn_name].decode(feat)
-            results[attn_name] = recon
+    #     for layer in range(self.model.cfg.n_layers):  # Divide by 2 since we have both attn and mlp for each layer
+    #         # Attention
+    #         attn_name = f'attn_{layer}'
+    #         attn_input = cache[f'blocks.{layer}.hook_attn_out']
+    #         feat = self.aes[attn_name].encode(attn_input)
+    #         recon = self.aes[attn_name].decode(feat)
+    #         results[attn_name] = recon
             
-            # MLP
-            mlp_name = f'mlp_{layer}'
-            mlp_input = cache[f'blocks.{layer}.ln2.hook_normalized']
-            feat = self.aes[mlp_name].encode(mlp_input)
-            recon = self.aes[mlp_name].decode(feat)
-            results[mlp_name] = recon
+    #         # MLP
+    #         mlp_name = f'mlp_{layer}'
+    #         mlp_input = cache[f'blocks.{layer}.ln2.hook_normalized']
+    #         feat = self.aes[mlp_name].encode(mlp_input)
+    #         recon = self.aes[mlp_name].decode(feat)
+    #         results[mlp_name] = recon
         
-        return results
+    #     return results
 
     def get_initial_contribs_mlp(
         self,
@@ -364,12 +364,10 @@ class SCAESuite(nn.Module):
                     approx_acts = approx_acts + contributions
                     del contributions
                     t.cuda.empty_cache()
-            
-            # # Avoid inplace division: approx_acts = approx_acts / ln_scale
-            # ln_name = 'ln1' if down_type == 'attn' else 'ln2'
-            # ln_scale = cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
-            # ln_scale = ln_scale.unsqueeze(-1) if ln_scale.dim() < approx_acts.dim() else ln_scale
-            # approx_acts = approx_acts / ln_scale
+
+            # Messy bias stuff. Beware bugs.
+            if down_type == 'attn':
+                approx_acts = approx_acts + self.model.b_O[down_layer].squeeze().to(self.dtype) @ self.aes[down_name].encoder.weight.T
             
             # Add downstream b_enc 
             bias = self.aes[down_name].encoder.bias
@@ -382,6 +380,9 @@ class SCAESuite(nn.Module):
             # Add upstream b_dec contributions
             ln_name = 'ln1' if down_type == 'attn' else 'ln2'
             upstream_bias_post_ln = upstream_bias.unsqueeze(0).unsqueeze(0) / cache[f'blocks.{down_layer}.{ln_name}.hook_scale']
+            if down_type == 'attn':
+                upstream_bias_post_ln = einsum(self.W_OVs[down_layer], upstream_bias_post_ln, 
+                                               "n_heads d_in d_out, b s d_in -> b s d_out")
             projected_bias = einsum(self.aes[down_name].encoder.weight,
                                      upstream_bias_post_ln,
                                      "f d, b s d -> b s f")
