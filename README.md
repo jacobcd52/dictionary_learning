@@ -1,4 +1,4 @@
-Overview
+**Overview**
 
 This is a fork of Sam Marks' library, adapted for training Sparsely Connected Autoencoders (SCAEs).
 
@@ -10,7 +10,7 @@ Given SAEs at various points in a model, we'd like each feature to depend on onl
 4. Finetune the suite on local reconstruction and/or downstream CE using the pruned forward pass.
 
 
-Usage:
+**Usage:**
 
 For testing, I pretrained some small (expansion=4) TopK SAEs for Pythia-70M, available at the HF repo jacobcd52/TinyStories-33M_suite_4. You can finetune them as follows:
 
@@ -18,7 +18,7 @@ For testing, I pretrained some small (expansion=4) TopK SAEs for Pythia-70M, ava
 1. gdown https://drive.google.com/drive/folders/1kxpZkpdL2Yhs3xnv2zhbDw-OnlBkzZcx?usp=sharing (this downloads files specifying feature-connectivity graphs, for various values of the number C of connections per feature. I got these connections by taking, for each feature, the top C upstream features with highest average contribution over a large dataset, .
 2. python run_finetuning.py (or run as a notebook). You'll need to enter a wandb key.
 
-Code Structure
+**Code Structure**
 
 The main differences to Sam Marks' code are:
 
