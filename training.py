@@ -14,15 +14,19 @@ from transformer_lens import HookedTransformer
 
 from trainers.scae import SCAESuite
 
+def get_module(model):
+    return model.module if isinstance(model, t.nn.DataParallel) else model
+
 def initialize_optimizers(suite, base_lr):
-    """Initialize optimizers with custom learning rates based on feature counts"""
+    # If suite is wrapped, use the underlying module.
+    module = suite.module if isinstance(suite, t.nn.DataParallel) else suite
     lrs = {
-        name: base_lr / (suite.n_features / 2**14)**0.5
-        for name in suite.aes.keys()
+        name: base_lr / (module.n_features / 2**14)**0.5
+        for name in module.aes.keys()
     }
     optimizer = t.optim.Adam([
         {'params': ae.parameters(), 'lr': lrs[name]}
-        for name, ae in suite.aes.items()
+        for name, ae in module.aes.items()
     ], betas=(0.9, 0.999))
     return optimizer, lrs
 
@@ -50,18 +54,6 @@ import wandb
 from transformer_lens import HookedTransformer
 
 from trainers.scae import SCAESuite
-
-def initialize_optimizers(suite, base_lr):
-    """Initialize optimizers with custom learning rates based on feature counts"""
-    lrs = {
-        name: base_lr / (suite.n_features / 2**14)**0.5
-        for name in suite.aes.keys()
-    }
-    optimizer = t.optim.Adam([
-        {'params': ae.parameters(), 'lr': lrs[name]}
-        for name, ae in suite.aes.items()
-    ], betas=(0.9, 0.999))
-    return optimizer, lrs
 
 def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
     """Create learning rate scheduler with linear decay"""
@@ -151,6 +143,11 @@ def train_scae_suite(
             "n_features": suite.n_features,
             "is_pretrained": True
         }
+
+    # --- Wrap with DataParallel if multiple GPUs are available ---
+    print(f"Using {t.cuda.device_count()} GPUs for training")
+    if device.startswith("cuda") and t.cuda.device_count() > 1:
+        suite = t.nn.DataParallel(suite)
     
     # Initialize optimizer and scheduler
     optimizer, lrs = initialize_optimizers(suite, base_lr)
@@ -195,7 +192,8 @@ def train_scae_suite(
         
         if loss_type == "mse":
             cache, tokens = next(buffer)
-            reconstructions = suite.vanilla_forward(cache) if vanilla else suite.forward_pruned(cache)
+            module = get_module(suite)
+            reconstructions = module.vanilla_forward(cache) if vanilla else module.forward_pruned(cache)
             
             # Compute MSE loss using FVU
             total_loss = 0
@@ -229,8 +227,9 @@ def train_scae_suite(
         else:  # ce loss
             cache, tokens = next(buffer)
             tokens = tokens.to(device)
-            reconstructions = suite.vanilla_forward(cache) if vanilla else suite.forward_pruned(cache)
-            loss = suite.get_ce_loss(reconstructions, tokens)
+            module = get_module(suite)
+            reconstructions = module.vanilla_forward(cache) if vanilla else module.forward_pruned(cache)
+            loss = module.get_ce_loss(reconstructions, tokens)
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
@@ -240,7 +239,8 @@ def train_scae_suite(
         
         # Backward pass and optimization
         loss.backward()
-        for ae in suite.aes.values():
+        module = suite.module if isinstance(suite, t.nn.DataParallel) else suite
+        for ae in module.aes.values():
             if ae.decoder.weight.grad is not None:
                 t.nn.utils.clip_grad_norm_(ae.parameters(), 1.0)
         optimizer.step()
@@ -253,9 +253,11 @@ def train_scae_suite(
             checkpoint_dir = os.path.join(save_dir, f"step_{step}")
             os.makedirs(checkpoint_dir, exist_ok=True)
             
+            # Unwrap suite if needed
+            state_dict = suite.module.state_dict() if isinstance(suite, t.nn.DataParallel) else suite.state_dict()
             t.save(
                 {
-                    'suite_state': suite.state_dict(),
+                    'suite_state': state_dict,
                     'optimizer_state': optimizer.state_dict(),
                     'scheduler_state': scheduler.state_dict(),
                     'step': step,
