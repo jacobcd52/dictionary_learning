@@ -90,7 +90,6 @@ class SCAESuite(nn.Module):
             self.connections = processed_connections
         elif connections is not None and connections != "all":
             raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
-
         # Precompute W_OV matrices
         self.W_OVs = []
         for layer in range(model.cfg.n_layers):
@@ -159,52 +158,18 @@ class SCAESuite(nn.Module):
         down_name: str,
         up_facts: t.Tensor,
     ) -> t.Tensor:
-        if self.connections is None:
-            up_decoder = self.aes[up_name].decoder.weight
-            down_encoder = self.aes[down_name].encoder.weight
-            virtual_weights = down_encoder @ up_decoder
-            up_facts_post_ln = up_facts / cache[f'blocks.0.ln2.hook_scale']
-            contributions = up_facts_post_ln @ virtual_weights.T
-            return contributions  # Added return statement here!
-        else:
-            layer = int(down_name.split('_')[1])
+        
+        layer = int(down_name.split('_')[1])
+        up_decoder = self.aes[up_name].decoder.weight
+        down_encoder = self.aes[down_name].encoder.weight
+        virtual_weights = down_encoder @ up_decoder
+        if self.connections is not None:
+            virtual_weights = virtual_weights * self.connection_masks[down_name][up_name]
 
-            up_decoder = self.aes[up_name].decoder.weight
-            down_encoder = self.aes[down_name].encoder.weight
-            connection_mask = self.connection_masks[down_name][up_name]
+        up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln2.hook_scale']
+        contributions = up_facts_post_ln @ virtual_weights.T
+        return contributions  # Added return statement here!
             
-            # Get non-zero indices from the connection mask
-            indices = connection_mask.nonzero(as_tuple=False).t()  # [2, M]
-            i_indices, j_indices = indices[0], indices[1]
-            
-            # Compute only the necessary elements of virtual_weights
-            down_selected = down_encoder[i_indices]  # [M, d_model]
-            up_selected = up_decoder[:, j_indices]   # [d_model, M]
-            values = (down_selected * up_selected.t()).sum(dim=1)  # [M]
-            
-            # Gather relevant up_facts and compute contributions via scatter-add
-            up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
-            scaled = up_facts_selected * values[None, None, :]  # [B, S, M]
-
-            scaled_post_ln = scaled / cache[f'blocks.{layer}.ln2.hook_scale']
-            
-            # Replace inplace scatter_add_ with functional scatter_add
-            contributions = t.zeros(
-                up_facts.shape[0], 
-                up_facts.shape[1], 
-                down_encoder.shape[0], 
-                device=up_facts.device, 
-                dtype=up_facts.dtype
-            )
-            contributions = t.scatter_add(
-                input=contributions,
-                dim=-1,
-                index=i_indices[None, None, :].expand_as(scaled_post_ln),
-                src=scaled_post_ln
-            )
-            
-            return contributions
-    
     def get_initial_contribs_attn(
             self,
             cache: ActivationCache,
@@ -246,65 +211,23 @@ class SCAESuite(nn.Module):
 
         layer = int(down_name.split('_')[1])
         W_OV = self.W_OVs[layer]   
- 
-
-        # # Add condition for when connections is None
-        if self.connections is None:
-            up_recons = self.aes[up_name].decode(up_facts) # [B, S, d_model]
-
-            # Divide by layer norm scale
-            up_recons_post_ln = up_recons / cache[f'blocks.{layer}.ln1.hook_scale']
-
-            post_ov = einsum(up_recons_post_ln, W_OV, "b s d_model, n_heads d_model d_out -> b s n_heads d_out")
-            probs = cache[f'blocks.{layer}.attn.hook_pattern']
-            post_moving = einsum(post_ov, probs, "b k h d_out, b h q k -> b q d_out")
-            contribs = self.aes[down_name].encode(post_moving)
-            return contribs
-
+        down_encoder = self.aes[down_name].encoder.weight
+        up_decoder  = self.aes[up_name].decoder.weight
+        virtual_weights = einsum(down_encoder, W_OV, up_decoder,
+            "f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up")
+        if self.connections is not None:
+            virtual_weights = virtual_weights * self.connection_masks[down_name][up_name].unsqueeze(0)
         
-        else:         
-            # Compute temp tensor
-            temp = einsum(
-                self.aes[down_name].encoder.weight, W_OV,
-                "f_down d_out, n_heads d_in d_out -> n_heads f_down d_in"
-            )
-            
-            # Get connection mask and indices
-            connection_mask = self.connection_masks[down_name][up_name]
-            indices = connection_mask.nonzero(as_tuple=False)
-            i_indices, j_indices = indices[:, 0], indices[:, 1]
-            
-            # Vectorized computation (3A)
-            selected_temp = temp[:, i_indices, :]  # [n_heads, M, d_in]
-            selected_up = self.aes[up_name].decoder.weight[:, j_indices]  # [d_in, M]
-            values = einsum(selected_temp, selected_up, "n_heads m d_in, d_in m -> n_heads m")
-            
-            # Gather relevant up_facts
-            up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
-            
-            # Divide by layer norm scale
-            up_facts_selected = up_facts_selected / cache[f'blocks.{layer}.ln1.hook_scale']
-            
-            # Expand dimensions for vectorized scatter
-            scaled = up_facts_selected[:, :, None, :] * values[None, None, :, :]  # [B, S, n_heads, M]
-            
-            # Initialize contributions tensor
-            contributions = t.zeros(
-                up_facts.shape[0], up_facts.shape[1], temp.shape[0], temp.shape[1],
-                device=up_facts.device, dtype=up_facts.dtype
-            )
-            
-            # Vectorized scatter add
-            contributions.scatter_add_(
-                dim=-1,
-                index=i_indices[None, None, None, :].expand_as(scaled),
-                src=scaled
-            )
-            
-            # Apply attention pattern mixing
-            probs = cache[f'blocks.{layer}.attn.hook_pattern']
-            final_contribs = einsum(probs, contributions, "b h q k, b k h f -> b q f")
-            return final_contribs
+        up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln1.hook_scale']
+        contributions_post_ov = einsum(up_facts_post_ln, virtual_weights,
+            "batch qpos f_up, n_heads f_down f_up -> batch n_heads qpos f_down")
+        
+        # Mix between positions using attention pattern
+        probs = cache[f'blocks.{layer}.attn.hook_pattern']
+        contributions = einsum(probs, contributions_post_ov,
+            "batch n_heads qpos kpos, batch n_heads qpos f_down -> batch kpos f_down")
+        
+        return contributions
     
     def forward_pruned(
         self,
@@ -524,8 +447,8 @@ class SCAESuite(nn.Module):
         with open(config_path, 'r') as f:
             config = json.load(f)
         
-        if config["connections"]:
-            connections = config["connections"]
+        # if config["connections"]:
+        #     connections = config["connections"]
 
         # Initialize suite
         suite = cls(
