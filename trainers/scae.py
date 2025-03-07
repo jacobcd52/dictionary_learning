@@ -167,6 +167,8 @@ class SCAESuite(nn.Module):
             contributions = up_facts_post_ln @ virtual_weights.T
             return contributions  # Added return statement here!
         else:
+            layer = int(down_name.split('_')[1])
+
             up_decoder = self.aes[up_name].decoder.weight
             down_encoder = self.aes[down_name].encoder.weight
             connection_mask = self.connection_masks[down_name][up_name]
@@ -184,7 +186,7 @@ class SCAESuite(nn.Module):
             up_facts_selected = up_facts[:, :, j_indices]  # [B, S, M]
             scaled = up_facts_selected * values[None, None, :]  # [B, S, M]
 
-            scaled_post_ln = scaled / cache[f'blocks.0.ln2.hook_scale']
+            scaled_post_ln = scaled / cache[f'blocks.{layer}.ln2.hook_scale']
             
             # Replace inplace scatter_add_ with functional scatter_add
             contributions = t.zeros(
@@ -410,6 +412,7 @@ class SCAESuite(nn.Module):
 
     def get_ce_loss(
             self,
+            cache,
             reconstructions: Dict[str, t.Tensor],
             tokens: t.Tensor,  # shape: [batch, seq]
         ) -> t.Tensor:
@@ -422,7 +425,8 @@ class SCAESuite(nn.Module):
         Returns:
             Cross entropy loss between predicted logits and target tokens
         """
-        resid_final = sum(reconstructions.values())
+        resid_final = sum(reconstructions.values()) 
+        resid_final += cache['blocks.0.hook_resid_pre'] # don't forget initial contribution! thanks logan
         logits = self.model.unembed(self.model.ln_final(resid_final))  # [batch, seq, n_vocab]
         
         # Shift sequences by 1

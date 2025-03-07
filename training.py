@@ -229,7 +229,7 @@ def train_scae_suite(
             tokens = tokens.to(device)
             module = get_module(suite)
             reconstructions = module.vanilla_forward(cache) if vanilla else module.forward_pruned(cache)
-            loss = module.get_ce_loss(reconstructions, tokens)
+            loss = module.get_ce_loss(cache, reconstructions, tokens)
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
