@@ -100,37 +100,6 @@ class SCAESuite(nn.Module):
             ).to(device=self.device, dtype=self.dtype)
             self.W_OVs.append(W_OV)
 
-    # def vanilla_forward(
-    #     self,
-    #     cache: Dict[str, t.Tensor],
-    # ) -> Dict[str, t.Tensor]:
-    #     """Forward pass that outputs reconstructions.
-        
-    #     Args:
-    #         cache: Dictionary mapping hook points to activation tensors
-            
-    #     Returns:
-    #         Dictionary of reconstructions matching input dimensions
-    #     """
-    #     results = {}
-        
-    #     for layer in range(self.model.cfg.n_layers):  # Divide by 2 since we have both attn and mlp for each layer
-    #         # Attention
-    #         attn_name = f'attn_{layer}'
-    #         attn_input = cache[f'blocks.{layer}.hook_attn_out']
-    #         feat = self.aes[attn_name].encode(attn_input)
-    #         recon = self.aes[attn_name].decode(feat)
-    #         results[attn_name] = recon
-            
-    #         # MLP
-    #         mlp_name = f'mlp_{layer}'
-    #         mlp_input = cache[f'blocks.{layer}.ln2.hook_normalized']
-    #         feat = self.aes[mlp_name].encode(mlp_input)
-    #         recon = self.aes[mlp_name].decode(feat)
-    #         results[mlp_name] = recon
-        
-    #     return results
-
     def get_initial_contribs_mlp(
         self,
         cache: ActivationCache,
@@ -145,10 +114,12 @@ class SCAESuite(nn.Module):
         Returns:
             Tensor of initial contributions to features
         """
+        assert 'mlp' in down_name
+        layer = int(down_name.split('_')[1])
         initial_act = cache['blocks.0.hook_resid_pre']  # [batch, seq, d_model]
         W_enc = self.aes[down_name].encoder.weight  # [n_features, d_model]
         
-        initial_act_post_ln = initial_act / cache[f'blocks.0.ln2.hook_scale']
+        initial_act_post_ln = initial_act / cache[f'blocks.{layer}.ln2.hook_scale']
         return initial_act_post_ln @ W_enc.T  # [batch, seq, n_features]
 
     def get_pruned_contribs_mlp(
@@ -158,6 +129,7 @@ class SCAESuite(nn.Module):
         down_name: str,
         up_facts: t.Tensor,
     ) -> t.Tensor:
+        assert 'mlp' in down_name
         
         layer = int(down_name.split('_')[1])
         up_decoder = self.aes[up_name].decoder.weight
@@ -167,7 +139,7 @@ class SCAESuite(nn.Module):
             virtual_weights = virtual_weights * self.connection_masks[down_name][up_name]
 
         up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln2.hook_scale']
-        contributions = up_facts_post_ln @ virtual_weights.T
+        contributions = up_facts_post_ln @ virtual_weights.T # TODO: check transpose
         return contributions  # Added return statement here!
             
     def get_initial_contribs_attn(
@@ -176,7 +148,7 @@ class SCAESuite(nn.Module):
             down_name: str,  # e.g. 'attn_1'
         ) -> t.Tensor:  # [batch, qpos, n_down_features]
             """Compute initial contributions for attention autoencoder from residual stream."""
-            from einops import einsum
+            assert 'attn' in down_name
             
             layer = int(down_name.split('_')[1])
             initial_act = cache['blocks.0.hook_resid_pre'] # [batch, seq, d_model]
@@ -207,7 +179,7 @@ class SCAESuite(nn.Module):
         up_facts: t.Tensor,
     ) -> t.Tensor:
         """Compute pruned contributions for attention autoencoder."""
-        from einops import einsum
+        assert 'attn' in down_name
 
         layer = int(down_name.split('_')[1])
         W_OV = self.W_OVs[layer]   
@@ -225,7 +197,7 @@ class SCAESuite(nn.Module):
         # Mix between positions using attention pattern
         probs = cache[f'blocks.{layer}.attn.hook_pattern']
         contributions = einsum(probs, contributions_post_ov,
-            "batch n_heads qpos kpos, batch n_heads qpos f_down -> batch kpos f_down")
+            "batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down")
         
         return contributions
     
