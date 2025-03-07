@@ -15,7 +15,7 @@ Given SAEs at various points in a model, we'd like each feature to depend on onl
 For testing, I pretrained some small (expansion=4) TopK SAEs for Pythia-70M, available at the HF repo jacobcd52/TinyStories-33M_suite_4. You can finetune them as follows:
 
 0. pip install -r requirements.txt
-1. gdown https://drive.google.com/drive/folders/1kxpZkpdL2Yhs3xnv2zhbDw-OnlBkzZcx?usp=sharing (this downloads files specifying feature-connectivity graphs, for various values of the number C of connections per feature. I got these connections by taking, for each feature, the top C upstream features with highest average contribution over a large dataset, .
+1. gdown --folder 1kxpZkpdL2Yhs3xnv2zhbDw-OnlBkzZcx (this downloads files specifying feature-connectivity graphs, for various values of the number C of connections per feature. I got these connections by taking, for each feature, the top C upstream features with highest average contribution over a large dataset).
 2. python run_finetuning.py (or run as a notebook). You'll need to enter a wandb key.
 
 **Code Structure**
