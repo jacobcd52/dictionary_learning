@@ -60,20 +60,35 @@ class SCAESuite(nn.Module):
         # Initialize and validate connections
         self.connections = connections
         self.connection_masks = {}
-        if isinstance(connections, dict):
+        self._process_connections()
+        
+        # Precompute W_OV matrices
+        self.W_OVs = []
+        for layer in range(model.cfg.n_layers):
+            W_O = model.W_O[layer]
+            W_V = model.W_V[layer]
+            W_OV = einsum(W_O, W_V,
+                "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
+            ).to(device=self.device, dtype=self.dtype)
+            self.W_OVs.append(W_OV)
+
+    def _process_connections(self):
+        """Process connections to create connection masks and validate input."""
+        if isinstance(self.connections, dict):
             processed_connections = {}
-            for down_name, up_dict in connections.items():
+            self.connection_masks = {}
+            for down_name, up_dict in self.connections.items():
                 processed_connections[down_name] = {}
                 self.connection_masks[down_name] = {}
                 for up_name, conn_tensor in up_dict.items():
                     # Verify indices are valid
-                    valid_indices = (conn_tensor >= -1) & (conn_tensor < n_features)
+                    valid_indices = (conn_tensor >= -1) & (conn_tensor < self.n_features)
                     assert valid_indices.all(), \
                         f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
                     
                     processed_connections[down_name][up_name] = conn_tensor.to(device=self.device, dtype=t.long)
                     
-                    # Vectorized connection mask creation (3B)
+                    # Vectorized connection mask creation
                     valid_connections = conn_tensor != -1
                     n_features = conn_tensor.shape[0]
                     
@@ -88,17 +103,8 @@ class SCAESuite(nn.Module):
                     
                     self.connection_masks[down_name][up_name] = connection_mask
             self.connections = processed_connections
-        elif connections is not None and connections != "all":
+        elif self.connections is not None and self.connections != "all":
             raise ValueError("connections must be either None, 'all', or a dictionary of connection tensors")
-        # Precompute W_OV matrices
-        self.W_OVs = []
-        for layer in range(model.cfg.n_layers):
-            W_O = model.W_O[layer]
-            W_V = model.W_V[layer]
-            W_OV = einsum(W_O, W_V,
-                "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
-            ).to(device=self.device, dtype=self.dtype)
-            self.W_OVs.append(W_OV)
 
     def get_initial_contribs_mlp(
         self,
@@ -189,7 +195,6 @@ class SCAESuite(nn.Module):
             "f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up")
         if self.connections is not None:
             virtual_weights = virtual_weights * self.connection_masks[down_name][up_name].unsqueeze(0)
-        
         up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln1.hook_scale']
         contributions_post_ov = einsum(up_facts_post_ln, virtual_weights,
             "batch qpos f_up, n_heads f_down f_up -> batch n_heads qpos f_down")
@@ -198,7 +203,6 @@ class SCAESuite(nn.Module):
         probs = cache[f'blocks.{layer}.attn.hook_pattern']
         contributions = einsum(probs, contributions_post_ov,
             "batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down")
-        
         return contributions
     
     def forward_pruned(
@@ -359,23 +363,21 @@ class SCAESuite(nn.Module):
         config = {
             "k": self.k,
             "n_features": self.n_features,
-            "connections": self.connections
         }
         
-        # Save config
-        import json
+        # Save config and state dict with connections
         import tempfile
         import os
         
         with tempfile.TemporaryDirectory() as tmp_dir:
-            # Save config
             config_path = os.path.join(tmp_dir, "config.json")
             with open(config_path, 'w') as f:
                 json.dump(config, f)
             
-            # Save state dict
             checkpoint_path = os.path.join(tmp_dir, "checkpoint.pt")
-            t.save(self.state_dict(), checkpoint_path)
+            state_dict = self.state_dict()
+            state_dict['connections'] = self.connections
+            t.save(state_dict, checkpoint_path)
             
             # Upload files
             api = HfApi()
@@ -400,6 +402,7 @@ class SCAESuite(nn.Module):
         Args:
             repo_id: HuggingFace repository ID containing the saved model
             model: TransformerLens model
+            connections: Optional connections to override loaded ones
             device: Device to load the model on
             dtype: Data type for model parameters
             
@@ -419,10 +422,7 @@ class SCAESuite(nn.Module):
         with open(config_path, 'r') as f:
             config = json.load(f)
         
-        # if config["connections"]:
-        #     connections = config["connections"]
-
-        # Initialize suite
+        # Initialize suite with possible user-provided connections
         suite = cls(
             model=model,
             k=config["k"],
@@ -436,8 +436,19 @@ class SCAESuite(nn.Module):
         checkpoint_path = hf_hub_download(repo_id=repo_id, filename="checkpoint.pt")
         state_dict = t.load(checkpoint_path, map_location='cpu')
         
-        # Load state dict into suite
-        missing_keys, unexpected_keys = suite.load_state_dict(state_dict)
+        # Extract connections from state_dict if present
+        loaded_connections = state_dict.pop('connections', None)
+        
+        # Handle connections override
+        if loaded_connections is not None:
+            if connections is not None:
+                print("Warning: Provided connections argument overrides the loaded connections from HuggingFace.")
+            else:
+                suite.connections = loaded_connections
+                suite._process_connections()
+        
+        # Load the state_dict into the suite
+        missing_keys, unexpected_keys = suite.load_state_dict(state_dict, strict=False)
         
         if len(missing_keys) > 0:
             print(f"Warning: Missing keys in state dict: {missing_keys}")

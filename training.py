@@ -94,7 +94,22 @@ def train_scae_suite(
         model_name: Name of the transformer model to use
         k: Number of features to select for each autoencoder (required if repo_id_in not provided)
         expansion: Factor to multiply model.cfg.d_model by to get n_features (required if repo_id_in not provided)
-        ...
+        loss_type: Type of loss to use, either "mse" or "ce"
+        base_lr: Base learning rate for training
+        steps: Total number of training steps
+        connections: Optional dictionary specifying sparse connections
+        save_steps: Interval for saving checkpoints
+        save_dir: Directory to save checkpoints and final model
+        log_steps: Interval for logging metrics
+        use_wandb: Whether to use Weights & Biases for logging
+        repo_id_in: HuggingFace repository ID to load a pretrained model from
+        repo_id_out: HuggingFace repository ID to upload the trained model to
+        dtype: Data type for model parameters
+        device: Device to use for training
+        seed: Random seed for reproducibility
+        wandb_project_name: Name of the Weights & Biases project
+        lr_decay_start_proportion: Proportion of training steps after which learning rate decay starts
+        vanilla: Whether to use vanilla autoencoders (no connections)
     """
     if loss_type not in ["mse", "ce"]:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'mse' or 'ce'")
@@ -110,6 +125,7 @@ def train_scae_suite(
     model = HookedTransformer.from_pretrained(model_name, device=device, dtype=dtype)
     
     if repo_id_in is None:
+        # New training initialization
         if k is None or expansion is None:
             raise ValueError("k and expansion must be provided when not loading a pretrained model")
         
@@ -129,13 +145,15 @@ def train_scae_suite(
             "is_pretrained": False
         }
     else:      
+        # Simplified loading - let SCAESuite.from_pretrained handle connections
         suite = SCAESuite.from_pretrained(
             repo_id=repo_id_in,
             model=model,
+            connections=connections,  # Let class handle override logic
             device=device,
-            dtype=dtype,
-            connections=connections
+            dtype=dtype
         )
+        
         # Calculate expansion from loaded n_features
         config_dict = {
             "k": suite.k,
@@ -212,7 +230,7 @@ def train_scae_suite(
                 total_variance = t.var(target, dim=0).sum()
                 residual_variance = t.var(target - recon, dim=0).sum()
                 fvu_loss = residual_variance / total_variance
-                total_loss = total_loss + fvu_loss #* 2**(9-3*layer) # weight early layers higher
+                total_loss = total_loss + fvu_loss
                 losses[name] = fvu_loss.item()
             
             loss = total_loss
@@ -270,9 +288,11 @@ def train_scae_suite(
         final_dir = os.path.join(save_dir, "final")
         os.makedirs(final_dir, exist_ok=True)
         
+        # Unwrap suite if needed for final save
+        state_dict = suite.module.state_dict() if isinstance(suite, t.nn.DataParallel) else suite.state_dict()
         t.save(
             {
-                'suite_state': suite.state_dict(),
+                'suite_state': state_dict,
                 'optimizer_state': optimizer.state_dict(),
                 'scheduler_state': scheduler.state_dict(),
                 'step': step if step is not None else -1,
@@ -282,7 +302,8 @@ def train_scae_suite(
     
     # Upload to HuggingFace if requested
     if repo_id_out is not None:
-        suite.upload_to_hf(repo_id_out)
+        module = suite.module if isinstance(suite, t.nn.DataParallel) else suite
+        module.upload_to_hf(repo_id_out)
     
     if use_wandb:
         wandb.finish()

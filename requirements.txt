@@ -10,5 +10,6 @@ tqdm>=4.66.1
 umap-learn>=0.5.6
 zstandard>=0.22.0
 transformer-lens>=2.14.1
+huggingface-hub>=0.29.2
 wandb
 gdown
