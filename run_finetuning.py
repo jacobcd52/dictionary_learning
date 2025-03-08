@@ -15,7 +15,7 @@ device = "cuda:0" if t.cuda.is_available() else "cpu"
 #%%
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
-num_tokens = int(10e6)
+num_tokens = int(100e6)
 batch_size = 256
 expansion = 4
 ctx_len = 128
@@ -46,19 +46,19 @@ with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{n
 trainer = train_scae_suite(
     buffer,
     model_name=MODEL_NAME,
-    k=128,
+    # k=128,
     base_lr=1e-3,
-    expansion=expansion,
-    loss_type="mse",
-    connections=connections,
+    # expansion=expansion,
+    loss_type="ce",
+    # connections=connections,
     steps=num_tokens // (batch_size * ctx_len),
     save_steps = 1000,
     dtype = DTYPE,
     device=device,
-    log_steps = 20,
-    use_wandb = False,
-    repo_id_in='jacobcd52/TinyStories-33M_suite_4',
-    repo_id_out = f"jacobcd52/TinyStories-33M_scae_{num_connections}_mse",
-    wandb_project_name="tinystories33m_scae_4",
+    log_steps = 1,
+    use_wandb = True,
+    repo_id_in=f"jacobcd52/TinyStories-33M_scae_{num_connections}_mse", #'jacobcd52/TinyStories-33M_suite_4',
+    repo_id_out = f"jacobcd52/TinyStories-33M_scae_{num_connections}_ce",
+    wandb_project_name="tinystories33m_scae_5",
 )
 # %%
