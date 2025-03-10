@@ -83,6 +83,7 @@ def train_scae_suite(
     device: Optional[str] = None,
     seed: Optional[int] = None,
     wandb_project_name: str = "scae",
+    wandb_run_name: Optional[str] = None,
     lr_decay_start_proportion: float = 0.8,
     vanilla: bool = False,
 ):
@@ -108,6 +109,7 @@ def train_scae_suite(
         device: Device to use for training
         seed: Random seed for reproducibility
         wandb_project_name: Name of the Weights & Biases project
+        wandb_run_name: Name of the Weights & Biases run
         lr_decay_start_proportion: Proportion of training steps after which learning rate decay starts
         vanilla: Whether to use vanilla autoencoders (no connections)
     """
@@ -196,6 +198,7 @@ def train_scae_suite(
         wandb.init(
             project=wandb_project_name,
             config=config_dict,
+            name=wandb_run_name,
         )
     
     # Training loop

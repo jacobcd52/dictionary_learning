@@ -344,12 +344,13 @@ class SCAESuite(nn.Module):
         return loss
             
 
-    def upload_to_hf(self, repo_id: str):
+    def upload_to_hf(self, repo_id: str, private: bool = False):
         """
-        Upload the model to HuggingFace Hub.
+        Upload the model to HuggingFace Hub. Creates the repository if it doesn't exist.
         
         Args:
             repo_id: HuggingFace repository ID to upload to
+            private: Whether the repository should be private if created (default: False)
         """
         try:
             from huggingface_hub import HfApi
@@ -381,11 +382,23 @@ class SCAESuite(nn.Module):
             
             # Upload files
             api = HfApi()
+            
+            # Check if repo exists and create it if it doesn't
+            try:
+                api.repo_info(repo_id=repo_id, repo_type="model")
+            except Exception:  # Repository doesn't exist
+                api.create_repo(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    private=private
+                )
+                
             api.upload_folder(
                 folder_path=tmp_dir,
                 repo_id=repo_id,
                 repo_type="model"
             )
+            
 
     @classmethod
     def from_pretrained(
