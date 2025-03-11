@@ -50,7 +50,15 @@ class SimpleBuffer:
         """
         while True:  # Keep trying until we get a full batch
             try:
-                batch = [next(self.data) for _ in range(self.batch_size)]
+                batch = []
+                for _ in range(self.batch_size):
+                    found=False
+                    while not found:
+                        text = next(self.data)
+                        tokens = self.model.to_tokens([text], prepend_bos=True)
+                        if tokens.shape[1] >= self.ctx_len:
+                            batch.append(text)
+                            found=True
                 tokens = self.model.to_tokens(batch, prepend_bos=True)[:, :self.ctx_len]
                 with t.no_grad():
                     loss, cache = self.model.run_with_cache(
