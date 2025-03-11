@@ -291,10 +291,11 @@ class SCAESuite(nn.Module):
             
             # Get top k features (no inplace scatter)
             top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
-            
+            top_vals = t.relu(top_vals)
+
             # Avoid inplace zeroing: create a new feat_buffer
             feat_buffer = t.zeros_like(feat_buffer)
-            
+
             # Avoid inplace scatter: create a new tensor
             feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
             
