@@ -14,6 +14,8 @@ device = "cuda:0"
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
 ctx_len = 128
+k = 64
+expansion = 4
 
 num_tokens = int(100e6)
 batch_size = 256
@@ -46,15 +48,19 @@ for num_connections in [10, 30, 100]:
     if in_type == "":
         with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
             connections = pickle.load(f)
+        k=k
+        expansion=expansion
     else:
         connections = None
+        k = None
+        expansion = None
     
 
     #%%
     trainer = train_scae_suite(
         buffer,
-        k=64,
-        expansion=4,
+        k=k,
+        expansion=expansion,
         model_name=MODEL_NAME,
         base_lr=1e-3,
         loss_type=out_type,

@@ -30,7 +30,8 @@ class SimpleBuffer:
         self.ctx_len = ctx_len
         self.batch_size = batch_size
         self.device = device
-        self.dtype = dtype        
+        self.dtype = dtype     
+        self.prepend_bos = prepend_bos   
 
         self.hook_list = ['blocks.0.hook_resid_pre']
         for layer in range(self.model.cfg.n_layers):
@@ -56,11 +57,11 @@ class SimpleBuffer:
                     found=False
                     while not found:
                         text = next(self.data)
-                        tokens = self.model.to_tokens([text], prepend_bos=prepend_bos)
+                        tokens = self.model.to_tokens([text], prepend_bos=self.prepend_bos)
                         if tokens.shape[1] >= self.ctx_len:
                             batch.append(text)
                             found=True
-                tokens = self.model.to_tokens(batch, prepend_bos=prepend_bos)[:, :self.ctx_len]
+                tokens = self.model.to_tokens(batch, prepend_bos=self.prepend_bos)[:, :self.ctx_len]
                 with t.no_grad():
                     loss, cache = self.model.run_with_cache(
                         tokens, 
