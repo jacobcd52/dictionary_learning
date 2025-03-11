@@ -254,9 +254,17 @@ def train_scae_suite(
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
-                wandb.log({
-                    "ce": loss.item(),
-                }, step=step)
+                if(not vanilla):
+                    # Calculate CE-diff
+                    original_loss = suite.model(tokens, return_type="loss")
+                    wandb.log({
+                        "ce_diff": loss.item() - original_loss.item(),
+                        "ce": loss.item(),
+                    }, step=step)
+                else:
+                    wandb.log({
+                        "ce": loss.item(),
+                    }, step=step)
         
         # Backward pass and optimization
         loss.backward()
