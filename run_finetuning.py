@@ -14,7 +14,6 @@ device = "cuda:0"
 DTYPE = t.bfloat16
 MODEL_NAME = "roneneldan/TinyStories-33M"
 ctx_len = 128
-k = 64
 
 num_tokens = int(100e6)
 batch_size = 256
@@ -39,7 +38,8 @@ for num_connections in [10, 30, 100]:
         device=device,
         batch_size=batch_size,
         dtype=DTYPE,
-        ctx_len=ctx_len
+        ctx_len=ctx_len,
+        prepend_bos=False
     ) 
 
     #%%
@@ -53,6 +53,8 @@ for num_connections in [10, 30, 100]:
     #%%
     trainer = train_scae_suite(
         buffer,
+        k=64,
+        expansion=4,
         model_name=MODEL_NAME,
         base_lr=1e-3,
         loss_type=out_type,

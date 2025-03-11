@@ -16,6 +16,7 @@ class SimpleBuffer:
             model_name: str,
             ctx_len: int = 128,
             batch_size: int = 512,
+            prepend_bos: bool = True,
             device: str = "cpu",
             dtype: t.dtype = t.float32,
         ):
@@ -55,11 +56,11 @@ class SimpleBuffer:
                     found=False
                     while not found:
                         text = next(self.data)
-                        tokens = self.model.to_tokens([text], prepend_bos=True)
+                        tokens = self.model.to_tokens([text], prepend_bos=prepend_bos)
                         if tokens.shape[1] >= self.ctx_len:
                             batch.append(text)
                             found=True
-                tokens = self.model.to_tokens(batch, prepend_bos=True)[:, :self.ctx_len]
+                tokens = self.model.to_tokens(batch, prepend_bos=prepend_bos)[:, :self.ctx_len]
                 with t.no_grad():
                     loss, cache = self.model.run_with_cache(
                         tokens, 
