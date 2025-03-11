@@ -208,6 +208,7 @@ class SCAESuite(nn.Module):
     def forward_pruned(
         self,
         cache: ActivationCache,
+        return_features = False, 
     ) -> Dict[str, t.Tensor]:
         """Forward pass computing sparse reconstructions."""
         reconstructions = {}
@@ -307,6 +308,8 @@ class SCAESuite(nn.Module):
             del top_vals, top_idx
             t.cuda.empty_cache()
         
+        if(return_features):
+            return reconstructions, pruned_features
         return reconstructions
 
     def get_ce_loss(
