@@ -20,7 +20,7 @@ expansion = 4
 num_tokens = int(100e6)
 batch_size = 256
 in_type = ""
-out_type = "ce"
+out_type = "mse"
 
 
 #%%
@@ -59,6 +59,7 @@ for num_connections in [10, 30, 100]:
     #%%
     trainer = train_scae_suite(
         buffer,
+        stagger_steps=50,
         k=k,
         expansion=expansion,
         model_name=MODEL_NAME,

@@ -86,6 +86,7 @@ def train_scae_suite(
     wandb_run_name: Optional[str] = None,
     lr_decay_start_proportion: float = 0.8,
     vanilla: bool = False,
+    stagger_steps: Optional[int] = None,
 ):
     """
     Train a Sparse Connected Autoencoder Suite.
@@ -112,6 +113,7 @@ def train_scae_suite(
         wandb_run_name: Name of the Weights & Biases run
         lr_decay_start_proportion: Proportion of training steps after which learning rate decay starts
         vanilla: Whether to use vanilla autoencoders (no connections)
+        stagger_steps: If provided, number of steps to wait before introducing each new loss term
     """
     if loss_type not in ["mse", "ce"]:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'mse' or 'ce'")
@@ -184,7 +186,8 @@ def train_scae_suite(
             "batch_size": buffer.batch_size,
         },
         "loss_type": loss_type,
-        "vanilla": vanilla  # Add vanilla to config
+        "vanilla": vanilla,  # Add vanilla to config
+        "stagger_steps": stagger_steps  # Add stagger_steps to config
     })
     
     # Save initial config if requested
@@ -200,6 +203,26 @@ def train_scae_suite(
             config=config_dict,
             name=wandb_run_name,
         )
+    
+    # Define helper function to determine if a component should be included in the loss
+    def get_loss_scale(name, step):
+        if stagger_steps is None:
+            return 1.0  # No staggering, use all components
+        
+        # Determine the expected ordering of components for staggering
+        # First, extract layer number and type (attn or mlp)
+        parts = name.split('_')
+        layer_num = int(parts[1])
+        is_attn = 'attn' in name
+        
+        # Calculate the position in the sequence
+        pos = 2 * layer_num + (0 if is_attn else 1)
+        
+        # If the current step is beyond the step where this component should be included
+        if step >= pos * stagger_steps:
+            return 1.0  # Include this component
+        else:
+            return 0.0  # Zero out this component
     
     # Training loop
     from itertools import count
@@ -219,6 +242,7 @@ def train_scae_suite(
             # Compute MSE loss using FVU
             total_loss = 0
             losses = {}
+            scales = {}
             
             for name, recon in reconstructions.items():
                 layer = int(name.split('_')[1])
@@ -233,8 +257,13 @@ def train_scae_suite(
                 total_variance = t.var(target, dim=0).sum()
                 residual_variance = t.var(target - recon, dim=0).sum()
                 fvu_loss = residual_variance / total_variance
-                total_loss = total_loss + fvu_loss
+                
+                # Apply scaling factor based on step and component
+                scale = get_loss_scale(name, step)
+                total_loss = total_loss + scale * fvu_loss
+                
                 losses[name] = fvu_loss.item()
+                scales[name] = scale
             
             loss = total_loss
             
@@ -242,6 +271,7 @@ def train_scae_suite(
             if log_steps is not None and step % log_steps == 0 and use_wandb:
                 wandb.log({
                     **{f"FVU/{name}": value for name, value in losses.items()},
+                    **{f"Scale/{name}": value for name, value in scales.items()},
                     "loss": loss.item()
                 }, step=step)
                 
