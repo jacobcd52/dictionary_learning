@@ -1,0 +1,25 @@
+[project]
+name = "dictionary-learning"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "circuitsvis>=1.43.2",
+    "datasets>=2.18.0",
+    "einops>=0.7.0",
+    "flash-attn>=2.7.4.post1",
+    "gdown>=5.2.0",
+    "huggingface-hub[cli,hf-transfer]>=0.29.2",
+    "ipykernel>=6.29.5",
+    "matplotlib>=3.8.3",
+    "nnsight==0.3.7",
+    "pandas>=2.2.1",
+    "plotly>=5.18.0",
+    "torch>=2.1.2",
+    "tqdm>=4.66.1",
+    "transformer-lens>=2.15.0",
+    # "transformer-lens>=2.14.1",
+    "wandb>=0.19.8",
+    "zstandard>=0.22.0",
+]

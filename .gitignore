@@ -176,3 +176,6 @@ experiment*
 run_experiment.sh
 nohup.out
 *.zip
+
+# uv
+uv.lock
