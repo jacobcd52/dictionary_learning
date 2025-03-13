@@ -1,3 +1,3 @@
-from .top_k import AutoEncoderTopK, TrainerTopK
+from .top_k import AutoEncoderTopK
 
-__all__ = ["AutoEncoderTopK", "TrainerTopK"]
+__all__ = ["AutoEncoderTopK"]

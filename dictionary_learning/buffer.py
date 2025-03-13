@@ -1,11 +1,69 @@
 import torch as t
-from nnsight import LanguageModel
-from tqdm import tqdm
-from utils import get_modules
 from transformer_lens import HookedTransformer, ActivationCache
-from collections import namedtuple
-import torch as t
-from typing import Dict, Iterator, Union, Tuple, Any
+from typing import Iterator, Union, Tuple
+from transformers import PreTrainedTokenizerBase
+from datasets import load_dataset
+
+from multiprocessing import cpu_count
+
+# from gpt_neo import GPTNeoModel
+
+def chunk_and_tokenize(
+    data,
+    tokenizer: PreTrainedTokenizerBase,
+    format: str = "torch",
+    num_proc: int = cpu_count() // 2,
+    text_key: str = "text",
+    max_seq_len: int = 2048,
+    # load_from_cache_file: bool = True,
+):
+    def _tokenize_fn(x: dict[str, list]):
+        chunk_size = min(tokenizer.model_max_length, max_seq_len)
+        batch_encoding = tokenizer(
+            # Concatenate all the samples together, separated by the EOS token.
+            x[text_key],  # start with an eos token
+            max_length=chunk_size,
+            return_attention_mask=False,
+            padding=True,
+            truncation=True,
+        )
+        tokens = batch_encoding["input_ids"]
+        mask = ~(tokens == tokenizer.pad_token_id).any(dim=1)
+        tokens = tokens[mask][:2]
+
+        return tokens
+
+    data = data.map(
+        _tokenize_fn,
+        # Batching is important for ensuring that we don't waste tokens
+        # since we always throw away the last element of the batch we
+        # want to keep the batch size as large as possible
+        batched=True,
+        batch_size=2048,
+        num_proc=num_proc,
+        # load_from_cache_file=load_from_cache_file,
+    )
+    return data.with_format(format, columns=["input_ids"])
+
+# class Buffer: 
+#     def __init__(
+#         self,
+#         device: str = "cuda:0",
+#         dataset_id: str = "roneneldan/TinyStories",
+#         cache_ctx_len: int = 1024,
+#         n_tokens: int = 10_000_000,
+#         torch_dtype: t.dtype = t.bfloat16,
+#     ):
+
+#         model = GPTNeoModel.from_pretrained("roneneldan/TinyStories-33M", device=device)
+#         self.model = t.compile(model)
+
+#         self.tokens = self.tokenize(dataset_id)
+
+#     def tokenize(self, dataset_id: str) -> t.Tensor:
+#         dataset = load_dataset(dataset_id, split="train")
+
+
 
 
 
