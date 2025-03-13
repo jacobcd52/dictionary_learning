@@ -12,7 +12,7 @@ login("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")
 device = "cuda:0"
 #%%
 DTYPE = t.bfloat16
-MODEL_NAME = "roneneldan/TinyStories-33M"
+MODEL_NAME = "pythia-70m"
 ctx_len = 128
 k = 64
 expansion = 4
@@ -20,20 +20,19 @@ lr=2e-3
 lr_decay_start_proportion = 0.2
 num_tokens = int(100e6)
 batch_size = 256
-in_type = "mse"
+in_type = ""
 out_type = "ce"
-
 
 #%%
 for num_connections in [100]:
     if in_type == "":
         repo_id_in = None
     else:
-        repo_id_in = f"jacobcd52/TinyStories-33M_scae_{num_connections}_{in_type}"
-    repo_id_out = f"jacobcd52/TinyStories-33M_scae_{num_connections}_{in_type}_{out_type}"
+        repo_id_in = f"jacobcd52/pythia-70m_scae_{num_connections}_{in_type}"
+    repo_id_out = f"jacobcd52/pythia-70m_scae_{num_connections}_{in_type}_{out_type}"
 
     #%%
-    data = load_iterable_dataset('roneneldan/TinyStories')
+    data = load_iterable_dataset('monology/pile-uncopyrighted', streaming=True)
 
     buffer = SimpleBuffer(
         data=data,
@@ -49,6 +48,10 @@ for num_connections in [100]:
     if in_type == "":
         with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
             connections = pickle.load(f)
+            connections = generate_fake_connections(connections, num_features=512*expansion)
+            for down_name in connections:
+                for up_name in connections[down_name]:
+                    connections[down_name][up_name] = connections[down_name][up_name][:512*4, :512*4].to(device)
         k=k
         expansion=expansion
     else:
@@ -74,7 +77,7 @@ for num_connections in [100]:
         use_wandb = True,
         repo_id_in=repo_id_in,
         repo_id_out = repo_id_out,
-        wandb_project_name="tinystories33m_scae_6",
+        wandb_project_name="pythia70_scae_2",
         wandb_run_name=f"c{num_connections} b{batch_size} decay{lr_decay_start_proportion} lr{lr} {in_type} {out_type}",
         save_dir = "/root/dictionary_learning/checkpoints/"
     )

@@ -85,14 +85,20 @@ def load_model_with_folded_ln2(
 
 def load_iterable_dataset(
         hf_name,
-        streaming=True
+        streaming=True,
+        load_dataset_args=[]
         ):
     dataset = load_dataset(
         hf_name, 
         split='train', 
         streaming=streaming,
-        trust_remote_code=True
+        trust_remote_code=True,
+        *load_dataset_args
         )
+    if streaming:
+        dataset = dataset.shuffle(buffer_size=10_000, seed=42)
+    else:
+        dataset = dataset.shuffle(seed=42)
 
     class CustomData():
         def __init__(self, dataset):

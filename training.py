@@ -30,15 +30,6 @@ def initialize_optimizers(suite, base_lr):
     ], betas=(0.9, 0.999))
     return optimizer, lrs
 
-def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
-    """Create learning rate scheduler with linear decay"""
-    def lr_fn(step):
-        if step < lr_decay_start_proportion * steps:
-            return 1.0
-        return (steps - step) / (steps - lr_decay_start_proportion * steps)
-    
-    return t.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
-
 """
 Training for Sparsely-Connected AutoEncoder Suite
 """
@@ -55,12 +46,15 @@ from transformer_lens import HookedTransformer
 
 from trainers.scae import SCAESuite
 
-def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
+def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion, lr_warmup_end_proportion):
     """Create learning rate scheduler with linear decay"""
     def lr_fn(step):
-        if step < lr_decay_start_proportion * steps:
+        if step < lr_warmup_end_proportion * steps:
+            return step / (lr_warmup_end_proportion * steps)
+        elif step < lr_decay_start_proportion * steps:
             return 1.0
-        return (steps - step) / (steps - lr_decay_start_proportion * steps)
+        else:
+            return (steps - step) / (steps - lr_decay_start_proportion * steps)
     
     return t.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_fn)
 
@@ -85,6 +79,7 @@ def train_scae_suite(
     wandb_project_name: str = "scae",
     wandb_run_name: Optional[str] = None,
     lr_decay_start_proportion: float = 0.8,
+    lr_warmup_end_proportion: float = 0.0,
     vanilla: bool = False,
 ):
     """
@@ -171,7 +166,7 @@ def train_scae_suite(
     
     # Initialize optimizer and scheduler
     optimizer, lrs = initialize_optimizers(suite, base_lr)
-    scheduler = get_lr_scheduler(optimizer, steps, lr_decay_start_proportion)
+    scheduler = get_lr_scheduler(optimizer, steps, lr_decay_start_proportion, lr_warmup_end_proportion)
     
     # Add remaining config information
     config_dict.update({

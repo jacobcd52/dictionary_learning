@@ -1,5 +1,6 @@
 # SAE checkpoints
 sae_checkpoints/
+checkpoints/
 noteboooks/importance_scores
 
 tinystories_connections
