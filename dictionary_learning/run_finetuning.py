@@ -2,7 +2,7 @@
 from buffer import SimpleBuffer
 from training import train_scae_suite
 from utils import load_iterable_dataset
-from find_top_connections import generate_fake_connections
+# from find_top_connections import generate_fake_connections
 
 import torch as t
 from huggingface_hub import login

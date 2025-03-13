@@ -14,7 +14,7 @@ import gc
 import pickle
 from pathlib import Path
 
-from trainers.scae import SCAESuite
+from dictionary_learning.scae import SCAESuite
 from buffer import AllActivationBuffer
 from utils import load_model_with_folded_ln2, load_iterable_dataset
 from find_top_connections import get_importance_scores, get_valid_pairs, process_pair

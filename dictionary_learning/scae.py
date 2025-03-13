@@ -7,7 +7,7 @@ import numpy as np
 import json
 from einops import einsum
 
-from trainers.top_k import AutoEncoderTopK
+from .top_k import AutoEncoderTopK
 from transformer_lens import ActivationCache
 
 

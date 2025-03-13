@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 import wandb
 from transformer_lens import HookedTransformer
 
-from trainers.scae import SCAESuite
+from dictionary_learning.scae import SCAESuite
 
 def get_module(model):
     return model.module if isinstance(model, t.nn.DataParallel) else model
@@ -53,7 +53,7 @@ from tqdm.auto import tqdm
 import wandb
 from transformer_lens import HookedTransformer
 
-from trainers.scae import SCAESuite
+from dictionary_learning.scae import SCAESuite
 
 def get_lr_scheduler(optimizer, steps, lr_decay_start_proportion):
     """Create learning rate scheduler with linear decay"""
