@@ -60,6 +60,7 @@ for num_connections in [100]:
     #%%
     trainer = train_scae_suite(
         buffer,
+        stagger_steps=50,
         k=k,
         expansion=expansion,
         model_name=MODEL_NAME,
