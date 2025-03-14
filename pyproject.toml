@@ -17,6 +17,7 @@ dependencies = [
     "pandas>=2.2.1",
     "plotly>=5.18.0",
     "torch>=2.1.2",
+    "torchtyping>=0.1.4",
     "tqdm>=4.66.1",
     "transformer-lens>=2.15.0",
     "wandb>=0.19.8",

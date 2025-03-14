@@ -1,6 +1,6 @@
 """PyTorch GPT Neo model."""
 
-from typing import Optional, NamedTuple
+from typing import Optional, NamedTuple, List
 
 import torch
 import torch.utils.checkpoint
@@ -181,13 +181,17 @@ class GPTNeoLayerNorm(nn.Module):
         return ((x / scale).to(original_dtype), scale)
 
 
-class GPTNeoHiddenStates(NamedTuple):
+class GPTNeoBlockHiddenStates(NamedTuple):
     layer: int
     attn_output: torch.Tensor
     attn_weights: torch.Tensor
     mlp_output: torch.Tensor
     ln_1_scale: torch.Tensor
     ln_2_scale: torch.Tensor
+
+class GPTNeoHiddenStates(NamedTuple):
+    embed_out: torch.Tensor
+    block_hidden_states: List[GPTNeoBlockHiddenStates]
 
 
 class GPTNeoBlock(nn.Module):
@@ -219,7 +223,7 @@ class GPTNeoBlock(nn.Module):
         # residual connection
         hidden_states = residual + mlp_output
 
-        return hidden_states, GPTNeoHiddenStates(
+        return hidden_states, GPTNeoBlockHiddenStates(
             self.layer_id,
             attn_output,
             attn_weights,
@@ -290,46 +294,66 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def fold_ln(self):
+    def fold_ln(self, device: str, dtype: torch.dtype):
+        from einops import reduce
+
+        assert self.h[0].attn.attention.q_proj.bias is None, "fold_ln assumes attn has no bias"
         for layer in range(self.config.num_layers):
-            # Fold ln_1
-            g = self.h[layer].ln_1.weight.data.clone()
-            # c = self.h[layer].ln_1.bias.data.clone()
+            # 1) Fold ln_1 into attention weights
+            # Note attention weight matrices do not have biases
+            W_ln_1 = self.h[layer].ln_1.weight.data.clone()
 
             W_Q = self.h[layer].attn.attention.q_proj.weight.data.clone()
-            # b_Q = self.h[layer].attn.attention.q_proj.bias.data.clone()
-
-            self.h[layer].attn.attention.q_proj.weight.data = (
-                W_Q.T * g.unsqueeze(1)
-            ).T
-            # self.h[layer].attn.attention.q_proj.bias.data = b_Q + W_Q @ c
-
             W_K = self.h[layer].attn.attention.k_proj.weight.data.clone()
-            # b_K = self.h[layer].attn.attention.k_proj.bias.data.clone()
-
-            self.h[layer].attn.attention.k_proj.weight.data = (
-                W_K.T * g.unsqueeze(1)
-            ).T
-            # self.h[layer].attn.attention.k_proj.bias.data = b_K + W_K @ c
-
             W_V = self.h[layer].attn.attention.v_proj.weight.data.clone()
-            # b_V = self.h[layer].attn.attention.v_proj.bias.data.clone()
 
-            self.h[layer].attn.attention.v_proj.weight.data = (
-                W_V.T * g.unsqueeze(1)
-            ).T
-            # self.h[layer].attn.attention.v_proj.bias.data = b_V + W_V @ c
+            W_Q = (
+                W_Q * W_ln_1[None, :, None]
+            )
+            W_K = (
+                W_K * W_ln_1[None, :, None]
+            )
+            W_V = (
+                W_V * W_ln_1[None, :, None]
+            )
 
-            # Fold ln_2
-            g = self.h[layer].ln_2.weight.data.clone()
-            c = self.h[layer].ln_2.bias.data.clone()
-            W = self.h[layer].mlp.c_fc.weight.data.clone()
-            b = self.h[layer].mlp.c_fc.bias.data.clone()
+            # Center weights
+            self.h[layer].attn.attention.q_proj.weight.data = W_Q - reduce(
+                W_Q,
+                "head_index d_model d_head -> head_index 1 d_head",
+                "mean",
+            )
+            self.h[layer].attn.attention.k_proj.weight.data = W_K - reduce(
+                W_K,
+                "head_index d_model d_head -> head_index 1 d_head",
+                "mean",
+            )
+            self.h[layer].attn.attention.v_proj.weight.data = W_V - reduce(
+                W_V,
+                "head_index d_model d_head -> head_index 1 d_head",
+                "mean",
+            )
 
-            self.h[layer].mlp.c_fc.weight.data = (W.T * g.unsqueeze(1)).T
-            self.h[layer].mlp.c_fc.bias.data = b + W @ c
+            # 2) Fold ln_2 into MLP weights
 
-        self.to(torch.bfloat16)
+            W_ln_2 = self.h[layer].ln_2.weight.data.clone()
+            b_ln_2 = self.h[layer].ln_2.bias.data.clone()
+            W_mlp = self.h[layer].mlp.c_fc.weight.data.clone()
+            b_mlp = self.h[layer].mlp.c_fc.bias.data.clone()
+
+            b_mlp = b_mlp + (
+                W_mlp * b_ln_2[:, None]
+            ).sum(-2)
+
+            W_mlp = W_mlp * W_ln_2[:, None]
+            
+
+
+
+
+
+
+        self.to(device=device, dtype=dtype)
 
     def get_input_embeddings(self):
         return self.wte
@@ -350,10 +374,10 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
             device=inputs_embeds.device,
         ).unsqueeze(0)
         position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        embed_out = inputs_embeds + position_embeds
 
-        hidden_states = self.drop(hidden_states)
-        output_shape = (-1, seq_length, hidden_states.size(-1))
+        hidden_states = self.drop(embed_out)
+        # output_shape = (-1, seq_length, hidden_states.size(-1))
 
         all_block_outputs = []
         for block in self.h:
@@ -364,11 +388,14 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
             hidden_states = outputs[0]
             all_block_outputs.append(outputs[1])
 
-        hidden_states = self.ln_f(hidden_states)
+        # hidden_states = self.ln_f(hidden_states)
 
-        hidden_states = hidden_states.view(output_shape)
+        # hidden_states = hidden_states.view(output_shape)
 
-        return hidden_states, all_block_outputs
+        return GPTNeoHiddenStates(
+            embed_out=embed_out,
+            block_hidden_states=all_block_outputs
+        )
 
 
 __all__ = [
