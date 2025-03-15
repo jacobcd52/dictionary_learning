@@ -1,4 +1,5 @@
 #%%
+print("0")
 from buffer import SimpleBuffer
 from training import train_scae_suite
 from utils import load_iterable_dataset
@@ -22,7 +23,7 @@ num_tokens = int(100e6)
 batch_size = 256
 in_type = "mse"
 out_type = "ce"
-
+print("1")
 
 #%%
 for num_connections in [100]:

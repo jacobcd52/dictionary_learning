@@ -16,24 +16,23 @@ MODEL_NAME = "pythia-70m"
 ctx_len = 128
 k = 64
 expansion = 4
-lr=2e-3
-lr_decay_start_proportion = 0.2
+lr=1e-3
+lr_decay_start_proportion = 0.7
 num_tokens = int(100e6)
 batch_size = 256
-in_type = ""
+in_type = "mse"
 out_type = "ce"
 
 #%%
-for num_connections in [100]:
+for num_connections in [100, 0, 10, 30]:
     if in_type == "":
-        repo_id_in = None
+        repo_id_in = "jacobcd52/pythia-70m_scae_all__mse"
     else:
-        repo_id_in = f"jacobcd52/pythia-70m_scae_{num_connections}_{in_type}"
+        repo_id_in = f"jacobcd52/pythia-70m_scae_{num_connections}__{in_type}"
     repo_id_out = f"jacobcd52/pythia-70m_scae_{num_connections}_{in_type}_{out_type}"
 
     #%%
     data = load_iterable_dataset('monology/pile-uncopyrighted', streaming=True)
-
     buffer = SimpleBuffer(
         data=data,
         model_name=MODEL_NAME,
@@ -46,12 +45,12 @@ for num_connections in [100]:
 
     #%%
     if in_type == "":
-        with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
-            connections = pickle.load(f)
-            connections = generate_fake_connections(connections, num_features=512*expansion)
-            for down_name in connections:
-                for up_name in connections[down_name]:
-                    connections[down_name][up_name] = connections[down_name][up_name][:512*4, :512*4].to(device)
+        if num_connections == "all":
+            connections = None
+        else:
+            with open(f"/root/dictionary_learning/pythia_connections/top_connections_{num_connections}.pkl", "rb") as f:
+                connections = pickle.load(f)
+ 
         k=k
         expansion=expansion
     else:
@@ -59,7 +58,6 @@ for num_connections in [100]:
         k = None
         expansion = None
     
-
     #%%
     trainer = train_scae_suite(
         buffer,

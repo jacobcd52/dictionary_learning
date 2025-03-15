@@ -2,8 +2,9 @@
 sae_checkpoints/
 checkpoints/
 noteboooks/importance_scores
-
+pythia_connections
 tinystories_connections
+
 
 # Saved connections tensor
 connections_100.pkl

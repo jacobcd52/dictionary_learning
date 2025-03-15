@@ -62,6 +62,7 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         self.k = k
 
         self.encoder = nn.Linear(activation_dim, dict_size)
+        self.encoder.weight.data /= 1000
         self.encoder.bias.data.zero_()
 
         self.decoder = nn.Linear(dict_size, activation_dim, bias=False)

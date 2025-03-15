@@ -1,3 +1,4 @@
+#%%
 from typing import Dict
 import torch as t
 from einops import einsum
@@ -26,6 +27,9 @@ def get_avg_contribs(
     """
     from tqdm.auto import tqdm
     
+    # Assert that connections must be None
+    assert suite.connections is None, "connections must be None for this implementation"
+    
     with t.no_grad():
         # Initialize the results dictionary
         avg_contribs = {
@@ -35,6 +39,9 @@ def get_avg_contribs(
         # Process batches with tqdm
         for batch_idx in tqdm(range(n_batches)):
             cache, tokens = next(buffer)
+            
+            # Get all pruned features at once using forward_pruned
+            _, pruned_features = suite.forward_pruned(cache, return_features=True)
             
             # For each downstream autoencoder
             for down_name in suite.submodule_names:
@@ -49,23 +56,10 @@ def get_avg_contribs(
                     # Skip if not a valid upstream connection
                     if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
                         continue
-                        
-                    # Skip if connection not allowed by connections dict
-                    if suite.connections is not None and (
-                        down_name not in suite.connections or 
-                        up_name not in suite.connections[down_name]
-                    ):
-                        continue
-
-                    # Get upsteam feature acts in sparse form
-                    if up_type == 'mlp':
-                        inp = cache[f'blocks.{up_layer}.ln2.hook_normalized']
-                    elif up_type == 'attn':
-                        inp = cache[f'blocks.{up_layer}.ln1.hook_normalized']
-                    else:
-                        raise ValueError(f"Invalid up_type: {up_type}")
-                        
-                    _, topk_vals, topk_inds = suite.aes[up_name].encode(inp, return_topk=True)
+                    
+                    # Get upstream feature acts in sparse form from pruned features
+                    up_feats = pruned_features[up_name]
+                    batch_size, seq_len = up_feats.shape[:2]
                     
                     # Get encoder & decoder
                     up_decoder = suite.aes[up_name].decoder.weight
@@ -84,17 +78,20 @@ def get_avg_contribs(
                         )
                         
                         # Reshape topk values and indices for vectorized operation
-                        batch_size, seq_len = topk_vals.shape[:2]
-                        flat_vals = topk_vals.reshape(-1)  # [batch*seq*k]
-                        flat_inds = topk_inds.reshape(-1)  # [batch*seq*k]
+                        flat_vals = up_feats.reshape(-1, up_feats.shape[-1])  # [batch*seq, n_features]
                         
-                        # Compute all contributions at once
-                        contributions = virtual_weights[flat_inds] * flat_vals.unsqueeze(-1)  # [batch*seq*k, f_down]
+                        # Use vectorized operations for all positions at once
+                        nonzero_mask = flat_vals != 0
+                        pos_indices, feat_indices = nonzero_mask.nonzero(as_tuple=True)
+                        values = flat_vals[nonzero_mask]
+                        
+                        # Compute contributions for all non-zero elements
+                        contributions = virtual_weights[feat_indices] * values.unsqueeze(-1)  # [num_nonzero, f_down]
                         
                         # Use scatter_add to sum all contributions
                         contribution_tensor.scatter_add_(
                             0,
-                            flat_inds.unsqueeze(-1).expand(-1, virtual_weights.shape[1]),
+                            feat_indices.unsqueeze(-1).expand(-1, virtual_weights.shape[1]),
                             contributions
                         )
                         
@@ -113,31 +110,35 @@ def get_avg_contribs(
                         
                         # Get attention probabilities
                         probs = cache[f'blocks.{down_layer}.attn.hook_pattern']  # [b, n_heads, q, k]
-                        batch_size, seq_len = topk_vals.shape[:2]
                         n_heads = probs.shape[1]
                         
                         # Process each head separately
                         for head in range(n_heads):
                             head_weights = virtual_weights[head]  # [f_up, f_down]
                             
-                            # Reshape for this head
-                            flat_vals = topk_vals.reshape(batch_size * seq_len, -1)  # [batch*seq, k]
-                            flat_inds = topk_inds.reshape(batch_size * seq_len, -1)  # [batch*seq, k]
+                            # Reshape attention probs to match batch*seq
+                            head_probs = einops.rearrange(probs[:, head], 'b q k -> (b q) k')  # [batch*seq, seq]
+                            head_probs_sum = head_probs.sum(-1)  # [batch*seq]
                             
-                            head_probs = einops.rearrange(probs[:, head], 'b q k -> (b q) k')  # [batch*seq, k]
+                            # Reshape features
+                            flat_vals = up_feats.reshape(-1, up_feats.shape[-1])  # [batch*seq, n_features]
+                            
+                            # Find non-zero features
+                            nonzero_mask = flat_vals != 0
+                            pos_indices, feat_indices = nonzero_mask.nonzero(as_tuple=True)
+                            values = flat_vals[nonzero_mask]
+                            
+                            # Scale values by attention probabilities
+                            scaled_values = values * head_probs_sum[pos_indices]
                             
                             # Get selected weights and scale them
-                            selected = head_weights[flat_inds]  # [batch*seq, k, f_down]
-                            scaled = selected * (flat_vals * head_probs).unsqueeze(-1)  # [batch*seq, k, f_down]
+                            selected = head_weights[feat_indices]  # [num_nonzero, f_down]
+                            scaled = selected * scaled_values.unsqueeze(-1)  # [num_nonzero, f_down]
                             
-                            # Flatten batch and k dimensions for scatter_add_
-                            scaled = scaled.reshape(-1, scaled.shape[-1])  # [batch*seq*k, f_down]
-                            scatter_inds = flat_inds.reshape(-1)  # [batch*seq*k]
-
                             # Use scatter_add to accumulate contributions for this head
                             contribution_tensor.scatter_add_(
                                 0,
-                                scatter_inds.unsqueeze(-1).expand(-1, head_weights.shape[1]),
+                                feat_indices.unsqueeze(-1).expand(-1, head_weights.shape[1]),
                                 scaled
                             )
                         
@@ -362,8 +363,8 @@ def generate_fake_connections(
     
     return fake_connections
 
-
 if __name__ == "__main__":
+    #%%
     login("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")
     device = "cuda:0" if t.cuda.is_available() else "cpu"
 
@@ -371,15 +372,15 @@ if __name__ == "__main__":
 
     #%%
     DTYPE = t.bfloat16
-    MODEL_NAME = "roneneldan/TinyStories-33M"
+    MODEL_NAME = "pythia-70m"
     num_tokens = int(10e6)
-    batch_size = 64
+    batch_size = 128
     expansion = 4
     ctx_len = 128
 
 
     #%%
-    data = load_iterable_dataset('roneneldan/TinyStories')
+    data = load_iterable_dataset('monology/pile-uncopyrighted')
 
     buffer = SimpleBuffer(
         data=data,
@@ -393,7 +394,7 @@ if __name__ == "__main__":
     #%%
     model = HookedTransformer.from_pretrained(MODEL_NAME, device=device, dtype=DTYPE)
     suite = SCAESuite.from_pretrained(
-        "jacobcd52/TinyStories-33M_suite_4",
+        "jacobcd52/pythia-70m_scae_all__mse",
         model,
         device=device,
         dtype=DTYPE,
@@ -402,11 +403,15 @@ if __name__ == "__main__":
     #%%
     avg_contribs = get_avg_contribs(suite, buffer, n_batches=100)
 
-
     #%%
     from tqdm import tqdm
-    for c in tqdm([10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300, 400, 600, 800]):
+    import os
+    for c in tqdm([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300, 400, 600, 800]):
         top_connections = get_top_connections(avg_contribs, c=c)
-        # save as pickle file
-        with open(f"tinystories_connections/top_connections_{c}.pkl", "wb") as f:
+        # save as pickle file - create the file if it does not exist
+        file_path = f"pythia_connections/top_connections_{c}.pkl"
+        if not os.path.exists(file_path):
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        with open(file_path, "wb") as f:
             pickle.dump(top_connections, f)
