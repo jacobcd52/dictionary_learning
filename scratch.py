@@ -18,6 +18,11 @@ model = GPTNeoForCausalLM.from_pretrained(
 
 # %%
 
+from transformers import GPTNeoXConfig
+
+
+# %%
+
 tokenizer = AutoTokenizer.from_pretrained("roneneldan/TinyStories-33M")
 tokenizer.pad_token = tokenizer.eos_token
 

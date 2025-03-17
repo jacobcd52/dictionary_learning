@@ -334,25 +334,33 @@ class SCAESuite(nn.Module):
             for name in submodule_names
         }
 
-        self.scae_modules = self._make_modules(submodule_names, aes)
+        self.module_dict = self._make_module_dict(submodule_names, aes)
 
         # Initialize and validate connections
-        self.connection_masks = {}
-        self.connections = self._process_connections(connections)
+        self.connection_masks = self._process_connections(connections)
 
-    def _make_modules(
+    def _make_module_dict(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
-    ) -> Dict[SubmoduleName, List[SubmoduleName]]:
-        modules = []
+    ) -> nn.ModuleDict:
+        def _make_module(submodule_type: Literal["attn", "mlp"], *args):
+            submodule = SCAEAttention if submodule_type == "attn" else SCAEMLP
+            return submodule(*args)
+
+        module_dict = {}
         for down in submodule_names:
-            upstream_modules = []
+            upstream_aes = []
 
             for up in submodule_names:
-                # Both are MLPs or attention, or up is
-                not_adjacent = up.layer == down.layer and not (
-                    up.submodule_type == "attn" and down.submodule_type == "mlp"
+                # Adjacent means an attention block feeding
+                # into an MLP block on the same layer
+                adjacent = (
+                    up.layer == down.layer
+                    and up.submodule_type == "attn"
+                    and down.submodule_type == "mlp"
                 )
-                if up.layer > down.layer or adjacent:
+
+                # Skip if up is on a later layer or not adjacent
+                if up.layer > down.layer or not adjacent:
                     continue
 
                 if self.connections is None or (
@@ -360,67 +368,59 @@ class SCAESuite(nn.Module):
                     and down.name in self.connections
                     and up.name in self.connections[down.name]
                 ):
-                    upstream_modules.append(up)
+                    upstream_aes.append(aes[up])
 
-            if down.submodule_type == "attn":
-                modules.append(
-                    SCAEAttention(self.model, aes[down], down, self.connections)
-                )
-            elif down.submodule_type == "mlp":
-                modules.append(
-                    SCAEMLP(self.model, aes[down], down, self.connections)
-                )
+            module_dict[down.name] = _make_module(
+                down.submodule_type,
+                self.model,
+                aes[down],
+                upstream_aes,
+                self.connections,
+                down,
+            )
 
-        return modules
+        return nn.ModuleDict(module_dict)
 
     def _process_connections(self, connections: Connections):
         """Process connections to create connection masks and validate input."""
-        if isinstance(connections, dict):
-            processed_connections = {}
-            self.connection_masks = {}
-            for down_name, up_dict in connections.items():
-                processed_connections[down_name] = {}
-                self.connection_masks[down_name] = {}
-                for up_name, conn_tensor in up_dict.items():
-                    # Verify indices are valid
-                    valid_indices = (conn_tensor >= -1) & (
-                        conn_tensor < self.n_features
+
+        connection_masks = {}
+        for down_name, up_dict in connections.items():
+            connection_masks[down_name] = {}
+            for up_name, conn_tensor in up_dict.items():
+                # Verify indices are valid
+                valid_indices = (
+                    conn_tensor >= -1
+                    and conn_tensor < self.n_features
+                )
+
+                if not valid_indices.all():
+                    raise ValueError(
+                        "Invalid indices in connection tensor for",
+                        f"{down_name}->{up_name}. All values must be",
+                        "-1 or valid feature indices.",
                     )
-                    assert valid_indices.all(), (
-                        f"Invalid indices in connection tensor for {down_name}->{up_name}. All values must be -1 or valid feature indices."
-                    )
 
-                    processed_connections[down_name][up_name] = conn_tensor.to(
-                        device=self.device, dtype=t.long
-                    )
+                # Vectorized connection mask creation
+                valid_connections = conn_tensor != -1
+                n_features = conn_tensor.shape[0]
 
-                    # Vectorized connection mask creation
-                    valid_connections = conn_tensor != -1
-                    n_features = conn_tensor.shape[0]
+                # Get all valid (i,j) pairs
+                i_indices, j_indices = valid_connections.nonzero(as_tuple=True)
+                targets = conn_tensor[i_indices, j_indices]
 
-                    # Get all valid (i,j) pairs
-                    i_indices, j_indices = valid_connections.nonzero(
-                        as_tuple=True
-                    )
-                    targets = conn_tensor[i_indices, j_indices]
+                # Create mask using vectorized scatter
+                connection_mask = t.zeros(
+                    n_features,
+                    n_features,
+                    device=self.device,
+                    dtype=t.bool,
+                )
+                connection_mask[i_indices, targets] = True
 
-                    # Create mask using vectorized scatter
-                    connection_mask = t.zeros(
-                        n_features,
-                        n_features,
-                        device=self.device,
-                        dtype=t.bool,
-                    )
-                    connection_mask[i_indices, targets] = True
+                connection_masks[down_name][up_name] = connection_mask
 
-                    self.connection_masks[down_name][up_name] = connection_mask
-            connections = processed_connections
-        elif connections is not None and connections != "all":
-            raise ValueError(
-                "connections must be either None, 'all', or a dictionary of connection tensors"
-            )
-
-        return connections
+        return connection_masks
 
     def forward(self, cache: ActivationCache) -> t.Tensor:
         reconstructions = {}
@@ -435,8 +435,8 @@ class SCAESuite(nn.Module):
             (batch_size, seq_len, self.n_features), device=device, dtype=dtype
         )
 
-        for module in self.scae_modules:
-            reconstructions[module.name] = module(feat_buffer, cache)
+        for module_name, module in self.module_dict.items():
+            reconstructions[module_name] = module(feat_buffer, cache)
 
         return reconstructions
 
