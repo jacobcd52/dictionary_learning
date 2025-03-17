@@ -6,9 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "circuitsvis>=1.43.2",
+    "cut-cross-entropy",
     "datasets>=2.18.0",
     "einops>=0.7.0",
-    "flash-attn>=2.7.4.post1",
     "gdown>=5.2.0",
     "huggingface-hub[cli,hf-transfer]>=0.29.2",
     "ipykernel>=6.29.5",
@@ -30,3 +30,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["dictionary_learning"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+cut-cross-entropy = { git = "https://github.com/apple/ml-cross-entropy.git" }

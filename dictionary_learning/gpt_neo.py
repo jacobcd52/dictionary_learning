@@ -182,7 +182,6 @@ class GPTNeoLayerNorm(nn.Module):
 
 
 class GPTNeoBlockHiddenStates(NamedTuple):
-    layer: int
     attn_output: torch.Tensor
     attn_weights: torch.Tensor
     mlp_output: torch.Tensor
@@ -207,8 +206,6 @@ class GPTNeoBlock(nn.Module):
         self.attn = GPTNeoAttention(config, layer_id)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = GPTNeoMLP(inner_dim, config)
-        
-        self.layer_id = layer_id
 
     def forward(self, hidden_states):
         residual = hidden_states
@@ -224,7 +221,6 @@ class GPTNeoBlock(nn.Module):
         hidden_states = residual + mlp_output
 
         return hidden_states, GPTNeoBlockHiddenStates(
-            self.layer_id,
             attn_output,
             attn_weights,
             mlp_output,
@@ -347,12 +343,6 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
 
             W_mlp = W_mlp * W_ln_2[:, None]
             
-
-
-
-
-
-
         self.to(device=device, dtype=dtype)
 
     def get_input_embeddings(self):
@@ -396,6 +386,26 @@ class GPTNeoModel(GPTNeoPreTrainedModel):
             embed_out=embed_out,
             block_hidden_states=all_block_outputs
         )
+
+
+class GPTNeoForCausalLM(GPTNeoPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.transformer = GPTNeoModel(config)
+
+        # This isn't actually used, we just want to load the weights.
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self.transformer(input_ids)
 
 
 __all__ = [

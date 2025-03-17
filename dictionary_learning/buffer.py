@@ -1,10 +1,10 @@
 import torch as t
 from transformers import PreTrainedTokenizerBase
-from typing import Dict
+from typing import Dict, List
 from datasets import Dataset
 from multiprocessing import cpu_count
 
-from .gpt_neo import GPTNeoModel
+from .gpt_neo import GPTNeoModel, GPTNeoHiddenStates
 
 from torch.utils.data import DataLoader
 
@@ -52,9 +52,34 @@ def chunk_and_tokenize(
     return dataset
 
 
+def format_cache(hidden_states: List[GPTNeoHiddenStates]) -> Dict[str, t.Tensor]:
+    cache = {
+        "blocks.0.hook_resid_pre": hidden_states.embed_out,
+    }
+
+    for layer_idx, block_hidden_states in enumerate(
+        hidden_states.block_hidden_states
+    ):
+        layer_cache = {
+            f"blocks.{layer_idx}.ln1.hook_scale": block_hidden_states.ln_1_scale,
+            f"blocks.{layer_idx}.ln2.hook_scale": block_hidden_states.ln_2_scale,
+            f"blocks.{layer_idx}.hook_attn_out": block_hidden_states.attn_output,
+            f"blocks.{layer_idx}.hook_mlp_out": block_hidden_states.mlp_output,
+            f"blocks.{layer_idx}.attn.hook_pattern": block_hidden_states.attn_weights,
+        }
+
+        cache.update(layer_cache)
+
+    return cache
+
+
 class Buffer:
     def __init__(
-        self, model: GPTNeoModel, dataset: Dataset, batch_out_size: int, refresh_batch_size: int
+        self,
+        model: GPTNeoModel,
+        dataset: Dataset,
+        batch_out_size: int,
+        refresh_batch_size: int,
     ):
         if batch_out_size % refresh_batch_size != 0:
             raise ValueError(
