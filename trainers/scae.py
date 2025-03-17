@@ -22,6 +22,7 @@ class SCAESuite(nn.Module):
         connections: Optional[Union[Dict[str, Dict[str, t.Tensor]], str]] = None,
         dtype: t.dtype = t.float32,
         device: Optional[str] = None,
+
     ):
         """
         Args:
@@ -134,6 +135,7 @@ class SCAESuite(nn.Module):
         up_name: str,
         down_name: str,
         up_facts: t.Tensor,
+        avg_f_by_f: bool = False,
     ) -> t.Tensor:
         assert 'mlp' in down_name
         
@@ -145,8 +147,11 @@ class SCAESuite(nn.Module):
             virtual_weights = virtual_weights * self.connection_masks[down_name][up_name]
 
         up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln2.hook_scale']
-        contributions = up_facts_post_ln @ virtual_weights.T # TODO: check transpose
-        return contributions  # Added return statement here!
+        if avg_f_by_f:
+            return einsum(up_facts_post_ln, virtual_weights,
+                "batch seq f_up, f_down f_up -> f_down f_up")
+        else:
+            return up_facts_post_ln @ virtual_weights.T
             
     def get_initial_contribs_attn(
             self,
@@ -183,6 +188,7 @@ class SCAESuite(nn.Module):
         up_name: str,
         down_name: str,
         up_facts: t.Tensor,
+        avg_f_by_f: bool = False,
     ) -> t.Tensor:
         """Compute pruned contributions for attention autoencoder."""
         assert 'attn' in down_name
@@ -191,19 +197,59 @@ class SCAESuite(nn.Module):
         W_OV = self.W_OVs[layer]   
         down_encoder = self.aes[down_name].encoder.weight
         up_decoder  = self.aes[up_name].decoder.weight
+        probs = cache[f'blocks.{layer}.attn.hook_pattern']
         virtual_weights = einsum(down_encoder, W_OV, up_decoder,
             "f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up")
         if self.connections is not None:
             virtual_weights = virtual_weights * self.connection_masks[down_name][up_name].unsqueeze(0)
         up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln1.hook_scale']
-        contributions_post_ov = einsum(up_facts_post_ln, virtual_weights,
-            "batch qpos f_up, n_heads f_down f_up -> batch n_heads qpos f_down")
+
+        if avg_f_by_f:
+            # Initialize the result tensor
+            result = t.zeros(
+                (down_encoder.shape[0], up_decoder.shape[1]),  # [f_down, f_up]
+                device=down_encoder.device,
+                dtype=down_encoder.dtype
+            )
+            
+            batch_size, n_heads = probs.shape[0], probs.shape[1]
+            qpos_len, kpos_len = probs.shape[2], probs.shape[3]
+            
+            # Get the total number of positions for normalization later
+            total_positions = batch_size * n_heads * qpos_len * kpos_len
+            
+            # Process each head separately
+            for head in range(n_heads):
+                head_weights = virtual_weights[head]  # [f_down, f_up]
+                
+                # Apply attention weighting directly with einsum
+                # This multiplies each feature by the attention probability and sums across all positions
+                weighted_sum = einsum(
+                    probs[:, head],      # [batch, qpos, kpos]
+                    up_facts_post_ln,    # [batch, kpos, f_up]
+                    "batch qpos kpos, batch kpos f_up -> f_up"
+                )
+                
+                # Apply feature weights to the weighted sum
+                result += einsum(
+                    head_weights,        # [f_down, f_up]
+                    weighted_sum,        # [f_up]
+                    "f_down f_up, f_up -> f_down f_up"
+                )
+            
+            # Normalize by total number of positions
+            result = result / total_positions
+            
+            return result
+        else:
+            contributions_post_ov = einsum(up_facts_post_ln, virtual_weights,
+                "batch pos f_up, n_heads f_down f_up -> batch n_heads pos f_down")
+            return einsum(probs, contributions_post_ov,
+                "batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down")
         
-        # Mix between positions using attention pattern
-        probs = cache[f'blocks.{layer}.attn.hook_pattern']
-        contributions = einsum(probs, contributions_post_ov,
-            "batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down")
-        return contributions
+    def parse_name(self, name: str) -> Tuple[int, str]:
+        type_, layer = name.split('_')
+        return int(layer), type_
     
     def forward_pruned(
         self,
@@ -213,10 +259,6 @@ class SCAESuite(nn.Module):
         """Forward pass computing sparse reconstructions."""
         reconstructions = {}
         pruned_features = {}  # Store pruned features for each module
-        
-        def parse_name(name: str) -> Tuple[int, str]:
-            type_, layer = name.split('_')
-            return int(layer), type_
         
         # Pre-allocate tensors without inplace reuse
         first_cache_tensor = cache['blocks.0.hook_resid_pre']
@@ -231,7 +273,7 @@ class SCAESuite(nn.Module):
         )
         
         for down_name in self.submodule_names:
-            down_layer, down_type = parse_name(down_name)
+            down_layer, down_type = self.parse_name(down_name)
             
             # Initialize approx_acts (out-of-place)
             if down_type == 'attn':
@@ -242,10 +284,8 @@ class SCAESuite(nn.Module):
             # Initialize upstream_bias (out-of-place)
             upstream_bias = t.zeros(self.model.cfg.d_model, device=device, dtype=dtype)
             
-            for up_name in self.submodule_names:
-                up_layer, up_type = parse_name(up_name)
-                
-                if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
+            for up_name in self.submodule_names:          
+                if not self.does_precede(up_name, down_name):
                     continue
                     
                 if self.connections is None or (isinstance(self.connections, dict) 
@@ -311,6 +351,7 @@ class SCAESuite(nn.Module):
         
         if(return_features):
             return reconstructions, pruned_features
+        
         return reconstructions
 
     def get_ce_loss(
@@ -346,6 +387,15 @@ class SCAESuite(nn.Module):
             reduction='mean'
         )
         return loss
+    
+    def does_precede(self, up_name: str, down_name: str) -> bool:
+        """Check if up_name precedes down_name in the model."""
+        up_layer, up_type = self.parse_name(up_name)
+        down_layer, down_type = self.parse_name(up_name)
+        if 'pythia' in self.model.cfg.model_name or 'Pythia' in self.model.cfg.model_name:
+            return up_layer < down_layer
+        else:
+            return up_layer < down_layer or (up_layer == down_layer or (up_type == 'attn' and down_type == 'mlp'))
             
 
     def upload_to_hf(self, repo_id: str, private: bool = False):

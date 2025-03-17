@@ -16,15 +16,15 @@ MODEL_NAME = "pythia-70m"
 ctx_len = 128
 k = 64
 expansion = 4
-lr=1e-3
+lr=5e-4
 lr_decay_start_proportion = 0.7
-num_tokens = int(100e6)
+num_tokens = int(50e6)
 batch_size = 256
-in_type = "mse"
-out_type = "ce"
+in_type = ""
+out_type = "mse"
 
 #%%
-for num_connections in [100, 0, 10, 30]:
+for num_connections in ["all"]:
     if in_type == "":
         repo_id_in = "jacobcd52/pythia-70m_scae_all__mse"
     else:
@@ -73,10 +73,11 @@ for num_connections in [100, 0, 10, 30]:
         device=device,
         log_steps = 1,
         use_wandb = True,
-        repo_id_in=repo_id_in,
+        # repo_id_in=repo_id_in,
         repo_id_out = repo_id_out,
         wandb_project_name="pythia70_scae_2",
         wandb_run_name=f"c{num_connections} b{batch_size} decay{lr_decay_start_proportion} lr{lr} {in_type} {out_type}",
-        save_dir = "/root/dictionary_learning/checkpoints/"
+        save_dir = "/root/dictionary_learning/checkpoints/",
+        dead_feature_threshold=int(1e5)
     )
 # %%

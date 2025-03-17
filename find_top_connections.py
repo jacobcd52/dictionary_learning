@@ -23,7 +23,7 @@ def get_avg_contribs(
         n_batches: int = 10,
     ) -> Dict[str, Dict[str, t.Tensor]]:
     """Calculate average contributions between autoencoder features using sparse representation.
-    Memory-efficient implementation.
+    Memory-efficient implementation using SCAESuite's built-in avg_f_by_f functionality.
     """
     from tqdm.auto import tqdm
     
@@ -57,93 +57,18 @@ def get_avg_contribs(
                     if up_layer > down_layer or (up_layer == down_layer and (up_type == 'mlp' or up_name == down_name)):
                         continue
                     
-                    # Get upstream feature acts in sparse form from pruned features
+                    # Get upstream features from the pruned forward pass
                     up_feats = pruned_features[up_name]
-                    batch_size, seq_len = up_feats.shape[:2]
                     
-                    # Get encoder & decoder
-                    up_decoder = suite.aes[up_name].decoder.weight
-                    down_encoder = suite.aes[down_name].encoder.weight
-
-                    # Find avg contribution tensor
+                    # Use the built-in method with avg_f_by_f=True to get the feature-by-feature contribution matrix
                     if down_type == 'mlp':
-                        # Compute virtual weights
-                        virtual_weights = einsum(up_decoder, down_encoder, "d f_up, f_down d -> f_up f_down")
-                        
-                        # Initialize contribution tensor
-                        contribution_tensor = t.zeros(
-                            virtual_weights.shape,
-                            device=virtual_weights.device,
-                            dtype=virtual_weights.dtype
+                        contribution_tensor = suite.get_pruned_contribs_mlp(
+                            cache, up_name, down_name, up_feats, avg_f_by_f=True
                         )
-                        
-                        # Reshape topk values and indices for vectorized operation
-                        flat_vals = up_feats.reshape(-1, up_feats.shape[-1])  # [batch*seq, n_features]
-                        
-                        # Use vectorized operations for all positions at once
-                        nonzero_mask = flat_vals != 0
-                        pos_indices, feat_indices = nonzero_mask.nonzero(as_tuple=True)
-                        values = flat_vals[nonzero_mask]
-                        
-                        # Compute contributions for all non-zero elements
-                        contributions = virtual_weights[feat_indices] * values.unsqueeze(-1)  # [num_nonzero, f_down]
-                        
-                        # Use scatter_add to sum all contributions
-                        contribution_tensor.scatter_add_(
-                            0,
-                            feat_indices.unsqueeze(-1).expand(-1, virtual_weights.shape[1]),
-                            contributions
-                        )
-                        
-                        contribution_tensor = contribution_tensor / (batch_size * seq_len)
-                        
                     elif down_type == 'attn':
-                        virtual_weights = einsum(up_decoder, suite.W_OVs[down_layer], down_encoder, 
-                                              "d_in f_up, n_heads d_in d_out, f_down d_out -> n_heads f_up f_down")
-                        
-                        # Initialize contribution tensor
-                        contribution_tensor = t.zeros(
-                            (virtual_weights.shape[1], virtual_weights.shape[2]),  # [f_up, f_down]
-                            device=virtual_weights.device,
-                            dtype=virtual_weights.dtype
+                        contribution_tensor = suite.get_pruned_contribs_attn(
+                            cache, up_name, down_name, up_feats, avg_f_by_f=True
                         )
-                        
-                        # Get attention probabilities
-                        probs = cache[f'blocks.{down_layer}.attn.hook_pattern']  # [b, n_heads, q, k]
-                        n_heads = probs.shape[1]
-                        
-                        # Process each head separately
-                        for head in range(n_heads):
-                            head_weights = virtual_weights[head]  # [f_up, f_down]
-                            
-                            # Reshape attention probs to match batch*seq
-                            head_probs = einops.rearrange(probs[:, head], 'b q k -> (b q) k')  # [batch*seq, seq]
-                            head_probs_sum = head_probs.sum(-1)  # [batch*seq]
-                            
-                            # Reshape features
-                            flat_vals = up_feats.reshape(-1, up_feats.shape[-1])  # [batch*seq, n_features]
-                            
-                            # Find non-zero features
-                            nonzero_mask = flat_vals != 0
-                            pos_indices, feat_indices = nonzero_mask.nonzero(as_tuple=True)
-                            values = flat_vals[nonzero_mask]
-                            
-                            # Scale values by attention probabilities
-                            scaled_values = values * head_probs_sum[pos_indices]
-                            
-                            # Get selected weights and scale them
-                            selected = head_weights[feat_indices]  # [num_nonzero, f_down]
-                            scaled = selected * scaled_values.unsqueeze(-1)  # [num_nonzero, f_down]
-                            
-                            # Use scatter_add to accumulate contributions for this head
-                            contribution_tensor.scatter_add_(
-                                0,
-                                feat_indices.unsqueeze(-1).expand(-1, head_weights.shape[1]),
-                                scaled
-                            )
-                        
-                        contribution_tensor = contribution_tensor / (batch_size * seq_len)
-                        
                     else:
                         raise ValueError(f"Invalid down_type: {down_type}")
                     
@@ -159,7 +84,6 @@ def get_avg_contribs(
             t.cuda.empty_cache()
         
         return avg_contribs
-
 
 def get_top_c_indices(top_connections_dict: Dict[str, t.Tensor], c: int, chunk_size: int = 100, 
                       memory_threshold_gb: float = 32) -> Dict[str, t.Tensor]:
@@ -368,13 +292,12 @@ if __name__ == "__main__":
     login("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")
     device = "cuda:0" if t.cuda.is_available() else "cpu"
 
-    t.set_grad_enabled(False)
+    t.set_grad_enabled(True)
 
     #%%
     DTYPE = t.bfloat16
     MODEL_NAME = "pythia-70m"
-    num_tokens = int(10e6)
-    batch_size = 128
+    batch_size = 1024
     expansion = 4
     ctx_len = 128
 
@@ -406,7 +329,7 @@ if __name__ == "__main__":
     #%%
     from tqdm import tqdm
     import os
-    for c in tqdm([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300, 400, 600, 800]):
+    for c in tqdm([0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160, 180, 200, 300]):
         top_connections = get_top_connections(avg_contribs, c=c)
         # save as pickle file - create the file if it does not exist
         file_path = f"pythia_connections/top_connections_{c}.pkl"
