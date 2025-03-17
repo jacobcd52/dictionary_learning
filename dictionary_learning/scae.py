@@ -1,19 +1,15 @@
+from abc import ABC, abstractmethod
+from typing import Dict, List, NamedTuple, Literal
+
+# from einops import einsum
+from cut_cross_entropy import linear_cross_entropy
 import torch as t
 import torch.nn as nn
-
-from typing import Dict, List
-from torchtyping import TensorType
-from einops import einsum
-
-from .gpt_neo import GPTNeoForCausalLM
 from transformer_lens import ActivationCache
 
+from .gpt_neo import GPTNeoForCausalLM
 from .top_k import AutoEncoderTopK
 
-from cut_cross_entropy import linear_cross_entropy
-
-from typing import NamedTuple, Literal
-from abc import ABC, abstractmethod
 
 Connections = Dict[str, Dict[str, t.Tensor]]
 
@@ -55,92 +51,74 @@ class SCAEModule(nn.Module, ABC):
 
         self.pruned_features = None
 
-    def forward(self, cache: ActivationCache, down: SubmoduleName) -> t.Tensor:
-        initial_contribs = self.get_initial_contribs(cache, down)
+    def forward(self, cache: ActivationCache) -> t.Tensor:
+        approx_acts = self.get_initial_contribs(cache)
+        upstream_bias = t.zeros(
+            self.model.cfg.d_model, device=self.device, dtype=self.dtype
+        )
+
+        for ae in self.upstream_aes:
+            upstream_bias = upstream_bias + ae.b_dec
+
+            pruned_contribs = self.get_pruned_contribs(cache, ae)
+            approx_acts = approx_acts + pruned_contribs
+
+        approx_acts = self._compute_bias(approx_acts, upstream_bias, cache)
+
+        return approx_acts
 
     @abstractmethod
-    def get_initial_contribs(
-        self, cache: ActivationCache, down: SubmoduleName
-    ) -> t.Tensor:
+    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
         pass
 
     @abstractmethod
     def get_pruned_contribs(
         self,
         cache: ActivationCache,
-        up: SubmoduleName,
-        down: SubmoduleName,
-        up_facts: t.Tensor,
+        up_ae: AutoEncoderTopK,
     ) -> t.Tensor:
         pass
 
     def _compute_bias(
         self,
-        down: SubmoduleName,
         approx_acts: t.Tensor,
         upstream_bias: t.Tensor,
         cache: ActivationCache,
     ):
         # Add downstream b_enc
-        bias = self.aes[down.name].encoder.bias
+        bias = self.ae.encoder.bias
         bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
         approx_acts = approx_acts + bias
 
         # Subtract downstream b_dec contribution
-        approx_acts = (
-            approx_acts
-            - self.aes[down.name].encoder.weight @ self.aes[down.name].b_dec
-        )
+        approx_acts = approx_acts - self.ae.encoder.weight @ self.ae.b_dec
 
         # Add upstream b_dec contributions
-        ln_name = "ln1" if down.submodule_type == "attn" else "ln2"
+        ln_name = "ln1" if self.name.submodule_type == "attn" else "ln2"
         upstream_bias_post_ln = (
             upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{down.layer}.{ln_name}.hook_scale"]
+            / cache[f"blocks.{self.name.layer}.{ln_name}.hook_scale"]
         )
-        if down.submodule_type == "attn":
+
+        # TODO: Fix the fact that this module will probabl not have a W_OV
+        # Maybe move the bias computation to the modules
+        if self.name.submodule_type == "attn":
             # n_heads d_in d_out, b s d_in -> b s d_out
             upstream_bias_post_ln = t.einsum(
                 "hmd,bsm->bsd",
-                self.W_OVs[down.layer],  # [n_heads, d_in, d_out]
+                self.W_OVs[self.name.layer],  # [n_heads, d_in, d_out]
                 upstream_bias_post_ln,  # [batch, seq, d_in]
             )
 
         # f d, b s d -> b s f
         projected_bias = t.einsum(
             "fd,bsd->bsf",
-            self.aes[down.name].encoder.weight,  # [f, d]
+            self.ae.encoder.weight,  # [f, d]
             upstream_bias_post_ln,  # [batch, seq, d]
         )
 
         approx_acts = approx_acts + projected_bias
         return approx_acts
-
-    def compute_upstream(
-        self,
-        approx_acts: t.Tensor,
-        upstream_bias: t.Tensor,
-        cache: ActivationCache,
-    ):
-        for ae in self.upstream_aes:
-            pass
-
-        up_feats = pruned_features[up.name]
-
-        # Avoid inplace: upstream_bias = upstream_bias + ...
-        upstream_bias = upstream_bias + self.aes[up.name].b_dec
-
-        if down.submodule_type == "attn":
-            contributions = self.get_pruned_contribs_attn(
-                cache, up.name, down.name, up_feats
-            )
-        else:
-            contributions = self.get_pruned_contribs_mlp(
-                cache, up.name, down.name, up_feats
-            )
-
-        # Avoid inplace: approx_acts = approx_acts + contributions
-        approx_acts = approx_acts + contributions
 
 
 class SCAEAttention(SCAEModule):
@@ -312,23 +290,11 @@ class SCAESuite(nn.Module):
             for name in submodule_names
         }
 
-        self.modules = self._make_modules(submodule_names, aes)
+        self.scae_modules = self._make_modules(submodule_names, aes)
 
         # Initialize and validate connections
         self.connection_masks = {}
         self.connections = self._process_connections(connections)
-
-        # Precompute W_OV matrices
-        self.W_OVs = []
-        for layer in range(model.cfg.n_layers):
-            W_O = model.W_O[layer]
-            W_V = model.W_V[layer]
-            W_OV = einsum(
-                W_O,
-                W_V,
-                "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
-            ).to(device=self.device, dtype=self.dtype)
-            self.W_OVs.append(W_OV)
 
     def _make_modules(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
@@ -411,237 +377,8 @@ class SCAESuite(nn.Module):
 
         return connections
 
-    def build_modules(self):
-        pass
-
-    def get_initial_contribs_mlp(
-        self,
-        cache: ActivationCache,
-        down_name: str,  # e.g. 'mlp_0'
-    ) -> t.Tensor:  # [batch, seq, n_features]
-        """Compute initial contributions for MLP autoencoder from residual stream.
-
-        Args:
-            cache: TransformerLens activation cache
-            down_name: Name of downstream autoencoder (must be MLP type)
-
-        Returns:
-            Tensor of initial contributions to features
-        """
-        layer = int(down_name.split("_")[1])
-        initial_act = cache["blocks.0.hook_resid_pre"]  # [batch, seq, d_model]
-        W_enc = self.aes[down_name].encoder.weight  # [n_features, d_model]
-
-        initial_act_post_ln = (
-            initial_act / cache[f"blocks.{layer}.ln2.hook_scale"]
-        )
-        return initial_act_post_ln @ W_enc.T  # [batch, seq, n_features]
-
-    def get_pruned_contribs_mlp(
-        self,
-        cache: ActivationCache,
-        up_name: str,
-        down_name: str,
-        up_facts: t.Tensor,
-    ) -> t.Tensor:
-        assert "mlp" in down_name
-
-        layer = int(down_name.split("_")[1])
-        up_decoder = self.aes[up_name].decoder.weight
-        down_encoder = self.aes[down_name].encoder.weight
-        virtual_weights = down_encoder @ up_decoder
-        if self.connections is not None:
-            virtual_weights = (
-                virtual_weights * self.connection_masks[down_name][up_name]
-            )
-
-        up_facts_post_ln = up_facts / cache[f"blocks.{layer}.ln2.hook_scale"]
-        contributions = (
-            up_facts_post_ln @ virtual_weights.T
-        )  # TODO: check transpose
-        return contributions  # Added return statement here!
-
-    def get_initial_contribs_attn(
-        self, cache: ActivationCache, down: SubmoduleName
-    ) -> t.Tensor:  # [batch, qpos, n_down_features]
-        """Compute initial contributions for attention autoencoder from residual stream."""
-
-        initial_act = cache["blocks.0.hook_resid_pre"]  # [batch, seq, d_model]
-        initial_act_post_ln = (
-            initial_act / cache[f"blocks.{down.layer}.ln1.hook_scale"]
-        )
-
-        # Break down the einsum operations and clean up intermediates
-        W_OV = self.W_OVs[down.layer]  # [n_heads, d_model, d_out]
-        t.cuda.empty_cache()
-
-        down_encoder = self.aes[down].encoder.weight  # [f_down, d_out]
-
-        # batch pos d_in, n_heads d_in d_out, f_down d_out -> batch pos n_heads f_down
-        initial_contrib_pre_moving = t.einsum(
-            "bpd,hdq,fq->bphf",
-            initial_act_post_ln,  # [batch, pos, d_in]
-            W_OV,  # [n_heads, d_in, d_out]
-            down_encoder,  # [f_down, d_out]
-        )
-
-        # Mix between positions using attention pattern
-        probs = cache[
-            f"blocks.{down.layer}.attn.hook_pattern"
-        ]  # [batch, n_heads, qpos, kpos]
-
-        # batch n_heads qpos kpos, batch kpos n_heads f_down -> batch qpos f_down
-        initial_contrib = t.einsum(
-            "bhqk,bkhf->bqf",
-            probs,  # [batch, n_heads, qpos, kpos]
-            initial_contrib_pre_moving,  # [batch, kpos, n_heads, f_down]
-        )
-        # del initial_contrib_pre_moving
-        # t.cuda.empty_cache()
-
-        return initial_contrib
-
-    def get_pruned_contribs_attn(
-        self,
-        cache: ActivationCache,
-        up_name: str,
-        down_name: str,
-        up_facts: t.Tensor,
-    ) -> t.Tensor:
-        """Compute pruned contributions for attention autoencoder."""
-        assert "attn" in down_name
-
-        layer = int(down_name.split("_")[1])
-        W_OV = self.W_OVs[layer]
-        down_encoder = self.aes[down_name].encoder.weight
-        up_decoder = self.aes[up_name].decoder.weight
-
-        # f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up
-        virtual_weights = t.einsum(
-            "fd,hmd,mf->hdf",
-            down_encoder,  # [f_down, d_out]
-            W_OV,  # [n_heads, d_in, d_out]
-            up_decoder,  # [d_in, f_up]
-        )
-
-        if self.connections is not None:
-            virtual_weights = virtual_weights * self.connection_masks[
-                down_name
-            ][up_name].unsqueeze(0)
-        up_facts_post_ln = up_facts / cache[f"blocks.{layer}.ln1.hook_scale"]
-
-        # batch qpos f_up, n_heads f_down f_up -> batch n_heads qpos f_down
-        contributions_post_ov = t.einsum(
-            "bqf,hdf->bhqd",
-            up_facts_post_ln,  # [batch, qpos, f_up]
-            virtual_weights,  # [n_heads, f_down, f_up]
-        )
-
-        # batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down
-        probs = cache[f"blocks.{layer}.attn.hook_pattern"]
-        contributions = t.einsum(
-            "bhqk,bhkd->bqd",
-            probs,  # [batch, n_heads, qpos, kpos]
-            contributions_post_ov,  # [batch, n_heads, kpos, f_down]
-        )
-        return contributions
-
-    def forward_pruned(
-        self,
-        cache: ActivationCache,
-        return_features=False,
-    ) -> Dict[str, t.Tensor]:
-        """Forward pass computing sparse reconstructions."""
-        reconstructions = {}
-        pruned_features = {}  # Store pruned features for each module
-
-        # Pre-allocate tensors without inplace reuse
-        first_cache_tensor = cache["blocks.0.hook_resid_pre"]
-        batch_size, seq_len = first_cache_tensor.shape[:2]
-        device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
-
-        # Initialize feat_buffer (no inplace reuse)
-        feat_buffer = t.zeros(
-            (batch_size, seq_len, self.n_features), device=device, dtype=dtype
-        )
-
-        for down in self.submodule_names:
-            # Initialize approx_acts (out-of-place)
-            if down.submodule_typ == "attn":
-                approx_acts = self.get_initial_contribs_attn(cache, down)
-            elif down.submodule_type == "mlp":  # mlp
-                approx_acts = self.get_initial_contribs_mlp(cache, down)
-
-            # Initialize upstream_bias (out-of-place)
-            upstream_bias = t.zeros(
-                self.model.cfg.d_model, device=device, dtype=dtype
-            )
-
-            for up in self.submodule_names:
-                if up.layer > down.layer or (
-                    up.layer == down.layer
-                    and (up.submodule_type == "mlp" or up == down)
-                ):
-                    continue
-
-                if self.connections is None or (
-                    isinstance(self.connections, dict)
-                    and down.name in self.connections
-                    and up.name in self.connections[down.name]
-                ):
-                    up_feats = pruned_features[up.name]
-
-                    # Avoid inplace: upstream_bias = upstream_bias + ...
-                    upstream_bias = upstream_bias + self.aes[up.name].b_dec
-
-                    if down.submodule_type == "attn":
-                        contributions = self.get_pruned_contribs_attn(
-                            cache, up.name, down.name, up_feats
-                        )
-                    else:
-                        contributions = self.get_pruned_contribs_mlp(
-                            cache, up.name, down.name, up_feats
-                        )
-
-                    # Avoid inplace: approx_acts = approx_acts + contributions
-                    approx_acts = approx_acts + contributions
-                    del contributions
-                    t.cuda.empty_cache()
-
-            # Messy bias stuff. Beware bugs.
-            if down.submodule_type == "attn":
-                approx_acts = (
-                    approx_acts
-                    + self.model.b_O[down.layer].squeeze().to(self.dtype)
-                    @ self.aes[down.name].encoder.weight.T
-                )
-
-            approx_acts = self._compute_bias(
-                down, approx_acts, upstream_bias, cache
-            )
-
-            # Get top k features (no inplace scatter)
-            top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
-            top_vals = t.relu(top_vals)
-
-            # Avoid inplace zeroing: create a new feat_buffer
-            feat_buffer = t.zeros_like(feat_buffer)
-
-            # Avoid inplace scatter: create a new tensor
-            feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
-
-            # Store pruned features (clone to avoid accidental inplace later)
-            pruned_features[down.name] = feat_buffer.clone()
-
-            # Decode and store reconstruction
-            reconstructions[down.name] = self.aes[down.name].decode(feat_buffer)
-
-            del top_vals, top_idx
-            t.cuda.empty_cache()
-
-        if return_features:
-            return reconstructions, pruned_features
-        return reconstructions
+    def forward(self, cache: ActivationCache) -> t.Tensor:
+        return self.scae_modules(cache)
 
     def get_ce_loss(
         self,
