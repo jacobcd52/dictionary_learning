@@ -1,7 +1,7 @@
 import torch as t
 import torch.nn as nn
 
-from typing import Dict, Tuple
+from typing import Dict, List
 from torchtyping import TensorType
 from einops import einsum
 
@@ -10,10 +10,10 @@ from transformer_lens import ActivationCache
 
 from .top_k import AutoEncoderTopK
 
-
 from cut_cross_entropy import linear_cross_entropy
 
 from typing import NamedTuple, Literal
+from abc import ABC, abstractmethod
 
 Connections = Dict[str, Dict[str, t.Tensor]]
 
@@ -36,18 +36,126 @@ class SubmoduleName(NamedTuple):
         )
 
 
-class SCAEAttention(nn.Module):
+class SCAEModule(nn.Module, ABC):
     def __init__(
         self,
         model: GPTNeoForCausalLM,
         ae: AutoEncoderTopK,
-        layer: int,
-        connections: Connections | str = None,
+        upstream_aes: List[AutoEncoderTopK],
+        connection_mask: Connections,
+        name: SubmoduleName,
     ):
         super().__init__()
 
-        W_O = model.transformer.h[layer].attn.attention.o_proj.weight
-        W_V = model.transformer.h[layer].attn.attention.v_proj.weight
+        self.model = model
+        self.ae = ae
+        self.upstream_aes = upstream_aes
+        self.connection_mask = connection_mask
+        self.name = name
+
+        self.pruned_features = None
+
+    def forward(self, cache: ActivationCache, down: SubmoduleName) -> t.Tensor:
+        initial_contribs = self.get_initial_contribs(cache, down)
+
+    @abstractmethod
+    def get_initial_contribs(
+        self, cache: ActivationCache, down: SubmoduleName
+    ) -> t.Tensor:
+        pass
+
+    @abstractmethod
+    def get_pruned_contribs(
+        self,
+        cache: ActivationCache,
+        up: SubmoduleName,
+        down: SubmoduleName,
+        up_facts: t.Tensor,
+    ) -> t.Tensor:
+        pass
+
+    def _compute_bias(
+        self,
+        down: SubmoduleName,
+        approx_acts: t.Tensor,
+        upstream_bias: t.Tensor,
+        cache: ActivationCache,
+    ):
+        # Add downstream b_enc
+        bias = self.aes[down.name].encoder.bias
+        bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
+        approx_acts = approx_acts + bias
+
+        # Subtract downstream b_dec contribution
+        approx_acts = (
+            approx_acts
+            - self.aes[down.name].encoder.weight @ self.aes[down.name].b_dec
+        )
+
+        # Add upstream b_dec contributions
+        ln_name = "ln1" if down.submodule_type == "attn" else "ln2"
+        upstream_bias_post_ln = (
+            upstream_bias.unsqueeze(0).unsqueeze(0)
+            / cache[f"blocks.{down.layer}.{ln_name}.hook_scale"]
+        )
+        if down.submodule_type == "attn":
+            # n_heads d_in d_out, b s d_in -> b s d_out
+            upstream_bias_post_ln = t.einsum(
+                "hmd,bsm->bsd",
+                self.W_OVs[down.layer],  # [n_heads, d_in, d_out]
+                upstream_bias_post_ln,  # [batch, seq, d_in]
+            )
+
+        # f d, b s d -> b s f
+        projected_bias = t.einsum(
+            "fd,bsd->bsf",
+            self.aes[down.name].encoder.weight,  # [f, d]
+            upstream_bias_post_ln,  # [batch, seq, d]
+        )
+
+        approx_acts = approx_acts + projected_bias
+        return approx_acts
+
+    def compute_upstream(
+        self,
+        approx_acts: t.Tensor,
+        upstream_bias: t.Tensor,
+        cache: ActivationCache,
+    ):
+        for ae in self.upstream_aes:
+            pass
+
+        up_feats = pruned_features[up.name]
+
+        # Avoid inplace: upstream_bias = upstream_bias + ...
+        upstream_bias = upstream_bias + self.aes[up.name].b_dec
+
+        if down.submodule_type == "attn":
+            contributions = self.get_pruned_contribs_attn(
+                cache, up.name, down.name, up_feats
+            )
+        else:
+            contributions = self.get_pruned_contribs_mlp(
+                cache, up.name, down.name, up_feats
+            )
+
+        # Avoid inplace: approx_acts = approx_acts + contributions
+        approx_acts = approx_acts + contributions
+
+
+class SCAEAttention(SCAEModule):
+    def __init__(
+        self,
+        model: GPTNeoForCausalLM,
+        ae: AutoEncoderTopK,
+        upstream_aes: List[AutoEncoderTopK],
+        connection_mask: Connections,
+        name: SubmoduleName,
+    ):
+        super().__init__(model, ae, upstream_aes, connection_mask, name)
+
+        W_O = model.transformer.h[name.layer].attn.attention.o_proj.weight
+        W_V = model.transformer.h[name.layer].attn.attention.v_proj.weight
 
         self.W_OV = einsum(
             W_O,
@@ -55,8 +163,108 @@ class SCAEAttention(nn.Module):
             "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
         )
 
-        self.connections = connections
+    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
+        """Compute initial contributions for attention autoencoder from residual stream."""
+
+        initial_act = cache["blocks.0.hook_resid_pre"]  # [batch, seq, d_model]
+        initial_act_post_ln = (
+            initial_act / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
+        )
+
+        down_encoder = self.ae.encoder.weight  # [f_down, d_out]
+        initial_contrib_pre_moving = einsum(
+            initial_act_post_ln,
+            self.W_OV,
+            down_encoder,
+            "batch pos d_in, n_heads d_in d_out, f_down d_out -> batch pos n_heads f_down",
+        )
+
+        # Mix between positions using attention pattern
+        probs = cache[
+            f"blocks.{self.name.layer}.attn.hook_pattern"
+        ]  # [batch, n_heads, qpos, kpos]
+        initial_contrib = einsum(
+            probs,
+            initial_contrib_pre_moving,
+            "batch n_heads qpos kpos, batch kpos n_heads f_down -> batch qpos f_down",
+        )
+
+        return initial_contrib
+
+    def get_pruned_contribs(
+        self, cache: ActivationCache, up_ae: SubmoduleName
+    ) -> t.Tensor:
+        """Compute pruned contributions for attention autoencoder."""
+
+        down_encoder = self.ae.encoder.weight
+        up_decoder = up_ae.decoder.weight
+        virtual_weights = einsum(
+            down_encoder,
+            self.W_OV,
+            up_decoder,
+            "f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up",
+        )
+
+        virtual_weights = virtual_weights * self.connection_mask.unsqueeze(0)
+        up_facts_post_ln = (
+            self.pruned_features
+            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
+        )
+        contributions_post_ov = einsum(
+            up_facts_post_ln,
+            virtual_weights,
+            "batch qpos f_up, n_heads f_down f_up -> batch n_heads qpos f_down",
+        )
+
+        # Mix between positions using attention pattern
+        probs = cache[f"blocks.{self.name.layer}.attn.hook_pattern"]
+        contributions = einsum(
+            probs,
+            contributions_post_ov,
+            "batch n_heads qpos kpos, batch n_heads kpos f_down -> batch qpos f_down",
+        )
+        return contributions
+
+
+class SCAEMLP(SCAEModule):
+    def __init__(
+        self,
+        model: GPTNeoForCausalLM,
+        ae: AutoEncoderTopK,
+        name: SubmoduleName,
+        upstream_aes: List[AutoEncoderTopK],
+        connection_mask: Connections,
+    ):
+        super().__init__(model, ae, upstream_aes, connection_mask, name)
+
         self.ae = ae
+
+    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
+        initial_act = cache["blocks.0.hook_resid_pre"]  # [batch, seq, d_model]
+        W_enc = self.ae.encoder.weight  # [n_features, d_model]
+
+        initial_act_post_ln = (
+            initial_act / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
+        )
+        return initial_act_post_ln @ W_enc.T  # [batch, seq, n_features]
+
+    def get_pruned_contribs(
+        self, cache: ActivationCache, up_ae: AutoEncoderTopK
+    ) -> t.Tensor:
+        up_decoder = up_ae.decoder.weight
+        down_encoder = self.ae.encoder.weight
+
+        virtual_weights = (down_encoder @ up_decoder) * self.connection_mask
+
+        up_facts_post_ln = (
+            self.pruned_features
+            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
+        )
+
+        # TODO: check transpose
+        contributions = up_facts_post_ln @ virtual_weights.T
+
+        return contributions
 
 
 class SCAESuite(nn.Module):
@@ -91,20 +299,20 @@ class SCAESuite(nn.Module):
 
         n_layers = model.cfg.n_layers
 
-        self.submodule_names = [
+        submodule_names = [
             SubmoduleName(layer=i, submodule_type=submodule_type)
             for i in range(n_layers)
             for submodule_type in ["attn", "mlp"]
         ]
 
-        self.aes = nn.ModuleDict(
-            {
-                name: AutoEncoderTopK(model.cfg.d_model, n_features, k).to(
-                    device=self.device, dtype=self.dtype
-                )
-                for name in self.submodule_names
-            }
-        )
+        aes = {
+            name: AutoEncoderTopK(model.cfg.d_model, n_features, k).to(
+                device=self.device, dtype=self.dtype
+            )
+            for name in submodule_names
+        }
+
+        self.modules = self._make_modules(submodule_names, aes)
 
         # Initialize and validate connections
         self.connection_masks = {}
@@ -121,6 +329,38 @@ class SCAESuite(nn.Module):
                 "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
             ).to(device=self.device, dtype=self.dtype)
             self.W_OVs.append(W_OV)
+
+    def _make_modules(
+        self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
+    ) -> Dict[SubmoduleName, List[SubmoduleName]]:
+        modules = []
+        for down in submodule_names:
+            upstream_modules = []
+
+            for up in submodule_names:
+                if up.layer > down.layer or (
+                    up.layer == down.layer
+                    and (up.submodule_type == "mlp" or up == down)
+                ):
+                    continue
+
+                if self.connections is None or (
+                    isinstance(self.connections, dict)
+                    and down.name in self.connections
+                    and up.name in self.connections[down.name]
+                ):
+                    upstream_modules.append(up)
+
+            if down.submodule_type == "attn":
+                modules.append(
+                    SCAEAttention(self.model, aes[down], down, self.connections)
+                )
+            elif down.submodule_type == "mlp":
+                modules.append(
+                    SCAEMLP(self.model, aes[down], down, self.connections)
+                )
+
+        return modules
 
     def _process_connections(self, connections: Connections):
         """Process connections to create connection masks and validate input."""
@@ -170,6 +410,9 @@ class SCAESuite(nn.Module):
             )
 
         return connections
+
+    def build_modules(self):
+        pass
 
     def get_initial_contribs_mlp(
         self,
@@ -303,48 +546,6 @@ class SCAESuite(nn.Module):
         )
         return contributions
 
-    def _compute_bias(
-        self,
-        down: SubmoduleName,
-        approx_acts: t.Tensor,
-        upstream_bias: t.Tensor,
-        cache: ActivationCache,
-    ):
-        # Add downstream b_enc
-        bias = self.aes[down.name].encoder.bias
-        bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
-        approx_acts = approx_acts + bias
-
-        # Subtract downstream b_dec contribution
-        approx_acts = (
-            approx_acts
-            - self.aes[down.name].encoder.weight @ self.aes[down.name].b_dec
-        )
-
-        # Add upstream b_dec contributions
-        ln_name = "ln1" if down.submodule_type == "attn" else "ln2"
-        upstream_bias_post_ln = (
-            upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{down.layer}.{ln_name}.hook_scale"]
-        )
-        if down.submodule_type == "attn":
-            # n_heads d_in d_out, b s d_in -> b s d_out
-            upstream_bias_post_ln = t.einsum(
-                "hmd,bsm->bsd",
-                self.W_OVs[down.layer],  # [n_heads, d_in, d_out]
-                upstream_bias_post_ln,  # [batch, seq, d_in]
-            )
-
-        # f d, b s d -> b s f
-        projected_bias = t.einsum(
-            "fd,bsd->bsf",
-            self.aes[down.name].encoder.weight,  # [f, d]
-            upstream_bias_post_ln,  # [batch, seq, d]
-        )
-
-        approx_acts = approx_acts + projected_bias
-        return approx_acts
-
     def forward_pruned(
         self,
         cache: ActivationCache,
@@ -433,9 +634,7 @@ class SCAESuite(nn.Module):
             pruned_features[down.name] = feat_buffer.clone()
 
             # Decode and store reconstruction
-            reconstructions[down.name] = self.aes[down.name].decode(
-                feat_buffer
-            )
+            reconstructions[down.name] = self.aes[down.name].decode(feat_buffer)
 
             del top_vals, top_idx
             t.cuda.empty_cache()
