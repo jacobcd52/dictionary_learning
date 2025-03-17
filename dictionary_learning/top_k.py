@@ -6,8 +6,36 @@ Significant portions of this code have been copied from https://github.com/Eleut
 import einops
 import torch as t
 import torch.nn as nn
+from abc import ABC, abstractmethod
 
-from .dictionary import Dictionary
+class Dictionary(ABC, nn.Module):
+    """
+    A dictionary consists of a collection of vectors, an encoder, and a decoder.
+    """
+    dict_size : int # number of features in the dictionary
+    activation_dim : int # dimension of the activation vectors
+
+    @abstractmethod
+    def encode(self, x):
+        """
+        Encode a vector x in the activation space.
+        """
+        pass
+    
+    @abstractmethod
+    def decode(self, f):
+        """
+        Decode a dictionary vector f (i.e. a linear combination of dictionary elements)
+        """
+        pass
+
+    @classmethod
+    @abstractmethod
+    def from_pretrained(cls, path, device=None, **kwargs) -> "Dictionary":
+        """
+        Load a pretrained dictionary from a file.
+        """
+        pass
 
 
 class AutoEncoderTopK(Dictionary, nn.Module):

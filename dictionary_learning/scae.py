@@ -51,7 +51,9 @@ class SCAEModule(nn.Module, ABC):
 
         self.pruned_features = None
 
-    def forward(self, cache: ActivationCache) -> t.Tensor:
+    def forward(
+        self, feature_buffer: t.Tensor, cache: ActivationCache
+    ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
         upstream_bias = t.zeros(
             self.model.cfg.d_model, device=self.device, dtype=self.dtype
@@ -65,7 +67,15 @@ class SCAEModule(nn.Module, ABC):
 
         approx_acts = self._compute_bias(approx_acts, upstream_bias, cache)
 
-        return approx_acts
+        top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
+        top_vals = t.relu(top_vals)
+
+        feat_buffer = feature_buffer.scatter(-1, top_idx, top_vals)
+        self.pruned_features = feat_buffer.clone()
+
+        reconstructions = self.ae.decode(feat_buffer)
+
+        return reconstructions
 
     @abstractmethod
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
@@ -79,46 +89,14 @@ class SCAEModule(nn.Module, ABC):
     ) -> t.Tensor:
         pass
 
+    @abstractmethod
     def _compute_bias(
         self,
         approx_acts: t.Tensor,
         upstream_bias: t.Tensor,
         cache: ActivationCache,
     ):
-        # Add downstream b_enc
-        bias = self.ae.encoder.bias
-        bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
-        approx_acts = approx_acts + bias
-
-        # Subtract downstream b_dec contribution
-        approx_acts = approx_acts - self.ae.encoder.weight @ self.ae.b_dec
-
-        # Add upstream b_dec contributions
-        ln_name = "ln1" if self.name.submodule_type == "attn" else "ln2"
-        upstream_bias_post_ln = (
-            upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{self.name.layer}.{ln_name}.hook_scale"]
-        )
-
-        # TODO: Fix the fact that this module will probabl not have a W_OV
-        # Maybe move the bias computation to the modules
-        if self.name.submodule_type == "attn":
-            # n_heads d_in d_out, b s d_in -> b s d_out
-            upstream_bias_post_ln = t.einsum(
-                "hmd,bsm->bsd",
-                self.W_OVs[self.name.layer],  # [n_heads, d_in, d_out]
-                upstream_bias_post_ln,  # [batch, seq, d_in]
-            )
-
-        # f d, b s d -> b s f
-        projected_bias = t.einsum(
-            "fd,bsd->bsf",
-            self.ae.encoder.weight,  # [f, d]
-            upstream_bias_post_ln,  # [batch, seq, d]
-        )
-
-        approx_acts = approx_acts + projected_bias
-        return approx_acts
+        pass
 
 
 class SCAEAttention(SCAEModule):
@@ -203,6 +181,46 @@ class SCAEAttention(SCAEModule):
         )
         return contributions
 
+    def compute_bias(
+        self,
+        approx_acts: t.Tensor,
+        upstream_bias: t.Tensor,
+        cache: ActivationCache,
+    ):
+        approx_acts = (
+            approx_acts
+            + self.model.b_O[self.name.layer].squeeze().to(self.dtype)
+            @ self.ae.encoder.weight.T
+        )
+
+        # Add downstream b_enc
+        bias = self.ae.encoder.bias
+        bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
+        approx_acts = approx_acts + bias
+
+        # Subtract downstream b_dec contribution
+        approx_acts = approx_acts - self.ae.encoder.weight @ self.ae.b_dec
+
+        # Add upstream b_dec contributions
+        upstream_bias_post_ln = (
+            upstream_bias.unsqueeze(0).unsqueeze(0)
+            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
+        )
+
+        upstream_bias_post_ln = einsum(
+            self.W_OV,
+            upstream_bias_post_ln,
+            "n_heads d_in d_out, b s d_in -> b s d_out",
+        )
+
+        projected_bias = einsum(
+            self.ae.encoder.weight,
+            upstream_bias_post_ln,
+            "f d, b s d -> b s f",
+        )
+
+        return approx_acts + projected_bias
+
 
 class SCAEMLP(SCAEModule):
     def __init__(
@@ -214,8 +232,6 @@ class SCAEMLP(SCAEModule):
         connection_mask: Connections,
     ):
         super().__init__(model, ae, upstream_aes, connection_mask, name)
-
-        self.ae = ae
 
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
         initial_act = cache["blocks.0.hook_resid_pre"]  # [batch, seq, d_model]
@@ -243,6 +259,34 @@ class SCAEMLP(SCAEModule):
         contributions = up_facts_post_ln @ virtual_weights.T
 
         return contributions
+
+    def compute_bias(
+        self,
+        approx_acts: t.Tensor,
+        upstream_bias: t.Tensor,
+        cache: ActivationCache,
+    ):
+        # Add downstream b_enc
+        bias = self.ae.encoder.bias
+        bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
+        approx_acts = approx_acts + bias
+
+        # Subtract downstream b_dec contribution
+        approx_acts = approx_acts - self.ae.encoder.weight @ self.ae.b_dec
+
+        # Add upstream b_dec contributions
+        upstream_bias_post_ln = (
+            upstream_bias.unsqueeze(0).unsqueeze(0)
+            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
+        )
+
+        projected_bias = einsum(
+            self.ae.encoder.weight,
+            upstream_bias_post_ln,
+            "f d, b s d -> b s f",
+        )
+
+        return projected_bias
 
 
 class SCAESuite(nn.Module):
@@ -304,10 +348,11 @@ class SCAESuite(nn.Module):
             upstream_modules = []
 
             for up in submodule_names:
-                if up.layer > down.layer or (
-                    up.layer == down.layer
-                    and (up.submodule_type == "mlp" or up == down)
-                ):
+                # Both are MLPs or attention, or up is
+                not_adjacent = up.layer == down.layer and not (
+                    up.submodule_type == "attn" and down.submodule_type == "mlp"
+                )
+                if up.layer > down.layer or adjacent:
                     continue
 
                 if self.connections is None or (
@@ -378,7 +423,22 @@ class SCAESuite(nn.Module):
         return connections
 
     def forward(self, cache: ActivationCache) -> t.Tensor:
-        return self.scae_modules(cache)
+        reconstructions = {}
+
+        # Pre-allocate tensors without inplace reuse
+        first_cache_tensor = cache["blocks.0.hook_resid_pre"]
+        batch_size, seq_len = first_cache_tensor.shape[:2]
+        device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
+
+        # Initialize feat_buffer (no inplace reuse)
+        feat_buffer = t.zeros(
+            (batch_size, seq_len, self.n_features), device=device, dtype=dtype
+        )
+
+        for module in self.scae_modules:
+            reconstructions[module.name] = module(feat_buffer, cache)
+
+        return reconstructions
 
     def get_ce_loss(
         self,
