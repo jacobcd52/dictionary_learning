@@ -56,7 +56,7 @@ class SCAEModule(nn.Module, ABC):
     ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
         upstream_bias = t.zeros(
-            self.model.cfg.d_model, device=self.device, dtype=self.dtype
+            self.model.config.hidden_size, device=self.device, dtype=self.dtype
         )
 
         for ae in self.upstream_aes:
@@ -90,7 +90,7 @@ class SCAEModule(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def _compute_bias(
+    def compute_bias(
         self,
         approx_acts: t.Tensor,
         upstream_bias: t.Tensor,
@@ -111,17 +111,27 @@ class SCAEAttention(SCAEModule):
         super().__init__(model, ae, upstream_aes, connection_mask, name)
 
         W_QKV = model.gpt_neox.layers[name.layer].attention.query_key_value
-        _, _, W_V = W_QKV.chunk(3, dim=-1)
+        _, _, W_V = W_QKV.weight.chunk(3, dim=0)
+        W_V = einops.rearrange(
+            W_V,
+            "(n_heads d_head) d_model_in -> n_heads d_head d_model_in",
+            n_heads=8,
+            d_head=64,
+        )
 
         W_O = model.gpt_neox.layers[name.layer].attention.dense.weight
+        W_O = einops.rearrange(
+            W_O,
+            "(n_heads d_head) d_model_out -> n_heads d_head d_model_out",
+            n_heads=8,
+            d_head=64,
+        )
 
         self.W_OV = einops.einsum(
             W_O,
             W_V,
-            "(n_heads d_head) d_model_out, (n_heads d_head) d_model_in \
+            "n_heads d_head d_model_out, n_heads d_head d_model_in \
                 -> n_heads d_model_in d_model_out",
-            d_head=64,
-            n_heads=8,
         )
 
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
@@ -197,7 +207,6 @@ class SCAEAttention(SCAEModule):
         upstream_bias: t.Tensor,
         cache: ActivationCache,
     ):
-        
         down_enc = self.ae.encoder.weight
 
         b_O = self.model.gpt_neox.layers[self.name.layer].attention.dense.bias
@@ -215,7 +224,7 @@ class SCAEAttention(SCAEModule):
             / cache[f"blocks.{self.name.layer}.ln1_scale"]
         )
 
-        # n_heads d_model_in d_model_out, batch seq d_model_in 
+        # n_heads d_model_in d_model_out, batch seq d_model_in
         # -> batch seq d_out
         upstream_bias_post_ln = t.einsum(
             self.W_OV,
@@ -223,12 +232,10 @@ class SCAEAttention(SCAEModule):
             "h i o, b s i -> b s o",
         )
 
-        # n_features_down d_model_in, batch seq d_model_in 
+        # n_features_down d_model_in, batch seq d_model_in
         # -> batch seq n_features_down
         projected_bias = t.einsum(
-            down_enc,
-            upstream_bias_post_ln,
-            "d i, b s i -> b s d"
+            down_enc, upstream_bias_post_ln, "d i, b s i -> b s d"
         )
 
         return approx_acts + projected_bias
@@ -292,16 +299,13 @@ class SCAEMLP(SCAEModule):
             / cache[f"blocks.{self.name.layer}.ln2_scale"]
         )
 
-        # n_features_down d_model_in, batch seq d_model_in 
+        # n_features_down d_model_in, batch seq d_model_in
         # -> batch seq n_features_down
         projected_bias = t.einsum(
-            down_enc,
-            upstream_bias_post_ln,
-            "d i, b s i -> b s d"
+            down_enc, upstream_bias_post_ln, "d i, b s i -> b s d"
         )
 
         return approx_acts + projected_bias
-
 
 
 class SCAESuite(nn.Module):
@@ -334,7 +338,10 @@ class SCAESuite(nn.Module):
         self.k = k
         self.n_features = n_features
 
-        n_layers = model.cfg.n_layers
+        n_layers = model.config.num_hidden_layers
+
+        self.connections = connections
+        self.connection_masks = self._process_connections(connections)
 
         submodule_names = [
             SubmoduleName(layer=i, submodule_type=submodule_type)
@@ -343,16 +350,13 @@ class SCAESuite(nn.Module):
         ]
 
         aes = {
-            name: AutoEncoderTopK(model.cfg.d_model, n_features, k).to(
+            name: AutoEncoderTopK(model.config.hidden_size, n_features, k).to(
                 device=self.device, dtype=self.dtype
             )
             for name in submodule_names
         }
-
+    
         self.module_dict = self._make_module_dict(submodule_names, aes)
-
-        # Initialize and validate connections
-        self.connection_masks = self._process_connections(connections)
 
     def _make_module_dict(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
@@ -368,14 +372,17 @@ class SCAESuite(nn.Module):
             for up in submodule_names:
                 # Adjacent means an attention block feeding
                 # into an MLP block on the same layer
-                adjacent = (
-                    up.layer == down.layer
-                    and up.submodule_type == "attn"
-                    and down.submodule_type == "mlp"
-                )
+                # adjacent = (
+                #     up.layer == down.layer
+                #     and up.submodule_type == "attn"
+                #     and down.submodule_type == "mlp"
+                # )
 
-                # Skip if up is on a later layer or not adjacent
-                if up.layer > down.layer or not adjacent:
+                # # Skip if up is on a later layer or not adjacent
+                # if up.layer > down.layer or not adjacent:
+                #     continue
+
+                if up.layer > down.layer:
                     continue
 
                 if self.connections is None or (
@@ -390,7 +397,7 @@ class SCAESuite(nn.Module):
                 self.model,
                 aes[down],
                 upstream_aes,
-                self.connections,
+                self.connection_masks[down.name][up.name],
                 down,
             )
 
@@ -404,9 +411,13 @@ class SCAESuite(nn.Module):
             connection_masks[down_name] = {}
             for up_name, conn_tensor in up_dict.items():
                 # Verify indices are valid
-                valid_indices = (
-                    conn_tensor >= -1 and conn_tensor < self.n_features
-                )
+
+                print(conn_tensor.shape)
+                # valid_indices = (
+                #     conn_tensor >= -1 and conn_tensor < self.n_features
+                # )
+
+                valid_indices = (conn_tensor >= -1) & (conn_tensor < self.n_features)
 
                 if not valid_indices.all():
                     raise ValueError(

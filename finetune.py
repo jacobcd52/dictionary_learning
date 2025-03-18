@@ -29,10 +29,6 @@ batch = next(buffer)
 
 # %%
 
-model.gpt_neox.layers[1].attention.dense.bias
-
-# %%
-
 n_connections = 200
 path = f"/root/tinystories_connections/top_connections_{n_connections}.pkl"
 
@@ -41,5 +37,14 @@ with open(path, "rb") as f:
 
 k = 64
 expansion = 4
+n_features = model.config.hidden_size * expansion
 
 # %%
+
+from dictionary_learning.scae import SCAESuite
+
+scae = SCAESuite(model, k, n_features, connections=connections)
+
+# %%
+
+connections["mlp_0"]["attn_0"].max()
