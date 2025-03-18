@@ -16,7 +16,7 @@ MODEL_NAME = "pythia-70m"
 ctx_len = 128
 k = 64
 expansion = 4
-lr=5e-4
+lr=0.
 lr_decay_start_proportion = 0.7
 num_tokens = int(50e6)
 batch_size = 256
@@ -80,4 +80,4 @@ for num_connections in ["all"]:
         save_dir = "/root/dictionary_learning/checkpoints/",
         dead_feature_threshold=int(1e5)
     )
-# %%
+# %% 

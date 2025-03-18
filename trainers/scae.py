@@ -23,7 +23,7 @@ class SCAESuite(nn.Module):
         dtype: t.dtype = t.float32,
         device: Optional[str] = None,
 
-    ):
+    ): 
         """
         Args:
             model: TransformerLens model
@@ -202,7 +202,7 @@ class SCAESuite(nn.Module):
             "f_down d_out, n_heads d_in d_out, d_in f_up -> n_heads f_down f_up")
         if self.connections is not None:
             virtual_weights = virtual_weights * self.connection_masks[down_name][up_name].unsqueeze(0)
-        up_facts_post_ln = up_facts / cache[f'blocks.{layer}.ln1.hook_scale']
+        up_facts_post_ln = up_facts  / cache[f'blocks.{layer}.ln1.hook_scale']
 
         if avg_f_by_f:
             # Initialize the result tensor
@@ -284,10 +284,9 @@ class SCAESuite(nn.Module):
             # Initialize upstream_bias (out-of-place)
             upstream_bias = t.zeros(self.model.cfg.d_model, device=device, dtype=dtype)
             
-            for up_name in self.submodule_names:          
+            for up_name in self.submodule_names:     
                 if not self.does_precede(up_name, down_name):
                     continue
-                    
                 if self.connections is None or (isinstance(self.connections, dict) 
                     and down_name in self.connections 
                     and up_name in self.connections[down_name]):
@@ -301,7 +300,7 @@ class SCAESuite(nn.Module):
                         contributions = self.get_pruned_contribs_attn(cache, up_name, down_name, up_feats)
                     else:
                         contributions = self.get_pruned_contribs_mlp(cache, up_name, down_name, up_feats)
-                    
+         
                     # Avoid inplace: approx_acts = approx_acts + contributions
                     approx_acts = approx_acts + contributions
                     del contributions
@@ -309,7 +308,8 @@ class SCAESuite(nn.Module):
 
             # Messy bias stuff. Beware bugs.
             if down_type == 'attn':
-                approx_acts = approx_acts + self.model.b_O[down_layer].squeeze().to(self.dtype) @ self.aes[down_name].encoder.weight.T
+                b_O_contribution = self.model.b_O[down_layer].squeeze().to(self.dtype) @ self.aes[down_name].encoder.weight.T
+                approx_acts = approx_acts + b_O_contribution
             
             # Add downstream b_enc 
             bias = self.aes[down_name].encoder.bias
@@ -391,7 +391,7 @@ class SCAESuite(nn.Module):
     def does_precede(self, up_name: str, down_name: str) -> bool:
         """Check if up_name precedes down_name in the model."""
         up_layer, up_type = self.parse_name(up_name)
-        down_layer, down_type = self.parse_name(up_name)
+        down_layer, down_type = self.parse_name(down_name)
         if 'pythia' in self.model.cfg.model_name or 'Pythia' in self.model.cfg.model_name:
             return up_layer < down_layer
         else:
