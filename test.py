@@ -1,29 +1,28 @@
 # %%
-from transformers import AutoTokenizer, GPTNeoModel
-from dictionary_learning.dictionary_learning.gpt_neo import GPTNeoModel as Custom
+from transformers import AutoTokenizer, GPTNeoXModel
+from dictionary_learning.gpt_neox import GPTNeoXModel as Custom
 import torch as t
 from datasets import load_dataset
 
 t.set_grad_enabled(False)
 
-transformer = GPTNeoModel.from_pretrained(
-    "roneneldan/TinyStories-33M",
+transformer = GPTNeoXModel.from_pretrained(
+    "EleutherAI/pythia-70m-deduped",
     torch_dtype=t.bfloat16,
     attn_implementation="eager",
     use_cache=False,
 ).to("cuda")
 
 model = Custom.from_pretrained(
-    "roneneldan/TinyStories-33M",
-    attn_implementation="eager",
-    use_cache=False,
-    torch_dtype=t.bfloat16,
+    "EleutherAI/pythia-70m-deduped",
 )
-# model.fold_ln()
-model.to("cuda")
-model = t.compile(model)
+model = model.to(t.bfloat16).to("cuda")
 
-tokenizer = AutoTokenizer.from_pretrained("roneneldan/TinyStories-33M")
+# %%
+# model.fold_ln()
+# model = t.compile(model)
+
+tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
 tokenizer.pad_token = tokenizer.eos_token
 
 dataset = load_dataset("kh4dien/fineweb-100m-sample", split="train[:1%]")
@@ -36,8 +35,7 @@ mask = ~(tokens == tokenizer.pad_token_id).any(dim=1)
 tokens = tokens[mask][0].unsqueeze(0)
 print(tokens.shape)
 
-
-#  %%
+# %%
 
 transformer_out = transformer(tokens)
 custom_out = model(tokens)
