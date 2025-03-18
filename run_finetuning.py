@@ -1,5 +1,4 @@
 #%%
-print("0")
 from buffer import SimpleBuffer
 from training import train_scae_suite
 from utils import load_iterable_dataset
@@ -17,16 +16,15 @@ MODEL_NAME = "roneneldan/TinyStories-33M"
 ctx_len = 128
 k = 64
 expansion = 4
-lr=2e-3
-lr_decay_start_proportion = 0.2
+lr=1e-3
+lr_decay_start_proportion = 0.7
 num_tokens = int(100e6)
 batch_size = 256
-in_type = "mse"
-out_type = "ce"
-print("1")
+in_type = ""
+out_type = "mse"
 
 #%%
-for num_connections in [100]:
+for num_connections in ["all"]:
     if in_type == "":
         repo_id_in = None
     else:
@@ -48,8 +46,11 @@ for num_connections in [100]:
 
     #%%
     if in_type == "":
-        with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
-            connections = pickle.load(f)
+        if num_connections == "all":
+            connections=None
+        else:
+            with open(f"/root/dictionary_learning/tinystories_connections/top_connections_{num_connections}.pkl", "rb") as f:
+                connections = pickle.load(f)
         k=k
         expansion=expansion
     else:
@@ -61,7 +62,7 @@ for num_connections in [100]:
     #%%
     trainer = train_scae_suite(
         buffer,
-        stagger_steps=50,
+        # stagger_steps=50,
         k=k,
         expansion=expansion,
         model_name=MODEL_NAME,
@@ -78,6 +79,7 @@ for num_connections in [100]:
         repo_id_out = repo_id_out,
         wandb_project_name="tinystories33m_scae_6",
         wandb_run_name=f"c{num_connections} b{batch_size} decay{lr_decay_start_proportion} lr{lr} {in_type} {out_type}",
-        save_dir = "/root/dictionary_learning/checkpoints/"
+        save_dir = "/root/dictionary_learning/checkpoints/",
+        dead_feature_threshold=int(1e5)
     )
 # %%

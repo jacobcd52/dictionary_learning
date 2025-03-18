@@ -395,7 +395,7 @@ class SCAESuite(nn.Module):
         if 'pythia' in self.model.cfg.model_name or 'Pythia' in self.model.cfg.model_name:
             return up_layer < down_layer
         else:
-            return up_layer < down_layer or (up_layer == down_layer or (up_type == 'attn' and down_type == 'mlp'))
+            return up_layer < down_layer or (up_layer == down_layer and (up_type == 'attn' and down_type == 'mlp'))
             
 
     def upload_to_hf(self, repo_id: str, private: bool = False):

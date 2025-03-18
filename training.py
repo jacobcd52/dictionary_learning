@@ -83,6 +83,7 @@ def train_scae_suite(
     stagger_steps: Optional[int] = None,
     track_dead_features: bool = True,
     dead_feature_threshold: int = 10_000_000,
+    auxk_alpha: float = 0.0,  # Added parameter for auxk loss weight
 ):
     """
     Train a Sparse Connected Autoencoder Suite.
@@ -112,6 +113,7 @@ def train_scae_suite(
         stagger_steps: If provided, number of steps to wait before introducing each new loss term
         track_dead_features: Whether to track and log dead features
         dead_feature_threshold: Number of tokens after which a feature is considered dead if it hasn't fired
+        auxk_alpha: Weight for auxk loss term (0.0 disables auxk loss)
     """
     if loss_type not in ["mse", "ce"]:
         raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'mse' or 'ce'")
@@ -187,6 +189,7 @@ def train_scae_suite(
         "stagger_steps": stagger_steps,  # Add stagger_steps to config
         "track_dead_features": track_dead_features,  # Add dead feature tracking to config
         "dead_feature_threshold": dead_feature_threshold,  # Add dead feature threshold to config
+        "auxk_alpha": auxk_alpha,  # Add auxk_alpha to config
     })
     
     # Save initial config if requested
@@ -223,6 +226,106 @@ def train_scae_suite(
         else:
             return 0.0  # Zero out this component
     
+    # Helper function to compute AuxK loss
+    def compute_auxk_loss(name, features, reconstruction, target, dead_mask, module, device, dtype):
+        """
+        Compute AuxK loss for the given features and target.
+        
+        Args:
+            name: Name of the autoencoder
+            features: Feature activations (can be sparse or dense)
+            reconstruction: Current reconstruction
+            target: Target activations to reconstruct
+            dead_mask: Boolean mask indicating dead features
+            module: SCAE module reference
+            device: Device to use
+            dtype: Data type to use
+        
+        Returns:
+            AuxK loss value
+        """
+        # Skip if no dead features
+        num_dead = int(dead_mask.sum().item())
+        if num_dead == 0:
+            return t.tensor(0.0, device=device, dtype=dtype)
+        
+        # Heuristic: use k_aux as half the input dimension
+        input_dim = target.shape[-1]
+        k_aux = input_dim // 2
+        
+        # Scale based on number of dead features
+        scale = min(num_dead / k_aux, 1.0)
+        k_aux = min(k_aux, num_dead)
+        
+        # Get shape information and flatten if needed
+        if len(features.shape) == 3:  # [batch, seq, features]
+            batch_size, seq_len, _ = features.shape
+            features_flat = features.reshape(-1, features.shape[-1])  # [batch*seq, features]
+            target_flat = target.reshape(-1, target.shape[-1])  # [batch*seq, dim]
+            reconstruction_flat = reconstruction.reshape(-1, reconstruction.shape[-1])  # [batch*seq, dim]
+        else:  # [batch*seq, features]
+            features_flat = features
+            target_flat = target
+            reconstruction_flat = reconstruction
+        
+        # Compute residual
+        residual_flat = target_flat - reconstruction_flat
+        
+        # Get the autoencoder
+        ae = module.aes[name]
+        
+        # Create full non-sparse feature representation if needed
+        dict_size = ae.dict_size if hasattr(ae, 'dict_size') else ae.code_size
+        
+        if features_flat.shape[-1] != dict_size:  # If we have sparse features
+            # Create full feature tensor
+            full_features = t.zeros(
+                features_flat.shape[0], dict_size,
+                device=features_flat.device, dtype=features_flat.dtype
+            )
+            
+            # Get indices of active features
+            if hasattr(features_flat, 'indices') and hasattr(features_flat, 'values'):
+                # If features is a sparse tensor
+                full_features.scatter_(-1, features_flat.indices, features_flat.values)
+            else:
+                # If features contains top-k values
+                _, top_indices = t.topk(features_flat, k=module.k, dim=-1)
+                for i in range(features_flat.shape[0]):
+                    full_features[i, top_indices[i]] = features_flat[i, range(module.k)]
+        else:
+            full_features = features_flat
+        
+        # Expand dead mask to match features
+        dead_mask_expanded = dead_mask.unsqueeze(0).expand(full_features.shape[0], -1)
+        
+        # Apply dead mask to features
+        auxk_features = t.where(
+            dead_mask_expanded, 
+            full_features, 
+            t.tensor(-float('inf'), device=device, dtype=dtype)
+        )
+        
+        # Get top k_aux dead features
+        if k_aux > 0:
+            auxk_vals, auxk_indices = auxk_features.topk(k_aux, dim=-1, sorted=False)
+            
+            # Create sparse representation for auxk
+            auxk_features_sparse = t.zeros_like(full_features)
+            batch_indices = t.arange(full_features.shape[0], device=device).unsqueeze(1).expand(-1, k_aux)
+            auxk_features_sparse[batch_indices.flatten(), auxk_indices.flatten()] = auxk_vals.flatten()
+            
+            # Decode to get residual prediction
+            residual_pred = ae.decode(auxk_features_sparse)
+            
+            # Compute AuxK loss (MSE on residual prediction normalized by total variance)
+            total_variance = t.var(target_flat, dim=0).sum()
+            auxk_loss = (residual_pred - residual_flat).pow(2).sum() / total_variance
+            
+            return scale * auxk_loss
+        else:
+            return t.tensor(0.0, device=device, dtype=dtype)
+    
     # Initialize dead feature tracking if enabled
     dead_feature_tracking = {}
     if track_dead_features:
@@ -255,7 +358,9 @@ def train_scae_suite(
             # Call forward_pruned with return_features=True to get activations
             reconstructions, pruned_features = module.forward_pruned(cache, return_features=True)
             
-            # Track dead features if enabled
+            # Track dead features and compute auxk loss components if enabled
+            auxk_losses = {}
+            
             if track_dead_features:
                 # Get batch size for this step
                 num_tokens_in_step = tokens.flatten().shape[0]
@@ -289,6 +394,28 @@ def train_scae_suite(
                     # Compute the number of dead features
                     dead_mask = dead_feature_tracking[name]['num_tokens_since_fired'] > dead_feature_threshold
                     dead_feature_tracking[name]['dead_features'] = int(dead_mask.sum().item())
+                    
+                    # Compute AuxK loss if enabled and there are dead features
+                    if auxk_alpha > 0 and dead_feature_tracking[name]['dead_features'] > 0:
+                        layer = int(name.split('_')[1])
+                        if 'attn' in name:  
+                            target = cache[f'blocks.{layer}.hook_attn_out']
+                        elif 'mlp' in name:
+                            target = cache[f'blocks.{layer}.hook_mlp_out']
+                        else:
+                            raise RuntimeError(f"Invalid layer name: {name}")
+                        
+                        # Compute AuxK loss
+                        auxk_losses[name] = compute_auxk_loss(
+                            name=name,
+                            features=features,
+                            reconstruction=reconstructions[name],
+                            target=target,
+                            dead_mask=dead_mask,
+                            module=module,
+                            device=device,
+                            dtype=dtype
+                        )
             
             # Compute MSE loss using FVU
             total_loss = 0
@@ -302,7 +429,7 @@ def train_scae_suite(
                 elif 'mlp' in name:
                     target = cache[f'blocks.{layer}.hook_mlp_out']
                 else:
-                    RuntimeError(f"Invalid layer name: {name}")
+                    raise RuntimeError(f"Invalid layer name: {name}")
                 
                 # Compute FVU loss
                 total_variance = t.var(target, dim=0).sum()
@@ -311,7 +438,14 @@ def train_scae_suite(
                 
                 # Apply scaling factor based on step and component
                 scale = get_loss_scale(name, step)
-                total_loss = total_loss + scale * fvu_loss
+                
+                # Add auxk loss if available
+                if name in auxk_losses:
+                    component_loss = fvu_loss + auxk_alpha * auxk_losses[name]
+                else:
+                    component_loss = fvu_loss
+                
+                total_loss = total_loss + scale * component_loss
                 
                 losses[name] = fvu_loss.item()
                 scales[name] = scale
@@ -325,6 +459,11 @@ def train_scae_suite(
                     **{f"Scale/{name}": value for name, value in scales.items()},
                     "loss": loss.item()
                 }
+                
+                # Add auxk loss metrics to logging
+                if auxk_alpha > 0:
+                    for name, auxk_loss in auxk_losses.items():
+                        log_dict[f"AuxKLoss/{name}"] = auxk_loss.item()
                 
                 # Add dead feature metrics to logging if enabled
                 if track_dead_features:
@@ -345,7 +484,9 @@ def train_scae_suite(
             # Call forward_pruned with return_features=True to get activations
             reconstructions, pruned_features = module.forward_pruned(cache, return_features=True)
             
-            # Track dead features if enabled
+            # Track dead features and compute auxk loss if enabled
+            auxk_loss_total = 0
+            
             if track_dead_features:
                 # Get batch size for this step
                 num_tokens_in_step = tokens.size(0)
@@ -379,8 +520,19 @@ def train_scae_suite(
                     # Compute the number of dead features
                     dead_mask = dead_feature_tracking[name]['num_tokens_since_fired'] > dead_feature_threshold
                     dead_feature_tracking[name]['dead_features'] = int(dead_mask.sum().item())
+                    
+                    # Calculate AuxK loss contribution if enabled and there are dead features
+                    # Note: For CE loss, a complete implementation would require additional model-specific code
+                    # This is a placeholder that can be expanded if needed
+                    if auxk_alpha > 0 and dead_feature_tracking[name]['dead_features'] > 0:
+                        # Placeholder for CE-based AuxK loss implementation
+                        pass
             
-            loss = module.get_ce_loss(cache, reconstructions, tokens)
+            # Get CE loss
+            ce_loss = module.get_ce_loss(cache, reconstructions, tokens)
+            
+            # Add auxk contribution if any
+            loss = ce_loss + auxk_loss_total
             
             # Log metrics if requested
             if log_steps is not None and step % log_steps == 0 and use_wandb:
@@ -392,6 +544,9 @@ def train_scae_suite(
                     "ce_diff": loss.item() - original_loss.item(),
                     "ce": loss.item(),
                 })
+                
+                if auxk_alpha > 0:
+                    log_dict["auxk_loss"] = auxk_loss_total.item()
                 
                 # Add dead feature metrics to logging if enabled
                 if track_dead_features:

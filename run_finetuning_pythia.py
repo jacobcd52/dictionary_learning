@@ -16,7 +16,7 @@ MODEL_NAME = "pythia-70m"
 ctx_len = 128
 k = 64
 expansion = 4
-lr=0.
+lr=1e-3
 lr_decay_start_proportion = 0.7
 num_tokens = int(50e6)
 batch_size = 256
@@ -76,8 +76,10 @@ for num_connections in ["all"]:
         # repo_id_in=repo_id_in,
         repo_id_out = repo_id_out,
         wandb_project_name="pythia70_scae_2",
-        wandb_run_name=f"c{num_connections} b{batch_size} decay{lr_decay_start_proportion} lr{lr} {in_type} {out_type}",
+        wandb_run_name=f"c{num_connections} b{batch_size} dec`ay{lr_decay_start_proportion} lr{lr} {in_type} {out_type}",
         save_dir = "/root/dictionary_learning/checkpoints/",
-        dead_feature_threshold=int(1e5)
+        dead_feature_threshold=int(1e5),
+        # stagger_steps=0,
+        auxk_alpha=0
     )
 # %% 
