@@ -56,7 +56,7 @@ class SCAEModule(nn.Module, ABC):
     ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
         upstream_bias = t.zeros(
-            self.model.cfg.d_model, device="cuda", dtype=t.bfloat16
+            self.model.cfg.d_model, device="cuda", dtype=t.bfloat16, requires_grad=False
         )
 
         for up_name, ae in self.upstream_aes.items():
@@ -75,11 +75,14 @@ class SCAEModule(nn.Module, ABC):
         top_vals, top_idx = approx_acts.topk(64, dim=-1)
         top_vals = t.relu(top_vals)
 
-        feat_buffer = feature_buffer.scatter(-1, top_idx, top_vals)
+        feat_buffer = t.zeros_like(feature_buffer)
+        feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
+
+        cloned_buffer = feat_buffer.clone()
 
         reconstructions = self.ae.decode(feat_buffer)
 
-        return feature_buffer, reconstructions
+        return cloned_buffer, reconstructions
 
     @abstractmethod
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
@@ -205,13 +208,15 @@ class SCAEAttention(SCAEModule):
         cache: ActivationCache,
     ):
         down_enc = self.ae.encoder.weight
-
         b_O = self.model.b_O[self.name.layer].squeeze()
         b_O_contribution = b_O @ down_enc.T
         approx_acts = approx_acts + b_O_contribution
 
+        # Add downstream b_enc
         down_enc_bias = self.ae.encoder.bias
         approx_acts = approx_acts + down_enc_bias
+
+        # Subtract downstream b_dec contribution
         approx_acts = approx_acts - down_enc @ self.ae.b_dec
 
         # Add upstream b_dec contributions
@@ -338,6 +343,7 @@ class SCAESuite(nn.Module):
         super().__init__()
 
         self.model = model
+
         self.device = device
         self.dtype = dtype
 
@@ -448,19 +454,18 @@ class SCAESuite(nn.Module):
         reconstructions = {}
         pruned_features = {}
 
-        # Pre-allocate tensors without inplace reuse
         cache_tensor = cache["blocks.0.hook_resid_pre"]
         batch_size, seq_len = cache_tensor.shape[:2]
         device, dtype = cache_tensor.device, cache_tensor.dtype
 
+        feat_buffer = t.zeros(
+            (batch_size, seq_len, self.n_features),
+            device=device,
+            dtype=dtype,
+            requires_grad=False
+        )
+        
         for module_name, module in self.module_dict.items():
-            # Initialize feat_buffer (no inplace reuse)
-            feat_buffer = t.zeros(
-                (batch_size, seq_len, self.n_features),
-                device=device,
-                dtype=dtype,
-            )
-
             feature_buffer, reconstruction = module(
                 cache, pruned_features, feat_buffer
             )
@@ -473,10 +478,11 @@ class SCAESuite(nn.Module):
         self,
         cache,
         reconstructions: Dict[str, t.Tensor],
-        tokens: t.Tensor,  # shape: [batch, seq]
+        tokens: t.Tensor,
     ) -> t.Tensor:
+
         resid_final = sum(reconstructions.values())
-        resid_final += cache["blocks.0.hook_resid_pre"]
+        resid_final = resid_final + cache["blocks.0.hook_resid_pre"]
 
         logits = self.model.unembed(self.model.ln_final(resid_final))
 
@@ -490,12 +496,11 @@ class SCAESuite(nn.Module):
         # )
 
         # Shift sequences by 1
-        logits = logits[:, :-1, :]  # Remove last position
-        tokens = tokens[:, 1:]  # Remove first position
+        logits = logits[:, :-1, :]
+        tokens = tokens[:, 1:]
         
-        # Flatten batch and sequence dimensions
-        logits = logits.reshape(-1, logits.size(-1))  # [batch*seq, n_vocab]
-        tokens = tokens.reshape(-1)  # [batch*seq]
+        logits = logits.reshape(-1, logits.size(-1))
+        tokens = tokens.reshape(-1)
         
         loss = nn.functional.cross_entropy(
             logits,

@@ -1,5 +1,5 @@
 from multiprocessing import cpu_count
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from datasets import Dataset
 import torch as t
@@ -51,6 +51,8 @@ def chunk_and_tokenize(
     return dataset
 
 
+CacheDict = Dict[str, t.Tensor]
+
 class Buffer:
     def __init__(
         self,
@@ -92,7 +94,7 @@ class Buffer:
             ]
 
     @t.no_grad()
-    def __next__(self):
+    def __next__(self) -> Tuple[CacheDict, t.Tensor]:
         caches = []
         for _ in range(self.acc_steps):
             batch = next(self.dataloader)
@@ -100,16 +102,21 @@ class Buffer:
             _, cache = self.model.run_with_cache(
                 input_ids, return_type=None, names_filter=self.hook_list
             )
-            caches.append(cache)
+            caches.append(cache.cache_dict)
 
-        return self._format_cache(caches)
+        return self._format_cache(caches), input_ids
 
-    def _format_cache(self, caches: List[ActivationCache]) -> Dict[str, t.Tensor]:
+    def __iter__(self):
+        return self
+
+    def _format_cache(self, caches: List[CacheDict]) -> CacheDict:
         if len(caches) == 1:
             full_cache = caches[0]
             for hook_name in self.hook_list:
+                hidden_states = full_cache[hook_name]
                 if (".ln" in hook_name) or (".hook_pattern" in hook_name):
-                    full_cache[hook_name] = full_cache[hook_name].to(t.bfloat16)
+                    hidden_states = hidden_states.to(t.bfloat16)
+                full_cache[hook_name] = hidden_states.detach()
 
         else:
             full_cache = {}
@@ -117,6 +124,6 @@ class Buffer:
                 hidden_states = t.cat([cache[hook_name] for cache in caches])
                 if (".ln" in hook_name) or (".hook_pattern" in hook_name):
                     hidden_states = hidden_states.to(t.bfloat16)
-                full_cache[hook_name] = hidden_states
+                full_cache[hook_name] = hidden_states.detach()
 
         return full_cache
