@@ -179,3 +179,6 @@ nohup.out
 
 # uv
 uv.lock
+
+# Connections
+pythia_connections/

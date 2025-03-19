@@ -365,7 +365,7 @@ class SCAESuite(nn.Module):
         self.module_dict = self._make_module_dict(submodule_names, aes)
 
     def get_trainable_params(self):
-        return {name: ae.parameters() for name, ae in self.module_dict.items()}
+        return [p for ae in self.module_dict.values() for p in ae.parameters()]
 
     def _make_module_dict(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
@@ -481,15 +481,27 @@ class SCAESuite(nn.Module):
         logits = self.model.unembed(self.model.ln_final(resid_final))
 
         # https://github.com/apple/ml-cross-entropy
-        # GPTNeo TinyStories has no unembed bias.
-        loss = linear_cross_entropy(
-            logits,
-            self.model.unembed.W_U.T,
-            tokens,
-            bias=self.model.unembed.b_U,
-            shift=1,
-        )
+        # loss = linear_cross_entropy(
+        #     logits,
+        #     self.model.unembed.W_U,
+        #     tokens,
+        #     bias=self.model.unembed.b_U,
+        #     shift=1,
+        # )
 
+        # Shift sequences by 1
+        logits = logits[:, :-1, :]  # Remove last position
+        tokens = tokens[:, 1:]  # Remove first position
+        
+        # Flatten batch and sequence dimensions
+        logits = logits.reshape(-1, logits.size(-1))  # [batch*seq, n_vocab]
+        tokens = tokens.reshape(-1)  # [batch*seq]
+        
+        loss = nn.functional.cross_entropy(
+            logits,
+            tokens,
+            reduction='mean'
+        )
         return loss
 
 
