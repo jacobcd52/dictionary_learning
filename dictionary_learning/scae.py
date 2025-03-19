@@ -5,9 +5,8 @@ import einops
 from cut_cross_entropy import linear_cross_entropy
 import torch as t
 import torch.nn as nn
-from transformer_lens import ActivationCache
+from transformer_lens import ActivationCache, HookedTransformer
 
-from .gpt_neox import GPTNeoXForCausalLM
 from .top_k import AutoEncoderTopK
 
 
@@ -35,7 +34,7 @@ class SubmoduleName(NamedTuple):
 class SCAEModule(nn.Module, ABC):
     def __init__(
         self,
-        model: GPTNeoXForCausalLM,
+        model: HookedTransformer,
         ae: AutoEncoderTopK,
         upstream_aes: Dict[str, AutoEncoderTopK],
         connection_masks: Dict[str, t.Tensor],
@@ -57,11 +56,10 @@ class SCAEModule(nn.Module, ABC):
     ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
         upstream_bias = t.zeros(
-            self.model.config.hidden_size, device="cuda", dtype=t.bfloat16
+            self.model.cfg.d_model, device="cuda", dtype=t.bfloat16
         )
 
         for up_name, ae in self.upstream_aes.items():
-            print(self.name, up_name)
             upstream_bias = upstream_bias + ae.b_dec
 
             connection_mask = self.connection_masks[up_name]
@@ -110,7 +108,7 @@ class SCAEModule(nn.Module, ABC):
 class SCAEAttention(SCAEModule):
     def __init__(
         self,
-        model: GPTNeoXForCausalLM,
+        model: HookedTransformer,
         ae: AutoEncoderTopK,
         upstream_aes: List[AutoEncoderTopK],
         connection_masks: Dict[str, t.Tensor],
@@ -118,33 +116,19 @@ class SCAEAttention(SCAEModule):
     ):
         super().__init__(model, ae, upstream_aes, connection_masks, name)
 
-        W_QKV = model.gpt_neox.layers[name.layer].attention.query_key_value
-        _, _, W_V = W_QKV.weight.chunk(3, dim=0)
-        W_V = einops.rearrange(
-            W_V,
-            "(n_heads d_head) d_model_in -> n_heads d_head d_model_in",
-            n_heads=8,
-            d_head=64,
-        )
-
-        W_O = model.gpt_neox.layers[name.layer].attention.dense.weight
-        W_O = einops.rearrange(
-            W_O,
-            "(n_heads d_head) d_model_out -> n_heads d_head d_model_out",
-            n_heads=8,
-            d_head=64,
-        )
+        W_O = model.W_O[self.name.layer]
+        W_V = model.W_V[self.name.layer]
 
         self.W_OV = einops.einsum(
             W_O,
             W_V,
-            "n_heads d_head d_model_out, n_heads d_head d_model_in \
-                -> n_heads d_model_in d_model_out",
+            "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
         )
 
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
         initial_act_post_ln = (
-            cache["embed_out"] / cache[f"blocks.{self.name.layer}.ln1_scale"]
+            cache["blocks.0.hook_resid_pre"]
+            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
 
         # batch seq d_model, n_heads d_model_in d_model_out, n_features d_model_out
@@ -192,7 +176,7 @@ class SCAEAttention(SCAEModule):
             virtual_weights = virtual_weights * connection_mask.unsqueeze(0)
 
         up_facts_post_ln = (
-            up_pruned_features / cache[f"blocks.{self.name.layer}.ln1_scale"]
+            up_pruned_features / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
         # batch qseq n_features_up, n_heads n_features_down n_features_up
         # -> batch n_heads qseq n_features_down
@@ -221,8 +205,8 @@ class SCAEAttention(SCAEModule):
     ):
         down_enc = self.ae.encoder.weight
 
-        b_O = self.model.gpt_neox.layers[self.name.layer].attention.dense.bias
-        b_O_contribution = b_O.squeeze() @ down_enc.T
+        b_O = self.model.b_O[self.name.layer].squeeze()
+        b_O_contribution = b_O @ down_enc.T
         approx_acts = approx_acts + b_O_contribution
 
         down_enc_bias = self.ae.encoder.bias
@@ -233,7 +217,7 @@ class SCAEAttention(SCAEModule):
         # Add upstream b_dec contributions
         upstream_bias_post_ln = (
             upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{self.name.layer}.ln1_scale"]
+            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
 
         # n_heads d_model_in d_model_out, batch seq d_model_in
@@ -258,7 +242,7 @@ class SCAEAttention(SCAEModule):
 class SCAEMLP(SCAEModule):
     def __init__(
         self,
-        model: GPTNeoXForCausalLM,
+        model: HookedTransformer,
         ae: AutoEncoderTopK,
         upstream_aes: List[AutoEncoderTopK],
         connection_masks: Dict[str, t.Tensor],
@@ -270,7 +254,8 @@ class SCAEMLP(SCAEModule):
         down_enc = self.ae.encoder.weight
 
         initial_act_post_ln = (
-            cache["embed_out"] / cache[f"blocks.{self.name.layer}.ln2_scale"]
+            cache["blocks.0.hook_resid_pre"]
+            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
         # batch seq d_model, n_features d_model -> batch seq n_features
@@ -291,7 +276,7 @@ class SCAEMLP(SCAEModule):
             virtual_weights = virtual_weights * connection_mask
 
         up_facts_post_ln = (
-            up_pruned_features / cache[f"blocks.{self.name.layer}.ln2_scale"]
+            up_pruned_features / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
         contributions = up_facts_post_ln @ virtual_weights.T
@@ -314,7 +299,7 @@ class SCAEMLP(SCAEModule):
         # Add upstream b_dec contributions
         upstream_bias_post_ln = (
             upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{self.name.layer}.ln2_scale"]
+            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
         # n_features_down d_model_in, batch seq d_model_in
@@ -358,7 +343,7 @@ class SCAESuite(nn.Module):
         self.k = k
         self.n_features = n_features
 
-        n_layers = model.config.num_hidden_layers
+        n_layers = model.cfg.n_layers
 
         self.connections = connections
         self.connection_masks = self._process_connections(connections)
@@ -370,9 +355,9 @@ class SCAESuite(nn.Module):
         ]
 
         aes = {
-            name: AutoEncoderTopK(model.config.hidden_size, n_features, k).to(
-                device=self.device, dtype=self.dtype
-            )
+            name: AutoEncoderTopK(model.cfg.d_model, n_features, k)
+            .to(self.device)
+            .to(self.dtype)
             for name in submodule_names
         }
 
@@ -390,24 +375,11 @@ class SCAESuite(nn.Module):
             upstream_aes = {}
 
             for up in submodule_names:
-                # Adjacent means an attention block feeding
-                # into an MLP block on the same layer
-                # adjacent = (
-                #     up.layer == down.layer
-                #     and up.submodule_type == "attn"
-                #     and down.submodule_type == "mlp"
-                # )
-
-                # # Skip if up is on a later layer or not adjacent
-                # if up.layer > down.layer or not adjacent:
-                #     continue
-
                 if up.layer >= down.layer:
                     continue
 
                 if self.connections is None or (
-                    isinstance(self.connections, dict)
-                    and down.name in self.connections
+                    down.name in self.connections
                     and up.name in self.connections[down.name]
                 ):
                     upstream_aes[up.name] = aes[up]
@@ -473,7 +445,7 @@ class SCAESuite(nn.Module):
         pruned_features = {}
 
         # Pre-allocate tensors without inplace reuse
-        first_cache_tensor = cache["embed_out"]
+        first_cache_tensor = cache["blocks.0.hook_resid_pre"]
         batch_size, seq_len = first_cache_tensor.shape[:2]
         device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
 
@@ -483,10 +455,11 @@ class SCAESuite(nn.Module):
         )
 
         for module_name, module in self.module_dict.items():
-            feature_buffer, reconstructions[module_name] = module(
+            feature_buffer, reconstruction = module(
                 cache, pruned_features, feat_buffer
             )
             pruned_features[module_name] = feature_buffer
+            reconstructions[module_name] = reconstruction
 
         return reconstructions
 
@@ -506,15 +479,14 @@ class SCAESuite(nn.Module):
             Cross entropy loss between predicted logits and target tokens
         """
         resid_final = sum(reconstructions.values())
-        resid_final += cache["embed_out"]
+        resid_final += cache["blocks.0.hook_resid_pre"]
 
-        unembed = self.model.lm_head
-        logits = unembed(
-            self.model.ln_final(resid_final)
-        )  # [batch, seq, n_vocab]
+        logits = self.model.unembed(self.model.ln_final(resid_final))
 
         # https://github.com/apple/ml-cross-entropy
         # GPTNeo TinyStories has no unembed bias.
-        loss = linear_cross_entropy(logits, unembed.weight, tokens, shift=1)
+        loss = linear_cross_entropy(
+            logits, self.model.unembed.weight, tokens, shift=1
+        )
 
         return loss

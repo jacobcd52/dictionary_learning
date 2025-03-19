@@ -1,12 +1,11 @@
-import torch as t
-from transformers import PreTrainedTokenizerBase
-from typing import Dict, List
-from datasets import Dataset
 from multiprocessing import cpu_count
+from typing import Dict, List
 
-from .gpt_neox import GPTNeoXModel, ModelHiddenStates
-
+from datasets import Dataset
+import torch as t
 from torch.utils.data import DataLoader
+from transformers import PreTrainedTokenizerBase
+from transformer_lens import HookedTransformer, ActivationCache
 
 
 def chunk_and_tokenize(
@@ -52,39 +51,31 @@ def chunk_and_tokenize(
     return dataset
 
 
-def format_cache(hidden_states: List[ModelHiddenStates]) -> Dict[str, t.Tensor]:
-    embed_out = t.cat([hs.embed_out for hs in hidden_states])
+def format_cache(
+    caches: List[ActivationCache], hook_names: List[str]
+) -> Dict[str, t.Tensor]:
+    if len(caches) == 1:
 
-    cache = {
-        "embed_out": embed_out,
-    }
+        full_cache = caches[0]
+        for hook_name in hook_names:
+            if (".ln" in hook_name) or (".hook_pattern" in hook_name):
+                full_cache[hook_name] = full_cache[hook_name].to(t.bfloat16)
 
-    for layer_idx, layer_hidden_states in enumerate(
-        zip(*[hs.all_hidden_states for hs in hidden_states])
-    ):
-        # ln_1_scale = t.cat([hs.ln_1_scale for hs in layer_hidden_states])
-        # ln_2_scale = t.cat([hs.ln_2_scale for hs in layer_hidden_states])
-        attn_out = t.cat([hs.attn_out for hs in layer_hidden_states])
-        mlp_out = t.cat([hs.mlp_out for hs in layer_hidden_states])
-        attn_weights = t.cat([hs.attn_weights for hs in layer_hidden_states])
+    else:
+        full_cache = {}
+        for hook_name in hook_names:
+            hidden_states = t.cat([cache[hook_name] for cache in caches])
+            if (".ln" in hook_name) or (".hook_pattern" in hook_name):
+                hidden_states = hidden_states.to(t.bfloat16)
+            full_cache[hook_name] = hidden_states
 
-        layer_cache = {
-            f"blocks.{layer_idx}.ln1_scale": 0,
-            f"blocks.{layer_idx}.ln2_scale": 0,
-            f"blocks.{layer_idx}.hook_attn_out": attn_out,
-            f"blocks.{layer_idx}.hook_mlp_out": mlp_out,
-            f"blocks.{layer_idx}.attn.hook_pattern": attn_weights,
-        }
-
-        cache.update(layer_cache)
-
-    return cache
+    return full_cache
 
 
 class Buffer:
     def __init__(
         self,
-        model: GPTNeoXModel,
+        model: HookedTransformer,
         dataset: Dataset,
         batch_out_size: int,
         refresh_batch_size: int,
@@ -109,12 +100,27 @@ class Buffer:
         )
         self.model = model
 
+        self.hook_list = ["blocks.0.hook_resid_pre"]
+        for layer in range(self.model.cfg.n_layers):
+            self.hook_list += [
+                f"blocks.{layer}.ln1.hook_scale",
+                f"blocks.{layer}.ln2.hook_scale",
+                # f"blocks.{layer}.ln1.hook_normalized",
+                # f"blocks.{layer}.ln2.hook_normalized",
+                # f"blocks.{layer}.hook_attn_out",
+                # f"blocks.{layer}.hook_mlp_out",
+                f"blocks.{layer}.attn.hook_pattern",
+            ]
+
     @t.no_grad()
     def __next__(self):
-        hidden_states = []
+        caches = []
         for _ in range(self.acc_steps):
             batch = next(self.dataloader)
             input_ids = batch["input_ids"].to("cuda")
-            hidden_states.append(self.model(input_ids))
+            _, cache = self.model.run_with_cache(
+                input_ids, names_filter=self.hook_list
+            )
+            caches.append(cache)
 
-        return format_cache(hidden_states)
+        return format_cache(caches, self.hook_list)
