@@ -131,11 +131,11 @@ class SCAEAttention(SCAEModule):
             / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
 
-        # batch seq d_model, n_heads d_model_in d_model_out, n_features d_model_out
-        # -> batch seq n_heads n_features
+        # batch seq d_model_in, n_heads d_model_in d_model_out, n_features_down d_model_out
+        # -> batch seq n_heads n_features_down
         down_enc = self.ae.encoder.weight
         initial_contrib_pre_moving = t.einsum(
-            "b s m, h i o, f o -> b s h f",
+            "b s i, h i o, d o -> b s h d",
             initial_act_post_ln,
             self.W_OV,
             down_enc,
@@ -144,10 +144,10 @@ class SCAEAttention(SCAEModule):
         # Mix between positions using attention pattern
         probs = cache[f"blocks.{self.name.layer}.attn.hook_pattern"]
 
-        # batch n_heads qseq kseq, batch kseq n_heads n_features
-        # -> batch qseq n_features
+        # batch n_heads qseq kseq, batch kseq n_heads n_features_down
+        # -> batch qseq n_features_down
         initial_contrib = t.einsum(
-            "b h q k, b k h f -> b q f", probs, initial_contrib_pre_moving
+            "b h q k, b k h d -> b q d", probs, initial_contrib_pre_moving
         )
 
         return initial_contrib
@@ -176,7 +176,8 @@ class SCAEAttention(SCAEModule):
             virtual_weights = virtual_weights * connection_mask.unsqueeze(0)
 
         up_facts_post_ln = (
-            up_pruned_features / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
+            up_pruned_features
+            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
         # batch qseq n_features_up, n_heads n_features_down n_features_up
         # -> batch n_heads qseq n_features_down
@@ -210,7 +211,6 @@ class SCAEAttention(SCAEModule):
         approx_acts = approx_acts + b_O_contribution
 
         down_enc_bias = self.ae.encoder.bias
-        # bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
         approx_acts = approx_acts + down_enc_bias
         approx_acts = approx_acts - down_enc @ self.ae.b_dec
 
@@ -276,7 +276,8 @@ class SCAEMLP(SCAEModule):
             virtual_weights = virtual_weights * connection_mask
 
         up_facts_post_ln = (
-            up_pruned_features / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
+            up_pruned_features
+            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
         contributions = up_facts_post_ln @ virtual_weights.T
@@ -355,13 +356,16 @@ class SCAESuite(nn.Module):
         ]
 
         aes = {
-            name: AutoEncoderTopK(model.cfg.d_model, n_features, k)
+            sm.name: AutoEncoderTopK(model.cfg.d_model, n_features, k)
             .to(self.device)
             .to(self.dtype)
-            for name in submodule_names
+            for sm in submodule_names
         }
 
         self.module_dict = self._make_module_dict(submodule_names, aes)
+
+    def get_trainable_params(self):
+        return {name: ae.parameters() for name, ae in self.module_dict.items()}
 
     def _make_module_dict(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
@@ -382,12 +386,12 @@ class SCAESuite(nn.Module):
                     down.name in self.connections
                     and up.name in self.connections[down.name]
                 ):
-                    upstream_aes[up.name] = aes[up]
+                    upstream_aes[up.name] = aes[up.name]
 
             module_dict[down.name] = _make_module(
                 down.submodule_type,
                 self.model,
-                aes[down],
+                aes[down.name],
                 upstream_aes,
                 self.connection_masks[down.name],
                 down,
@@ -445,16 +449,18 @@ class SCAESuite(nn.Module):
         pruned_features = {}
 
         # Pre-allocate tensors without inplace reuse
-        first_cache_tensor = cache["blocks.0.hook_resid_pre"]
-        batch_size, seq_len = first_cache_tensor.shape[:2]
-        device, dtype = first_cache_tensor.device, first_cache_tensor.dtype
-
-        # Initialize feat_buffer (no inplace reuse)
-        feat_buffer = t.zeros(
-            (batch_size, seq_len, self.n_features), device=device, dtype=dtype
-        )
+        cache_tensor = cache["blocks.0.hook_resid_pre"]
+        batch_size, seq_len = cache_tensor.shape[:2]
+        device, dtype = cache_tensor.device, cache_tensor.dtype
 
         for module_name, module in self.module_dict.items():
+            # Initialize feat_buffer (no inplace reuse)
+            feat_buffer = t.zeros(
+                (batch_size, seq_len, self.n_features),
+                device=device,
+                dtype=dtype,
+            )
+
             feature_buffer, reconstruction = module(
                 cache, pruned_features, feat_buffer
             )
@@ -469,15 +475,6 @@ class SCAESuite(nn.Module):
         reconstructions: Dict[str, t.Tensor],
         tokens: t.Tensor,  # shape: [batch, seq]
     ) -> t.Tensor:
-        """Compute cross entropy loss from reconstructions.
-
-        Args:
-            reconstructions: Dictionary mapping layer names to reconstruction tensors
-            tokens: Integer tensor of target tokens
-
-        Returns:
-            Cross entropy loss between predicted logits and target tokens
-        """
         resid_final = sum(reconstructions.values())
         resid_final += cache["blocks.0.hook_resid_pre"]
 
@@ -486,7 +483,62 @@ class SCAESuite(nn.Module):
         # https://github.com/apple/ml-cross-entropy
         # GPTNeo TinyStories has no unembed bias.
         loss = linear_cross_entropy(
-            logits, self.model.unembed.weight, tokens, shift=1
+            logits,
+            self.model.unembed.W_U.T,
+            tokens,
+            bias=self.model.unembed.b_U,
+            shift=1,
         )
 
         return loss
+
+
+class MergedSCAESuite(nn.Module):
+    def __init__(self, model: HookedTransformer, scae_suite: SCAESuite):
+        super().__init__()
+
+        self.model = model
+        self.scae_suite = scae_suite
+
+        self.hook_list = ["blocks.0.hook_resid_pre"]
+        for layer in range(self.model.cfg.n_layers):
+            self.hook_list += [
+                f"blocks.{layer}.ln1.hook_scale",
+                f"blocks.{layer}.ln2.hook_scale",
+                # f"blocks.{layer}.ln1.hook_normalized",
+                # f"blocks.{layer}.ln2.hook_normalized",
+                # f"blocks.{layer}.hook_attn_out",
+                # f"blocks.{layer}.hook_mlp_out",
+                f"blocks.{layer}.attn.hook_pattern",
+            ]
+
+    def get_trainable_params(self):
+        return self.scae_suite.get_trainable_params()
+
+    @t.no_grad()
+    def _get_cache(self, input_ids: t.Tensor) -> ActivationCache:
+        _, cache = self.model.run_with_cache(
+            input_ids, return_type=None, names_filter=self.hook_list
+        )
+
+        cache = cache.cache_dict
+
+        for hook_name in self.hook_list:
+            if (".ln" in hook_name) or (".hook_pattern" in hook_name):
+                cache[hook_name] = cache[hook_name].to(t.bfloat16)
+
+        return cache
+
+    def forward(
+        self, input_ids: t.Tensor, return_loss: bool = False
+    ) -> ActivationCache:
+        cache = self._get_cache(input_ids)
+        reconstructions = self.scae_suite(cache)
+
+        if return_loss:
+            loss = self.scae_suite.get_ce_loss(
+                cache, reconstructions, input_ids
+            )
+            return reconstructions, loss
+
+        return reconstructions, None

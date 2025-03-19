@@ -51,27 +51,6 @@ def chunk_and_tokenize(
     return dataset
 
 
-def format_cache(
-    caches: List[ActivationCache], hook_names: List[str]
-) -> Dict[str, t.Tensor]:
-    if len(caches) == 1:
-
-        full_cache = caches[0]
-        for hook_name in hook_names:
-            if (".ln" in hook_name) or (".hook_pattern" in hook_name):
-                full_cache[hook_name] = full_cache[hook_name].to(t.bfloat16)
-
-    else:
-        full_cache = {}
-        for hook_name in hook_names:
-            hidden_states = t.cat([cache[hook_name] for cache in caches])
-            if (".ln" in hook_name) or (".hook_pattern" in hook_name):
-                hidden_states = hidden_states.to(t.bfloat16)
-            full_cache[hook_name] = hidden_states
-
-    return full_cache
-
-
 class Buffer:
     def __init__(
         self,
@@ -119,8 +98,25 @@ class Buffer:
             batch = next(self.dataloader)
             input_ids = batch["input_ids"].to("cuda")
             _, cache = self.model.run_with_cache(
-                input_ids, names_filter=self.hook_list
+                input_ids, return_type=None, names_filter=self.hook_list
             )
             caches.append(cache)
 
-        return format_cache(caches, self.hook_list)
+        return self._format_cache(caches)
+
+    def _format_cache(self, caches: List[ActivationCache]) -> Dict[str, t.Tensor]:
+        if len(caches) == 1:
+            full_cache = caches[0]
+            for hook_name in self.hook_list:
+                if (".ln" in hook_name) or (".hook_pattern" in hook_name):
+                    full_cache[hook_name] = full_cache[hook_name].to(t.bfloat16)
+
+        else:
+            full_cache = {}
+            for hook_name in self.hook_list:
+                hidden_states = t.cat([cache[hook_name] for cache in caches])
+                if (".ln" in hook_name) or (".hook_pattern" in hook_name):
+                    hidden_states = hidden_states.to(t.bfloat16)
+                full_cache[hook_name] = hidden_states
+
+        return full_cache
