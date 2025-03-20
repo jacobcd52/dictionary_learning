@@ -488,14 +488,14 @@ class SCAESuite(nn.Module):
 
 
 class MergedSCAESuite(nn.Module):
-    def __init__(self, model: HookedTransformer, scae_suite: SCAESuite):
+    def __init__(self, transformer: HookedTransformer, scae_suite: SCAESuite):
         super().__init__()
 
-        self.model = model
+        self.transformer = transformer
         self.scae_suite = scae_suite
 
         self.hook_list = ["blocks.0.hook_resid_pre"]
-        for layer in range(self.model.cfg.n_layers):
+        for layer in range(self.transformer.cfg.n_layers):
             self.hook_list += [
                 f"blocks.{layer}.ln1.hook_scale",
                 f"blocks.{layer}.ln2.hook_scale",
@@ -520,7 +520,7 @@ class MergedSCAESuite(nn.Module):
 
     @t.no_grad()
     def _get_cache(self, input_ids: t.Tensor) -> ActivationCache:
-        _, cache = self.model.run_with_cache(
+        _, cache = self.transformer.run_with_cache(
             input_ids, return_type=None, names_filter=self.hook_list
         )
 

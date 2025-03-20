@@ -45,7 +45,7 @@ class SCAEConfig:
             "sample_length": self.sample_length,
         }
 
-def prepare_optim_and_scheduler(model, n_steps: int, cfg: SCAEConfig):
+def prepare_optim_and_scheduler(model: MergedSCAESuite, n_steps: int, cfg: SCAEConfig):
     if cfg.quantize_optimizer:
         from bitsandbytes.optim import Adam8bit as Adam
         print("Using Adam8bit optimizer")
@@ -55,7 +55,7 @@ def prepare_optim_and_scheduler(model, n_steps: int, cfg: SCAEConfig):
 
     if cfg.lr is None:
         n_features = model.transformer.cfg.d_model * cfg.expansion_factor
-        cfg.lr = (n_features / 2**14)**0.5
+        cfg.lr = 2e-4 / (n_features / 2**14)**0.5
 
     adam = Adam(model.get_trainable_params(), lr=cfg.lr)
 
@@ -167,7 +167,7 @@ def train(
             _, loss = model(input_ids, return_loss=True)
 
             loss.backward()
-            model.module.clip_grad_norm()
+            # model.module.clip_grad_norm()
             optimizer.step()
             scheduler.step()
 

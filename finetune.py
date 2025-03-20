@@ -8,20 +8,17 @@ from dictionary_learning.trainer import train, SCAEConfig
 
 
 PATH = "/root/dictionary_learning/pythia_connections/Copy of top_connections_20.pkl"
-
+N_TOKENS = 25_000_000
 CFG = SCAEConfig(
     wb_project="dictionary_learning",
-    lr=2e-5,
-    warmup_ratio=0.05,
+    warmup_ratio=0.00,
     epochs=1,
-    batch_size=32,
+    batch_size=64,
     k=64,
     expansion_factor=4,
-    sample_length=512,
+    sample_length=256,
     connections_path=PATH,
 )
-
-N_TOKENS = 200_000_000
 
 
 def main():
@@ -36,6 +33,7 @@ def main():
     buffered_row_count = int(N_TOKENS / CFG.sample_length * 1.5)
     dataset = dataset.select(range(buffered_row_count))
     dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length)
+    dataset = dataset.select(range(N_TOKENS // CFG.sample_length))
 
     world_size = t.cuda.device_count()
 
