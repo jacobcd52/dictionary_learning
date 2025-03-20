@@ -15,34 +15,49 @@ from .scae import SCAESuite, MergedSCAESuite
 
 
 @dataclass
-class TrainerConfig:
+class SCAEConfig:
+    # SCAE Arguments
+    k: int
+    expansion_factor: int
+    connections_path: str
+
     wb_project: str = "dictionary_learning"
-    wb_name: str = "scae"
-    lr: float = 2e-5
+    wb_run_name: str = "scae"
+    wb_entity: str = "steering-finetuning"
+    lr: float = None
 
     warmup_ratio: float = 0.05
     epochs: int = 1
     batch_size: int = 16
     quantize_optimizer: bool = False
+    sample_length: int = 512
 
+    @property
+    def wb_cfg(self):
+        return {
+            "k": self.k,
+            "expansion_factor": self.expansion_factor,
+            "lr": self.lr,
+            "warmup_ratio": self.warmup_ratio,
+            "epochs": self.epochs,
+            "batch_size": self.batch_size,
+            "quantize_optimizer": self.quantize_optimizer,
+            "sample_length": self.sample_length,
+        }
 
-@dataclass
-class SCAEConfig:
-    k: int
-    expansion_factor: int
-    connections_path: str
+def prepare_optim_and_scheduler(model, n_steps: int, cfg: SCAEConfig):
+    if cfg.quantize_optimizer:
+        from bitsandbytes.optim import Adam8bit as Adam
+        print("Using Adam8bit optimizer")
 
+    else:
+        from torch.optim import Adam
 
-def prepare_optim_and_scheduler(model, n_steps: int, cfg: TrainerConfig):
-    # if cfg.quantize_optimizer:
-    #     from bitsandbytes.optim import Adam8bit as Adam
+    if cfg.lr is None:
+        n_features = model.transformer.cfg.d_model * cfg.expansion_factor
+        cfg.lr = (n_features / 2**14)**0.5
 
-    #     print("Using Adam8bit optimizer")
-
-    # else:
-    from torch.optim import Adam
-
-    adam = Adam(model.module.get_trainable_params(), lr=cfg.lr)
+    adam = Adam(model.get_trainable_params(), lr=cfg.lr)
 
     warmup_steps = int(cfg.warmup_ratio * n_steps)
     lr_scheduler = get_linear_schedule_with_warmup(adam, warmup_steps, n_steps)
@@ -51,7 +66,7 @@ def prepare_optim_and_scheduler(model, n_steps: int, cfg: TrainerConfig):
 
 
 def prepare_dataloader(
-    dataset: Dataset, world_size: int, rank: int, cfg: TrainerConfig
+    dataset: Dataset, world_size: int, rank: int, cfg: SCAEConfig
 ):
     # Create distributed samplers
     train_sampler = DistributedSampler(
@@ -118,43 +133,45 @@ def train(
     world_size: int,
     dtype: t.dtype,
     dataset: Dataset,
-    train_cfg: TrainerConfig,
-    scae_cfg: SCAEConfig,
+    cfg: SCAEConfig,
 ):
     setup(rank, world_size)
-
-    # Load model and dispatch to correct device
     device = f"cuda:{rank}"
-    t.cuda.set_device(device)
 
-    # Not needed for bfloat16
-    # https://discuss.pytorch.org/t/why-bf16-do-not-need-loss-scaling/176596
-    # TODO: Learn about this
-    # scaler = GradScaler()
-    model = load_model(device, dtype, scae_cfg)
+    # Prepare optimizer and distributed dataloader
+    model = load_model(device, dtype, cfg)
+    loader = prepare_dataloader(dataset, world_size, rank, cfg)
+    optimizer, scheduler = prepare_optim_and_scheduler(
+        model, len(loader), cfg
+    )
+
     model = DDP(
         model,
         device_ids=[rank],
         output_device=rank,
     )
 
-    # Prepare optimizer and distributed dataloader
-    loader = prepare_dataloader(dataset, world_size, rank, train_cfg)
-    optimizer, scheduler = prepare_optim_and_scheduler(
-        model, len(loader), train_cfg
-    )
+    if rank == 0 and cfg.wb_project is not None:
+        wb.init(
+            project=cfg.wb_project,
+            name=cfg.wb_run_name,
+            config=cfg.wb_cfg,
+            entity=cfg.wb_entity,
+        )
 
-    for epoch in range(train_cfg.epochs):
+    for epoch in range(cfg.epochs):
         loader.sampler.set_epoch(epoch)
-        for batch in tqdm(loader):
+        for batch in tqdm(loader, disable=rank != 0):
             optimizer.zero_grad()
-            input_ids = batch["input_ids"]
+            input_ids = batch["input_ids"].to(device)
             _, loss = model(input_ids, return_loss=True)
 
             loss.backward()
+            model.module.clip_grad_norm()
             optimizer.step()
             scheduler.step()
 
-        dist.barrier()
+            if rank == 0:
+                wb.log({"loss": loss.item()})
 
     cleanup()

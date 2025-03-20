@@ -4,39 +4,44 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from dictionary_learning.buffer import chunk_and_tokenize
-from dictionary_learning.trainer import train, TrainerConfig, SCAEConfig
+from dictionary_learning.trainer import train, SCAEConfig
 
-n_connections = 20
-path = f"/root/dictionary_learning/pythia_connections/Copy of top_connections_{n_connections}.pkl"
 
-SCAE_CFG = SCAEConfig(
-    k=64,
-    expansion_factor=4,
-    connections_path=path,
-)
+PATH = "/root/dictionary_learning/pythia_connections/Copy of top_connections_20.pkl"
 
-TRAIN_CFG = TrainerConfig(
+CFG = SCAEConfig(
     wb_project="dictionary_learning",
-    wb_name="finetune",
     lr=2e-5,
     warmup_ratio=0.05,
     epochs=1,
-    batch_size=64,
+    batch_size=32,
+    k=64,
+    expansion_factor=4,
+    sample_length=512,
+    connections_path=PATH,
 )
+
+N_TOKENS = 200_000_000
 
 
 def main():
-    # Load dataset
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
     tokenizer.pad_token = tokenizer.eos_token
-    dataset = load_dataset("kh4dien/fineweb-100m-sample", split="train[:50%]")
-    dataset = chunk_and_tokenize(dataset, tokenizer, "text", 256)
+    dataset = load_dataset(
+        "/root/dictionary_learning/pile-uncopyrighted", split="train"
+    )
+    # Compute the number of rows to get from the
+    # Pile depending on a desired number of tokens.
+    # Buffer a little bc not all rows might have enough tokens.
+    buffered_row_count = int(N_TOKENS / CFG.sample_length * 1.5)
+    dataset = dataset.select(range(buffered_row_count))
+    dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length)
 
     world_size = t.cuda.device_count()
 
     mp.spawn(
         train,
-        args=(world_size, t.bfloat16, dataset, TRAIN_CFG, SCAE_CFG),
+        args=(world_size, t.bfloat16, dataset, CFG),
         nprocs=world_size,
         join=True,
     )

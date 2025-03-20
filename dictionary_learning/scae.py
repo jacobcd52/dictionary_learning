@@ -299,7 +299,7 @@ class SCAEMLP(SCAEModule):
     ):
         down_enc = self.ae.encoder.weight
         down_enc_bias = self.ae.encoder.bias
-        
+
         # bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
         approx_acts = approx_acts + down_enc_bias
         approx_acts = approx_acts - down_enc @ self.ae.b_dec
@@ -370,9 +370,6 @@ class SCAESuite(nn.Module):
         }
 
         self.module_dict = self._make_module_dict(submodule_names, aes)
-
-    def get_trainable_params(self):
-        return [p for ae in self.module_dict.values() for p in ae.parameters()]
 
     def _make_module_dict(
         self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
@@ -506,7 +503,20 @@ class MergedSCAESuite(nn.Module):
             ]
 
     def get_trainable_params(self):
-        return self.scae_suite.get_trainable_params()
+        params = []
+        for module in self.scae_suite.module_dict.values():
+            for submodule in module.modules():
+                if isinstance(submodule, AutoEncoderTopK):
+                    params.extend(submodule.parameters())
+
+        return params
+
+    def clip_grad_norm(self, max_norm: float = 1.0):
+        for module in self.scae_suite.module_dict.values():
+            for submodule in module.modules():
+                is_ae = isinstance(submodule, AutoEncoderTopK)
+                if is_ae and submodule.decoder.weight.grad is not None:
+                    t.nn.utils.clip_grad_norm_(submodule.parameters(), max_norm)
 
     @t.no_grad()
     def _get_cache(self, input_ids: t.Tensor) -> ActivationCache:
