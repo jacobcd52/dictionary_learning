@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import torch as t
 import torch.distributed as dist
-from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from transformers import get_linear_schedule_with_warmup
@@ -22,7 +21,7 @@ class TrainerConfig:
     lr: float = 2e-5
 
     warmup_ratio: float = 0.05
-    n_steps: int = 10
+    epochs: int = 1
     batch_size: int = 16
     quantize_optimizer: bool = False
 
@@ -34,21 +33,19 @@ class SCAEConfig:
     connections_path: str
 
 
-def prepare_optim_and_scheduler(model, cfg: TrainerConfig):
-    if cfg.quantize_optimizer:
-        from bitsandbytes.optim import Adam8bit as Adam
+def prepare_optim_and_scheduler(model, n_steps: int, cfg: TrainerConfig):
+    # if cfg.quantize_optimizer:
+    #     from bitsandbytes.optim import Adam8bit as Adam
 
-        print("Using Adam8bit optimizer")
+    #     print("Using Adam8bit optimizer")
 
-    else:
-        from torch.optim import Adam
+    # else:
+    from torch.optim import Adam
 
     adam = Adam(model.module.get_trainable_params(), lr=cfg.lr)
 
-    warmup_steps = int(cfg.warmup_ratio * cfg.n_steps)
-    lr_scheduler = get_linear_schedule_with_warmup(
-        adam, warmup_steps, cfg.n_steps
-    )
+    warmup_steps = int(cfg.warmup_ratio * n_steps)
+    lr_scheduler = get_linear_schedule_with_warmup(adam, warmup_steps, n_steps)
 
     return adam, lr_scheduler
 
@@ -130,7 +127,10 @@ def train(
     device = f"cuda:{rank}"
     t.cuda.set_device(device)
 
-    scaler = GradScaler()
+    # Not needed for bfloat16
+    # https://discuss.pytorch.org/t/why-bf16-do-not-need-loss-scaling/176596
+    # TODO: Learn about this
+    # scaler = GradScaler()
     model = load_model(device, dtype, scae_cfg)
     model = DDP(
         model,
@@ -139,20 +139,22 @@ def train(
     )
 
     # Prepare optimizer and distributed dataloader
-    optimizer, scheduler = prepare_optim_and_scheduler(model, train_cfg)
     loader = prepare_dataloader(dataset, world_size, rank, train_cfg)
+    optimizer, scheduler = prepare_optim_and_scheduler(
+        model, len(loader), train_cfg
+    )
 
-    loader.sampler.set_epoch(0)
+    for epoch in range(train_cfg.epochs):
+        loader.sampler.set_epoch(epoch)
+        for batch in tqdm(loader):
+            optimizer.zero_grad()
+            input_ids = batch["input_ids"]
+            _, loss = model(input_ids, return_loss=True)
 
-    for batch in tqdm(loader):
-        optimizer.zero_grad()
-        input_ids = batch["input_ids"]
-        _, loss = model(input_ids, return_loss=True)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+        dist.barrier()
 
-    dist.barrier()
     cleanup()

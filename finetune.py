@@ -20,8 +20,8 @@ TRAIN_CFG = TrainerConfig(
     wb_name="finetune",
     lr=2e-5,
     warmup_ratio=0.05,
-    n_steps=10,
-    batch_size=16,
+    epochs=1,
+    batch_size=64,
 )
 
 
@@ -29,7 +29,7 @@ def main():
     # Load dataset
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
     tokenizer.pad_token = tokenizer.eos_token
-    dataset = load_dataset("kh4dien/fineweb-100m-sample", split="train[:1%]")
+    dataset = load_dataset("kh4dien/fineweb-100m-sample", split="train[:50%]")
     dataset = chunk_and_tokenize(dataset, tokenizer, "text", 256)
 
     world_size = t.cuda.device_count()
