@@ -1,6 +1,7 @@
 import os
 import pickle
 from dataclasses import dataclass
+from typing import Dict
 
 import torch as t
 import torch.distributed as dist
@@ -45,9 +46,13 @@ class SCAEConfig:
             "sample_length": self.sample_length,
         }
 
-def prepare_optim_and_scheduler(model: MergedSCAESuite, n_steps: int, cfg: SCAEConfig):
+
+def prepare_optim_and_scheduler(
+    model: MergedSCAESuite, n_steps: int, cfg: SCAEConfig
+):
     if cfg.quantize_optimizer:
         from bitsandbytes.optim import Adam8bit as Adam
+
         print("Using Adam8bit optimizer")
 
     else:
@@ -55,7 +60,7 @@ def prepare_optim_and_scheduler(model: MergedSCAESuite, n_steps: int, cfg: SCAEC
 
     if cfg.lr is None:
         n_features = model.transformer.cfg.d_model * cfg.expansion_factor
-        cfg.lr = 2e-4 / (n_features / 2**14)**0.5
+        cfg.lr = 2e-4 / (n_features / 2**14) ** 0.5
 
     adam = Adam(model.get_trainable_params(), lr=cfg.lr)
 
@@ -84,34 +89,29 @@ def prepare_dataloader(
     return train_dataloader
 
 
-def load_model(device, dtype, cfg: SCAEConfig):
-    transformer = (
-        HookedTransformer.from_pretrained(
-            "EleutherAI/pythia-70m-deduped",
-        )
-        .to(device)
-        .to(dtype)
-    )
+def get_ce_loss(
+    model: MergedSCAESuite,
+    cache,
+    input_ids: t.Tensor,
+    reconstructions,
+):
+    resid_final = sum(reconstructions.values())
+    resid_final = resid_final + cache["blocks.0.hook_resid_pre"]
 
-    for p in transformer.parameters():
-        p.requires_grad = False
+    unembed = model.module.transformer.unembed
+    ln_final = model.module.transformer.ln_final
 
-    with open(cfg.connections_path, "rb") as f:
-        connections = pickle.load(f)
+    logits = unembed(ln_final(resid_final))
 
-    n_features = transformer.cfg.d_model * cfg.expansion_factor
-    scae = SCAESuite(
-        transformer,
-        cfg.k,
-        n_features,
-        device=device,
-        dtype=dtype,
-        connections=connections,
-    )
+    # Shift sequences by 1
+    logits = logits[:, :-1, :]
+    input_ids = input_ids[:, 1:]
 
-    model = MergedSCAESuite(transformer, scae)
+    logits = logits.reshape(-1, logits.size(-1))
+    input_ids = input_ids.reshape(-1)
 
-    return model
+    loss = t.nn.functional.cross_entropy(logits, input_ids, reduction="mean")
+    return loss
 
 
 def setup(rank, world_size):
@@ -128,50 +128,127 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def train(
-    rank: int,
-    world_size: int,
-    dtype: t.dtype,
-    dataset: Dataset,
-    cfg: SCAEConfig,
-):
-    setup(rank, world_size)
-    device = f"cuda:{rank}"
+class SCAETrainer:
+    def __init__(self, rank, world_size, dtype, cfg, dataset):
+        setup(rank, world_size)
+        self.device = f"cuda:{rank}"
 
-    # Prepare optimizer and distributed dataloader
-    model = load_model(device, dtype, cfg)
-    loader = prepare_dataloader(dataset, world_size, rank, cfg)
-    optimizer, scheduler = prepare_optim_and_scheduler(
-        model, len(loader), cfg
-    )
+        self.cfg = cfg
+        self.rank = rank
 
-    model = DDP(
-        model,
-        device_ids=[rank],
-        output_device=rank,
-    )
+        # Prepare optimizer and distributed dataloader
+        self.model = self.load_model(self.device, dtype, cfg)
+        self.loader = prepare_dataloader(dataset, world_size, rank, cfg)
 
-    if rank == 0 and cfg.wb_project is not None:
-        wb.init(
-            project=cfg.wb_project,
-            name=cfg.wb_run_name,
-            config=cfg.wb_cfg,
-            entity=cfg.wb_entity,
+    def load_model(self, device, dtype, cfg: SCAEConfig):
+        transformer = (
+            HookedTransformer.from_pretrained(
+                "EleutherAI/pythia-70m-deduped",
+            )
+            .to(device)
+            .to(dtype)
         )
 
-    for epoch in range(cfg.epochs):
-        loader.sampler.set_epoch(epoch)
-        for batch in tqdm(loader, disable=rank != 0):
-            optimizer.zero_grad()
-            input_ids = batch["input_ids"].to(device)
-            _, loss = model(input_ids, return_loss=True)
+        for p in transformer.parameters():
+            p.requires_grad = False
 
-            loss.backward()
-            # model.module.clip_grad_norm()
-            optimizer.step()
-            scheduler.step()
+        with open(cfg.connections_path, "rb") as f:
+            connections = pickle.load(f)
 
-            if rank == 0:
-                wb.log({"loss": loss.item()})
+        n_features = transformer.cfg.d_model * cfg.expansion_factor
+        scae = SCAESuite(
+            transformer,
+            cfg.k,
+            n_features,
+            device=device,
+            dtype=dtype,
+            connections=connections,
+        )
 
-    cleanup()
+        model = MergedSCAESuite(transformer, scae)
+
+        # Create dead feature tracker
+        if cfg.track_dead_features:
+            for name in model.module_dict:
+                self.num_tokens_since_fired[name] = t.zeros(
+                    n_features, device="cpu"
+                )
+
+        return model
+
+    def update_dead_features(
+        self, pruned_features: Dict[str, t.Tensor], num_tokens: int
+    ):
+        for name, features in pruned_features.items():
+            active_feature_indices = features.nonzero().flatten()
+            self.num_tokens_since_fired[name][active_feature_indices] = 0
+            self.num_tokens_since_fired[name][~active_feature_indices] += (
+                num_tokens
+            )
+
+    def train_step(self, model: MergedSCAESuite, input_ids: t.Tensor):
+        reconstructions, pruned_features, cache = model(input_ids)
+
+        # Update dead feature tracker
+        if self.cfg.track_dead_features:
+            self.update_dead_features(pruned_features, input_ids.numel())
+
+        # Get cross entropy loss
+        ce_loss = get_ce_loss(model, cache, input_ids, reconstructions)
+
+        # Compute FVU loss for each module
+        for name, recon in reconstructions.items():
+            module, layer = name.split("_")
+            target = cache[f"blocks.{layer}.hook_{module}_out"]
+
+            # Compute FVU loss
+            total_variance = t.var(target, dim=0).sum()
+            residual_variance = t.var(target - recon, dim=0).sum()
+            fvu_loss = residual_variance / total_variance
+
+            # Add FVU loss to total loss
+            # TODO: Finish
+
+        total_loss = ce_loss
+
+        return total_loss
+
+    def eval_step(self):
+        pass
+
+    def train(self):
+        optimizer, scheduler = prepare_optim_and_scheduler(
+            self.model, len(self.loader), self.cfg
+        )
+
+        self.model = DDP(
+            self.model,
+            device_ids=[self.rank],
+            output_device=self.rank,
+        )
+
+        if self.rank == 0 and self.cfg.wb_project is not None:
+            wb.init(
+                project=self.cfg.wb_project,
+                name=self.cfg.wb_run_name,
+                config=self.cfg.wb_cfg,
+                entity=self.cfg.wb_entity,
+            )
+
+        for epoch in range(self.cfg.epochs):
+            self.loader.sampler.set_epoch(epoch)
+            for batch in tqdm(self.loader, disable=self.rank != 0):
+                optimizer.zero_grad()
+                input_ids = batch["input_ids"].to(self.device)
+
+                loss = self.train_step(self.model, input_ids)
+                loss.backward()
+
+                self.model.module.clip_grad_norm()
+                optimizer.step()
+                scheduler.step()
+
+                if self.rank == 0:
+                    wb.log({"loss": loss.item()})
+
+        cleanup()

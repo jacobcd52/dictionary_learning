@@ -63,7 +63,11 @@ class SCAEModule(nn.Module, ABC):
             else:
                 upstream_bias = upstream_bias + ae.b_dec
 
-            connection_mask = self.connection_masks[up_name]
+            if self.connection_masks is not None:
+                connection_mask = self.connection_masks[up_name]
+            else:
+                connection_mask = None
+
             up_pruned_features = pruned_features[up_name]
             pruned_contribs = self.get_pruned_contribs(
                 cache, ae, connection_mask, up_pruned_features
@@ -392,12 +396,17 @@ class SCAESuite(nn.Module):
                 ):
                     upstream_aes[up.name] = aes[up.name]
 
+            connection_masks = (
+                self.connection_masks[down.name]
+                if self.connections is not None
+                else None
+            )
             module_dict[down.name] = _make_module(
                 down.submodule_type,
                 self.model,
                 aes[down.name],
                 upstream_aes,
-                self.connection_masks[down.name],
+                connection_masks,
                 down,
             )
 
@@ -463,7 +472,7 @@ class SCAESuite(nn.Module):
             pruned_features[module_name] = feature_buffer
             reconstructions[module_name] = reconstruction
 
-        return reconstructions
+        return reconstructions, pruned_features
 
     def get_ce_loss(
         self,
@@ -532,16 +541,8 @@ class MergedSCAESuite(nn.Module):
 
         return cache
 
-    def forward(
-        self, input_ids: t.Tensor, return_loss: bool = False
-    ) -> Tuple[Dict[str, t.Tensor], t.Tensor | None]:
+    def forward(self, input_ids: t.Tensor):
         cache = self._get_cache(input_ids)
-        reconstructions = self.scae_suite(cache)
+        reconstructions, pruned_features = self.scae_suite(cache)
 
-        if return_loss:
-            loss = self.scae_suite.get_ce_loss(
-                cache, reconstructions, input_ids
-            )
-            return reconstructions, loss
-
-        return reconstructions, None
+        return reconstructions, pruned_features, cache
