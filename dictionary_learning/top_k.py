@@ -1,19 +1,16 @@
-"""
-Implements the SAE training scheme from https://arxiv.org/abs/2406.04093.
-Significant portions of this code have been copied from https://github.com/EleutherAI/sae/blob/main/sae
-"""
-
 import einops
 import torch as t
 import torch.nn as nn
 from abc import ABC, abstractmethod
 
+
 class Dictionary(ABC, nn.Module):
     """
     A dictionary consists of a collection of vectors, an encoder, and a decoder.
     """
-    dict_size : int # number of features in the dictionary
-    activation_dim : int # dimension of the activation vectors
+
+    dict_size: int  # number of features in the dictionary
+    activation_dim: int  # dimension of the activation vectors
 
     @abstractmethod
     def encode(self, x):
@@ -21,7 +18,7 @@ class Dictionary(ABC, nn.Module):
         Encode a vector x in the activation space.
         """
         pass
-    
+
     @abstractmethod
     def decode(self, f):
         """
@@ -39,17 +36,6 @@ class Dictionary(ABC, nn.Module):
 
 
 class AutoEncoderTopK(Dictionary, nn.Module):
-    """
-    The top-k autoencoder architecture and initialization used in https://arxiv.org/abs/2406.04093
-    NOTE: (From Adam Karvonen) There is an unmaintained implementation using Triton kernels in the topk-triton-implementation branch.
-    We abandoned it as we didn't notice a significant speedup and it added complications, which are noted
-    in the AutoEncoderTopK class docstring in that branch.
-
-    With some additional effort, you can train a Top-K SAE with the Triton kernels and modify the state dict for compatibility with this class.
-    Notably, the Triton kernels currently have the decoder to be stored in nn.Parameter, not nn.Linear, and the decoder weights must also
-    be stored in the same shape as the encoder.
-    """
-
     def __init__(self, activation_dim: int, dict_size: int, k: int):
         super().__init__()
         self.activation_dim = activation_dim

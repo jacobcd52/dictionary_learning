@@ -1,8 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Literal
+from typing import Dict, List, NamedTuple, Literal, Tuple
 
 import einops
-from cut_cross_entropy import linear_cross_entropy
 import torch as t
 import torch.nn as nn
 from transformer_lens import ActivationCache, HookedTransformer
@@ -55,12 +54,14 @@ class SCAEModule(nn.Module, ABC):
         feature_buffer: t.Tensor,
     ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
-        upstream_bias = t.zeros(
-            self.model.cfg.d_model, device="cuda", dtype=t.bfloat16, requires_grad=False
-        )
+
+        upstream_bias = None
 
         for up_name, ae in self.upstream_aes.items():
-            upstream_bias = upstream_bias + ae.b_dec
+            if upstream_bias is None:
+                upstream_bias = ae.b_dec
+            else:
+                upstream_bias = upstream_bias + ae.b_dec
 
             connection_mask = self.connection_masks[up_name]
             up_pruned_features = pruned_features[up_name]
@@ -71,18 +72,16 @@ class SCAEModule(nn.Module, ABC):
 
         approx_acts = self.compute_bias(approx_acts, upstream_bias, cache)
 
-        # top_vals, top_idx = approx_acts.topk(self.k, dim=-1)
-        top_vals, top_idx = approx_acts.topk(64, dim=-1)
+        # NOTE: Sorting is off here, check if that's okay.
+        top_vals, top_idx = approx_acts.topk(self.ae.k, dim=-1, sorted=False)
         top_vals = t.relu(top_vals)
 
         feat_buffer = t.zeros_like(feature_buffer)
         feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
 
-        cloned_buffer = feat_buffer.clone()
-
         reconstructions = self.ae.decode(feat_buffer)
 
-        return cloned_buffer, reconstructions
+        return feat_buffer, reconstructions
 
     @abstractmethod
     def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
@@ -220,28 +219,31 @@ class SCAEAttention(SCAEModule):
         approx_acts = approx_acts - down_enc @ self.ae.b_dec
 
         # Add upstream b_dec contributions
-        upstream_bias_post_ln = (
-            upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
-        )
+        if upstream_bias is not None:
+            upstream_bias_post_ln = (
+                upstream_bias.unsqueeze(0).unsqueeze(0)
+                / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
+            )
 
-        # n_heads d_model_in d_model_out, batch seq d_model_in
-        # -> batch seq d_out
-        upstream_bias_post_ln = t.einsum(
-            "h i o, b s i -> b s o",
-            self.W_OV,
-            upstream_bias_post_ln,
-        )
+            # n_heads d_model_in d_model_out, batch seq d_model_in
+            # -> batch seq d_out
+            upstream_bias_post_ln = t.einsum(
+                "h i o, b s i -> b s o",
+                self.W_OV,
+                upstream_bias_post_ln,
+            )
 
-        # n_features_down d_model_in, batch seq d_model_in
-        # -> batch seq n_features_down
-        projected_bias = t.einsum(
-            "d i, b s i -> b s d",
-            down_enc,
-            upstream_bias_post_ln,
-        )
+            # n_features_down d_model_in, batch seq d_model_in
+            # -> batch seq n_features_down
+            projected_bias = t.einsum(
+                "d i, b s i -> b s d",
+                down_enc,
+                upstream_bias_post_ln,
+            )
 
-        return approx_acts + projected_bias
+            return approx_acts + projected_bias
+
+        return approx_acts
 
 
 class SCAEMLP(SCAEModule):
@@ -273,10 +275,10 @@ class SCAEMLP(SCAEModule):
         connection_mask: t.Tensor,
         up_pruned_features: t.Tensor,
     ) -> t.Tensor:
-        up_decoder = up_ae.decoder.weight
-        down_encoder = self.ae.encoder.weight
+        up_dec = up_ae.decoder.weight
+        down_enc = self.ae.encoder.weight
 
-        virtual_weights = down_encoder @ up_decoder
+        virtual_weights = down_enc @ up_dec
         if connection_mask is not None:
             virtual_weights = virtual_weights * connection_mask
 
@@ -296,27 +298,30 @@ class SCAEMLP(SCAEModule):
         cache: ActivationCache,
     ):
         down_enc = self.ae.encoder.weight
-
         down_enc_bias = self.ae.encoder.bias
+        
         # bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
         approx_acts = approx_acts + down_enc_bias
         approx_acts = approx_acts - down_enc @ self.ae.b_dec
 
-        # Add upstream b_dec contributions
-        upstream_bias_post_ln = (
-            upstream_bias.unsqueeze(0).unsqueeze(0)
-            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
-        )
+        if upstream_bias is not None:
+            # Add upstream b_dec contributions
+            upstream_bias_post_ln = (
+                upstream_bias.unsqueeze(0).unsqueeze(0)
+                / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
+            )
 
-        # n_features_down d_model_in, batch seq d_model_in
-        # -> batch seq n_features_down
-        projected_bias = t.einsum(
-            "d i, b s i -> b s d",
-            down_enc,
-            upstream_bias_post_ln,
-        )
+            # n_features_down d_model_in, batch seq d_model_in
+            # -> batch seq n_features_down
+            projected_bias = t.einsum(
+                "d i, b s i -> b s d",
+                down_enc,
+                upstream_bias_post_ln,
+            )
 
-        return approx_acts + projected_bias
+            return approx_acts + projected_bias
+
+        return approx_acts
 
 
 class SCAESuite(nn.Module):
@@ -327,9 +332,9 @@ class SCAESuite(nn.Module):
         model,
         k: int,
         n_features: int,
-        device: str = "cuda",
-        dtype: t.dtype = t.bfloat16,
-        connections: Connections | str = None,
+        device: str,
+        dtype: t.dtype,
+        connections: Connections = None,
     ):
         """
         Args:
@@ -343,28 +348,24 @@ class SCAESuite(nn.Module):
         super().__init__()
 
         self.model = model
-
-        self.device = device
         self.dtype = dtype
 
         self.k = k
         self.n_features = n_features
 
-        n_layers = model.cfg.n_layers
-
         self.connections = connections
-        self.connection_masks = self._process_connections(connections)
+        self.connection_masks = self._process_connections(connections, device)
 
         submodule_names = [
             SubmoduleName(layer=i, submodule_type=submodule_type)
-            for i in range(n_layers)
+            for i in range(model.cfg.n_layers)
             for submodule_type in ["attn", "mlp"]
         ]
 
         aes = {
             sm.name: AutoEncoderTopK(model.cfg.d_model, n_features, k)
-            .to(self.device)
-            .to(self.dtype)
+            .to(device)
+            .to(dtype)
             for sm in submodule_names
         }
 
@@ -405,19 +406,13 @@ class SCAESuite(nn.Module):
 
         return nn.ModuleDict(module_dict)
 
-    def _process_connections(self, connections: Connections):
+    def _process_connections(self, connections: Connections, device: t.device):
         """Process connections to create connection masks and validate input."""
 
         connection_masks = {}
         for down_name, up_dict in connections.items():
             connection_masks[down_name] = {}
             for up_name, conn_tensor in up_dict.items():
-                # Verify indices are valid
-
-                # valid_indices = (
-                #     conn_tensor >= -1 and conn_tensor < self.n_features
-                # )
-
                 valid_indices = (conn_tensor >= -1) & (
                     conn_tensor < self.n_features
                 )
@@ -441,7 +436,7 @@ class SCAESuite(nn.Module):
                 connection_mask = t.zeros(
                     n_features,
                     n_features,
-                    device=self.device,
+                    device=device,
                     dtype=t.bool,
                 )
                 connection_mask[i_indices, targets] = True
@@ -462,9 +457,8 @@ class SCAESuite(nn.Module):
             (batch_size, seq_len, self.n_features),
             device=device,
             dtype=dtype,
-            requires_grad=False
         )
-        
+
         for module_name, module in self.module_dict.items():
             feature_buffer, reconstruction = module(
                 cache, pruned_features, feat_buffer
@@ -480,33 +474,19 @@ class SCAESuite(nn.Module):
         reconstructions: Dict[str, t.Tensor],
         tokens: t.Tensor,
     ) -> t.Tensor:
-
         resid_final = sum(reconstructions.values())
         resid_final = resid_final + cache["blocks.0.hook_resid_pre"]
 
         logits = self.model.unembed(self.model.ln_final(resid_final))
 
-        # https://github.com/apple/ml-cross-entropy
-        # loss = linear_cross_entropy(
-        #     logits,
-        #     self.model.unembed.W_U,
-        #     tokens,
-        #     bias=self.model.unembed.b_U,
-        #     shift=1,
-        # )
-
         # Shift sequences by 1
         logits = logits[:, :-1, :]
         tokens = tokens[:, 1:]
-        
+
         logits = logits.reshape(-1, logits.size(-1))
         tokens = tokens.reshape(-1)
-        
-        loss = nn.functional.cross_entropy(
-            logits,
-            tokens,
-            reduction='mean'
-        )
+
+        loss = nn.functional.cross_entropy(logits, tokens, reduction="mean")
         return loss
 
 
@@ -522,10 +502,6 @@ class MergedSCAESuite(nn.Module):
             self.hook_list += [
                 f"blocks.{layer}.ln1.hook_scale",
                 f"blocks.{layer}.ln2.hook_scale",
-                # f"blocks.{layer}.ln1.hook_normalized",
-                # f"blocks.{layer}.ln2.hook_normalized",
-                # f"blocks.{layer}.hook_attn_out",
-                # f"blocks.{layer}.hook_mlp_out",
                 f"blocks.{layer}.attn.hook_pattern",
             ]
 
@@ -542,13 +518,13 @@ class MergedSCAESuite(nn.Module):
 
         for hook_name in self.hook_list:
             if (".ln" in hook_name) or (".hook_pattern" in hook_name):
-                cache[hook_name] = cache[hook_name].to(t.bfloat16)
+                cache[hook_name] = cache[hook_name].to(self.scae_suite.dtype)
 
         return cache
 
     def forward(
         self, input_ids: t.Tensor, return_loss: bool = False
-    ) -> ActivationCache:
+    ) -> Tuple[Dict[str, t.Tensor], t.Tensor | None]:
         cache = self._get_cache(input_ids)
         reconstructions = self.scae_suite(cache)
 
