@@ -28,6 +28,7 @@ class SCAEConfig:
     lr: float = None
 
     track_dead_features: bool = False
+    compute_fvu_loss: bool = False
 
     warmup_ratio: float = 0.05
     epochs: int = 1
@@ -187,17 +188,28 @@ class SCAETrainer:
     def update_dead_features(
         self, pruned_features: Dict[str, t.Tensor], num_tokens: int
     ):
-        did_fire = t.cat(
-            [firing_features for firing_features in pruned_features.values()]
+        did_fire = t.stack(
+            [
+                firing_features.sum(dim=(0, 1))
+                for firing_features in pruned_features.values()
+            ]
         )
 
         dist.all_reduce(did_fire, op=dist.ReduceOp.MAX)
         did_fire = did_fire.bool()
 
-        for row_idx in range(self.num_tokens_since_fired.shape[0]):
-            fire_mask = did_fire[row_idx].to(self.device)
+        row_indices = range(self.num_tokens_since_fired.shape[0])
+        for name, row_idx in zip(pruned_features.keys(), row_indices):
+            fire_mask = did_fire[row_idx].to("cpu")
             self.num_tokens_since_fired[row_idx][fire_mask] = 0
             self.num_tokens_since_fired[row_idx][~fire_mask] += num_tokens
+
+        if self.rank == 0:
+            pass
+            # wb.log(
+            #     {f"{name}_dead": self.num_tokens_since_fired[row_idx].mean().item()},
+            #     step=self.global_step,
+            # )
 
     def get_fvu_loss(
         self, reconstructions: Dict[str, t.Tensor], cache: Dict[str, t.Tensor]
@@ -227,11 +239,13 @@ class SCAETrainer:
         if self.cfg.track_dead_features:
             self.update_dead_features(pruned_features, input_ids.numel())
 
-        ce_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
+        total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
 
-        fvu_loss = self.get_fvu_loss(reconstructions, cache)
+        if self.cfg.compute_fvu_loss:
+            fvu_loss = self.get_fvu_loss(reconstructions, cache)
+            total_loss += fvu_loss
 
-        return ce_loss + fvu_loss
+        return total_loss
 
     def eval_step(self):
         pass
