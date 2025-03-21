@@ -5,7 +5,7 @@ from datasets import Dataset
 import torch as t
 from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
-from transformer_lens import HookedTransformer, ActivationCache
+from transformer_lens import HookedTransformer
 
 
 def chunk_and_tokenize(
@@ -53,6 +53,7 @@ def chunk_and_tokenize(
 
 CacheDict = Dict[str, t.Tensor]
 
+
 class Buffer:
     def __init__(
         self,
@@ -86,10 +87,8 @@ class Buffer:
             self.hook_list += [
                 f"blocks.{layer}.ln1.hook_scale",
                 f"blocks.{layer}.ln2.hook_scale",
-                # f"blocks.{layer}.ln1.hook_normalized",
-                # f"blocks.{layer}.ln2.hook_normalized",
-                # f"blocks.{layer}.hook_attn_out",
-                # f"blocks.{layer}.hook_mlp_out",
+                f"blocks.{layer}.hook_attn_out",
+                f"blocks.{layer}.hook_mlp_out",
                 f"blocks.{layer}.attn.hook_pattern",
             ]
 

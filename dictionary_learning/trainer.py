@@ -1,5 +1,7 @@
 import os
 import pickle
+import signal
+import sys
 from dataclasses import dataclass
 from typing import Dict
 
@@ -62,6 +64,14 @@ def setup(rank, world_size):
 def cleanup():
     """Cleanup the distributed environment."""
     dist.destroy_process_group()
+
+def signal_handler(sig, frame):
+    print('Keyboard interrupt detected. Cleaning up...')
+    cleanup()
+    sys.exit(0)
+
+# Register signal handler for keyboard interrupts
+signal.signal(signal.SIGINT, signal_handler)
 
 
 class SCAETrainer:
@@ -204,12 +214,13 @@ class SCAETrainer:
             self.num_tokens_since_fired[row_idx][fire_mask] = 0
             self.num_tokens_since_fired[row_idx][~fire_mask] += num_tokens
 
-        if self.rank == 0:
-            pass
-            # wb.log(
-            #     {f"{name}_dead": self.num_tokens_since_fired[row_idx].mean().item()},
-            #     step=self.global_step,
-            # )
+            if self.rank == 0:
+                have_not_fired_mask = self.num_tokens_since_fired[row_idx] > 100_000
+                pct_dead = have_not_fired_mask.sum() / have_not_fired_mask.numel()
+                wb.log(
+                    {f"{name}_dead": pct_dead},
+                    step=self.global_step,
+                )
 
     def get_fvu_loss(
         self, reconstructions: Dict[str, t.Tensor], cache: Dict[str, t.Tensor]
