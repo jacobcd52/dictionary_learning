@@ -177,7 +177,7 @@ class SCAETrainer:
 
         # Create dead feature tracker
         if cfg.track_dead_features:
-            n_modules = len(model.module_dict)
+            n_modules = len(model.scae_suite.module_dict)
             self.num_tokens_since_fired = t.zeros(
                 (n_modules, n_features), device="cpu"
             )
@@ -195,8 +195,9 @@ class SCAETrainer:
         did_fire = did_fire.bool()
 
         for row_idx in range(self.num_tokens_since_fired.shape[0]):
-            self.num_tokens_since_fired[row_idx][did_fire] = 0
-            self.num_tokens_since_fired[row_idx][~did_fire] += num_tokens
+            fire_mask = did_fire[row_idx].to(self.device)
+            self.num_tokens_since_fired[row_idx][fire_mask] = 0
+            self.num_tokens_since_fired[row_idx][~fire_mask] += num_tokens
 
     def get_fvu_loss(
         self, reconstructions: Dict[str, t.Tensor], cache: Dict[str, t.Tensor]
@@ -212,7 +213,10 @@ class SCAETrainer:
             component_fvu = residual_variance / total_variance
             fvu_loss += component_fvu
 
-            wb.log({f"{name}_fvu": component_fvu.item()}, step=self.global_step)
+            if self.rank == 0:
+                wb.log(
+                    {f"{name}_fvu": component_fvu.item()}, step=self.global_step
+                )
 
         return fvu_loss
 
