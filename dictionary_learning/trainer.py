@@ -171,8 +171,11 @@ class SCAETrainer:
         for p in transformer.parameters():
             p.requires_grad = False
 
-        with open(cfg.connections_path, "rb") as f:
-            connections = pickle.load(f)
+        if cfg.connections_path is not None:
+            with open(cfg.connections_path, "rb") as f:
+                connections = pickle.load(f)
+        else:
+            connections = None
 
         n_features = transformer.cfg.d_model * cfg.expansion_factor
         scae = SCAESuite(

@@ -358,7 +358,10 @@ class SCAESuite(nn.Module):
         self.n_features = n_features
 
         self.connections = connections
-        self.connection_masks = self._process_connections(connections, device)
+        if connections is not None:
+            self.connection_masks = self._process_connections(connections, device)
+        else:
+            self.connection_masks = None
 
         submodule_names = [
             SubmoduleName(layer=i, submodule_type=submodule_type)

@@ -18,7 +18,7 @@ CFG = SCAEConfig(
     expansion_factor=4,
     sample_length=256,
     track_dead_features=True,
-    connections_path=PATH,
+    connections_path=None,
 )
 
 
