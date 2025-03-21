@@ -4,7 +4,7 @@ import torch.multiprocessing as mp
 from transformers import AutoTokenizer
 
 from dictionary_learning.buffer import chunk_and_tokenize
-from dictionary_learning.trainer import train, SCAEConfig
+from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
 
 PATH = "/root/dictionary_learning/pythia_connections/Copy of top_connections_20.pkl"
@@ -17,6 +17,7 @@ CFG = SCAEConfig(
     k=64,
     expansion_factor=4,
     sample_length=256,
+    track_dead_features=True,
     connections_path=PATH,
 )
 
@@ -38,8 +39,8 @@ def main():
     world_size = t.cuda.device_count()
 
     mp.spawn(
-        train,
-        args=(world_size, t.bfloat16, dataset, CFG),
+        SCAETrainer,
+        args=(world_size, t.bfloat16, CFG, dataset),
         nprocs=world_size,
         join=True,
     )
