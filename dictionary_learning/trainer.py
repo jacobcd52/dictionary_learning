@@ -65,10 +65,12 @@ def cleanup():
     """Cleanup the distributed environment."""
     dist.destroy_process_group()
 
+
 def signal_handler(sig, frame):
-    print('Keyboard interrupt detected. Cleaning up...')
+    print("Keyboard interrupt detected. Cleaning up...")
     cleanup()
     sys.exit(0)
+
 
 # Register signal handler for keyboard interrupts
 signal.signal(signal.SIGINT, signal_handler)
@@ -157,6 +159,11 @@ class SCAETrainer:
         loss = t.nn.functional.cross_entropy(
             logits, input_ids, reduction="mean"
         )
+
+        if self.rank == 0:
+            ce_loss_diff = cache["loss"] - loss
+            wb.log({"train/ce_loss_diff": ce_loss_diff.item()}, step=self.global_step)
+
         return loss
 
     def load_model(self, device, dtype, cfg: SCAEConfig):
@@ -218,10 +225,14 @@ class SCAETrainer:
             self.num_tokens_since_fired[row_idx][~fire_mask] += num_tokens
 
             if self.rank == 0:
-                have_not_fired_mask = self.num_tokens_since_fired[row_idx] > 100_000
-                pct_dead = have_not_fired_mask.sum() / have_not_fired_mask.numel()
+                have_not_fired_mask = (
+                    self.num_tokens_since_fired[row_idx] > 100_000
+                )
+                pct_dead = (
+                    have_not_fired_mask.sum() / have_not_fired_mask.numel()
+                )
                 wb.log(
-                    {f"{name}_dead": pct_dead},
+                    {f"dead_pct/{name}": pct_dead},
                     step=self.global_step,
                 )
 
@@ -241,7 +252,7 @@ class SCAETrainer:
 
             if self.rank == 0:
                 wb.log(
-                    {f"{name}_fvu": component_fvu.item()}, step=self.global_step
+                    {f"fvu/{name}": component_fvu.item()}, step=self.global_step
                 )
 
         return fvu_loss
@@ -297,7 +308,7 @@ class SCAETrainer:
                 scheduler.step()
 
                 if self.rank == 0:
-                    wb.log({"loss": loss.item()}, step=self.global_step)
+                    wb.log({"train/loss": loss.item()}, step=self.global_step)
 
                 self.global_step += 1
 

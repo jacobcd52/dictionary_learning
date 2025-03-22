@@ -534,11 +534,12 @@ class MergedSCAESuite(nn.Module):
 
     @t.no_grad()
     def _get_cache(self, input_ids: t.Tensor) -> ActivationCache:
-        _, cache = self.transformer.run_with_cache(
-            input_ids, return_type=None, names_filter=self.hook_list
+        base_loss, cache = self.transformer.run_with_cache(
+            input_ids, return_type="loss", names_filter=self.hook_list
         )
 
         cache = cache.cache_dict
+        cache["loss"] = base_loss
 
         for hook_name in self.hook_list:
             if (".ln" in hook_name) or (".hook_pattern" in hook_name):

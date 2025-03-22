@@ -8,6 +8,7 @@ from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
 
 PATH = "/root/dictionary_learning/pythia_connections/Copy of top_connections_20.pkl"
+PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
 N_TOKENS = 25_000_000
 CFG = SCAEConfig(
     wb_project="dictionary_learning",
@@ -26,15 +27,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset(
-        "kh4dien/fineweb-100m-sample", split="train[:50%]"
+        PATH_TO_PILE,
+        split="train[:10%]",
+        num_proc=10,
     )
-    # Compute the number of rows to get from the
-    # Pile depending on a desired number of tokens.
-    # Buffer a little bc not all rows might have enough tokens.
-    # buffered_row_count = int(N_TOKENS / CFG.sample_length * 1.5)
-    # dataset = dataset.select(range(buffered_row_count))
     dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length)
-    # dataset = dataset.select(range(N_TOKENS // CFG.sample_length))
+    dataset = dataset.select(range(N_TOKENS // CFG.sample_length))
 
     world_size = t.cuda.device_count()
 
