@@ -31,6 +31,7 @@ class SCAEConfig:
 
     track_dead_features: bool = False
     compute_fvu_loss: bool = False
+    auxk_alpha: float = 0.0
 
     warmup_ratio: float = 0.05
     epochs: int = 1
@@ -49,7 +50,50 @@ class SCAEConfig:
             "batch_size": self.batch_size,
             "quantize_optimizer": self.quantize_optimizer,
             "sample_length": self.sample_length,
+            "auxk_alpha": self.auxk_alpha,
         }
+
+
+def prepare_optim_and_scheduler(
+    model: MergedSCAESuite, n_steps: int, cfg: SCAEConfig
+):
+    if cfg.quantize_optimizer:
+        from bitsandbytes.optim import Adam8bit as Adam
+
+        print("Using Adam8bit optimizer")
+
+    else:
+        from torch.optim import Adam
+
+    if cfg.lr is None:
+        n_features = model.transformer.cfg.d_model * cfg.expansion_factor
+        cfg.lr = 2e-4 / (n_features / 2**14) ** 0.5
+
+    adam = Adam(model.get_trainable_params(), lr=cfg.lr)
+
+    warmup_steps = int(cfg.warmup_ratio * n_steps)
+    lr_scheduler = get_linear_schedule_with_warmup(adam, warmup_steps, n_steps)
+
+    return adam, lr_scheduler
+
+
+def prepare_dataloader(
+    dataset: Dataset, world_size: int, rank: int, cfg: SCAEConfig
+):
+    # Create distributed samplers
+    train_sampler = DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True
+    )
+
+    # Create data loaders
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        sampler=train_sampler,
+        pin_memory=True,
+    )
+
+    return train_dataloader
 
 
 def setup(rank, world_size):
@@ -86,53 +130,11 @@ class SCAETrainer:
 
         # Prepare optimizer and distributed dataloader
         self.model = self.load_model(self.device, dtype, cfg)
-        self.loader = self.prepare_dataloader(dataset, world_size, rank, cfg)
+        self.loader = prepare_dataloader(dataset, world_size, rank, cfg)
 
         self.global_step = 0
 
         self.train()
-
-    def prepare_optim_and_scheduler(
-        self, model: MergedSCAESuite, n_steps: int, cfg: SCAEConfig
-    ):
-        if cfg.quantize_optimizer:
-            from bitsandbytes.optim import Adam8bit as Adam
-
-            print("Using Adam8bit optimizer")
-
-        else:
-            from torch.optim import Adam
-
-        if cfg.lr is None:
-            n_features = model.transformer.cfg.d_model * cfg.expansion_factor
-            cfg.lr = 2e-4 / (n_features / 2**14) ** 0.5
-
-        adam = Adam(model.get_trainable_params(), lr=cfg.lr)
-
-        warmup_steps = int(cfg.warmup_ratio * n_steps)
-        lr_scheduler = get_linear_schedule_with_warmup(
-            adam, warmup_steps, n_steps
-        )
-
-        return adam, lr_scheduler
-
-    def prepare_dataloader(
-        self, dataset: Dataset, world_size: int, rank: int, cfg: SCAEConfig
-    ):
-        # Create distributed samplers
-        train_sampler = DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True
-        )
-
-        # Create data loaders
-        train_dataloader = DataLoader(
-            dataset,
-            batch_size=cfg.batch_size,
-            sampler=train_sampler,
-            pin_memory=True,
-        )
-
-        return train_dataloader
 
     def get_ce_loss(
         self,
@@ -146,7 +148,6 @@ class SCAETrainer:
 
         unembed = model.module.transformer.unembed
         ln_final = model.module.transformer.ln_final
-
         logits = unembed(ln_final(resid_final))
 
         # Shift sequences by 1
@@ -162,7 +163,10 @@ class SCAETrainer:
 
         if self.rank == 0:
             ce_loss_diff = cache["loss"] - loss
-            wb.log({"train/ce_loss_diff": ce_loss_diff.item()}, step=self.global_step)
+            wb.log(
+                {"train/ce_loss_diff": ce_loss_diff.item()},
+                step=self.global_step,
+            )
 
         return loss
 
@@ -205,6 +209,90 @@ class SCAETrainer:
 
         return model
 
+    def _get_ae(self, name: str):
+        """Helper function to get the autoencoder for a given module."""
+        return self.model.module.scae_suite.module_dict[name].ae
+
+    def _compute_losses(self, y, pre_acts, sae_out, decode, dead_mask=None):
+        """Compute fvu and auxk loss.
+        From: https://github.com/EleutherAI/sparsify/blob/main/sparsify/sparse_coder.py
+
+        Args:
+            y: Target activations
+            pre_acts: Feature activations
+            sae_out: Current reconstruction
+            decode: Decoder function
+            dead_mask: Boolean mask indicating dead features
+        """
+
+        # Compute the residual
+        e = y - sae_out
+
+        # Used as a denominator for putting everything on a reasonable scale
+        total_variance = (y - y.mean(0)).pow(2).sum()
+
+        # Second decoder pass for AuxK loss
+        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+            # Heuristic from Appendix B.1 in the paper
+            k_aux = y.shape[-1] // 2
+
+            # Reduce the scale of the loss if there are a small number of dead latents
+            scale = min(num_dead / k_aux, 1.0)
+            k_aux = min(k_aux, num_dead)
+
+            # Don't include living latents in this loss
+            auxk_latents = t.where(dead_mask[None], pre_acts, -t.inf)
+
+            # Top-k dead latents
+            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+
+            # Encourage the top ~50% of dead latents to predict the residual of the
+            # top k living latents
+            e_hat = self.decode(auxk_acts, auxk_indices)
+            auxk_loss = (e_hat - e.detach()).pow(2).sum()
+            auxk_loss = scale * auxk_loss / total_variance
+        else:
+            auxk_loss = sae_out.new_tensor(0.0)
+
+        l2_loss = e.pow(2).sum()
+        fvu = l2_loss / total_variance
+
+        return auxk_loss, fvu
+
+    def get_losses(
+        self,
+        pruned_features: Dict[str, t.Tensor],
+        reconstructions: Dict[str, t.Tensor],
+        cache: Dict[str, t.Tensor],
+    ):
+        total_loss = 0
+        for module_idx, name in enumerate(pruned_features.keys()):
+            module, layer = name.split("_")
+            y = cache[f"blocks.{layer}.hook_{module}_out"]
+
+            # Only set dead mask if computing AuxK loss
+            dead_mask = (
+                self.num_tokens_since_fired[module_idx]
+                if self.cfg.auxk_alpha > 0
+                else None
+            )
+            
+            aux_k_loss, fvu = self._compute_losses(
+                y,
+                pruned_features[name],
+                reconstructions[name],
+                self._get_ae(name).decode,
+                dead_mask,
+            )
+
+            component_loss = fvu + self.cfg.auxk_alpha * aux_k_loss
+            total_loss = total_loss + component_loss
+
+            if self.rank == 0:
+                wb.log({f"fvu/{name}": fvu.item()}, step=self.global_step)
+
+        return total_loss
+
     def update_dead_features(
         self, pruned_features: Dict[str, t.Tensor], num_tokens: int
     ):
@@ -236,27 +324,6 @@ class SCAETrainer:
                     step=self.global_step,
                 )
 
-    def get_fvu_loss(
-        self, reconstructions: Dict[str, t.Tensor], cache: Dict[str, t.Tensor]
-    ):
-        # Compute FVU loss for each module
-        fvu_loss = 0
-        for name, recon in reconstructions.items():
-            module, layer = name.split("_")
-            target = cache[f"blocks.{layer}.hook_{module}_out"]
-
-            total_variance = t.var(target, dim=0).sum()
-            residual_variance = t.var(target - recon, dim=0).sum()
-            component_fvu = residual_variance / total_variance
-            fvu_loss += component_fvu
-
-            if self.rank == 0:
-                wb.log(
-                    {f"fvu/{name}": component_fvu.item()}, step=self.global_step
-                )
-
-        return fvu_loss
-
     def train_step(self, model: MergedSCAESuite, input_ids: t.Tensor):
         reconstructions, pruned_features, cache = model(input_ids)
 
@@ -267,8 +334,10 @@ class SCAETrainer:
         total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
 
         if self.cfg.compute_fvu_loss:
-            fvu_loss = self.get_fvu_loss(reconstructions, cache)
-            total_loss += fvu_loss
+            reconstruction_loss = self.get_losses(
+                pruned_features, reconstructions, cache
+            )
+            total_loss += reconstruction_loss
 
         return total_loss
 
@@ -276,7 +345,7 @@ class SCAETrainer:
         pass
 
     def train(self):
-        optimizer, scheduler = self.prepare_optim_and_scheduler(
+        optimizer, scheduler = prepare_optim_and_scheduler(
             self.model, len(self.loader), self.cfg
         )
 

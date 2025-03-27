@@ -129,6 +129,11 @@ class AutoEncoderTopK(Dictionary, nn.Module):
 
         return decoded
 
+    # Wrapping the forward in bf16 autocast improves performance by almost 2x
+    # https://github.com/EleutherAI/sparsify/blob/main/sparsify/sparse_coder.py
+    @t.autocast(
+        "cuda", dtype=t.bfloat16, enabled=t.cuda.is_bf16_supported()
+    )
     def forward(self, x: t.Tensor, output_features: bool = False):
         encoded_acts_BF = self.encode(x)
         x_hat_BD = self.decode(encoded_acts_BF)
