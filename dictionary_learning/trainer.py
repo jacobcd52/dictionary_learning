@@ -24,9 +24,9 @@ class SCAEConfig:
     expansion_factor: int
     connections_path: str
 
-    wb_project: str = "dictionary_learning"
-    wb_run_name: str = "scae"
-    wb_entity: str = "steering-finetuning"
+    wb_project: str = "pythia_scae_caden"
+    wb_run_name: str = "scae_bae"
+    wb_entity: str = "training-saes"
     lr: float = None
 
     track_dead_features: bool = False
