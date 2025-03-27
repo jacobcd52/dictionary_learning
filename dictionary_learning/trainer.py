@@ -162,7 +162,7 @@ class SCAETrainer:
         )
 
         if self.rank == 0:
-            ce_loss_diff = cache["loss"] - loss
+            ce_loss_diff =  loss - cache["loss"]
             wb.log(
                 {"train/ce_loss_diff": ce_loss_diff.item()},
                 step=self.global_step,
