@@ -9,6 +9,7 @@ import torch as t
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from torch.optim.lr_scheduler import LambdaLR
 from transformers import get_linear_schedule_with_warmup
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
@@ -29,7 +30,7 @@ class SCAEConfig:
     wb_project: str = "pythia_scae_caden"
     wb_run_name: str = "scae_bae"
     wb_entity: str = "training-saes"
-    lr: float = None
+    base_lr: float = 2e-4
     save_to_hf: bool = False
     hf_username: str = None
 
@@ -38,6 +39,7 @@ class SCAEConfig:
     auxk_alpha: float = 0.0
 
     warmup_ratio: float = 0.05
+    decay_start_ratio: float = 0.7
     epochs: int = 1
     batch_size: int = 16
     quantize_optimizer: bool = False
@@ -48,8 +50,9 @@ class SCAEConfig:
         return {
             "k": self.k,
             "expansion_factor": self.expansion_factor,
-            "lr": self.lr,
+            "base_lr": self.base_lr,
             "warmup_ratio": self.warmup_ratio,
+            "decay_start_ratio": self.decay_start_ratio,
             "epochs": self.epochs,
             "batch_size": self.batch_size,
             "quantize_optimizer": self.quantize_optimizer,
@@ -69,14 +72,30 @@ def prepare_optim_and_scheduler(
     else:
         from torch.optim import Adam
 
-    if cfg.lr is None:
-        n_features = model.transformer.cfg.d_model * cfg.expansion_factor
-        cfg.lr = 2e-4 / (n_features / 2**14) ** 0.5
+    
+    n_features = model.transformer.cfg.d_model * cfg.expansion_factor
+    lr = cfg.base_lr / (n_features / 2**14) ** 0.5
 
-    adam = Adam(model.get_trainable_params(), lr=cfg.lr)
+    adam = Adam(model.get_trainable_params(), lr=lr)
 
     warmup_steps = int(cfg.warmup_ratio * n_steps)
-    lr_scheduler = get_linear_schedule_with_warmup(adam, warmup_steps, n_steps)
+    decay_start_step = int(cfg.decay_start_ratio * n_steps)
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, warmup_steps))
+        elif current_step < decay_start_step:
+            # Constant LR after warmup until decay starts
+            return 1.0
+        else:
+            # Linear decay from decay_start_step to n_steps
+            return max(
+                0.0,
+                float(n_steps - current_step) / float(max(1, n_steps - decay_start_step))
+            )
+
+    lr_scheduler = LambdaLR(adam, lr_lambda=lr_lambda)
 
     return adam, lr_scheduler
 
@@ -318,7 +337,7 @@ class SCAETrainer:
 
             if self.rank == 0:
                 have_not_fired_mask = (
-                    self.num_tokens_since_fired[row_idx] > 100_000
+                    self.num_tokens_since_fired[row_idx] > 1_000_000
                 )
                 pct_dead = (
                     have_not_fired_mask.sum() / have_not_fired_mask.numel()

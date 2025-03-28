@@ -1,10 +1,13 @@
 # SCAEs
 
-Download `uv` and run `bash install.sh` from within `dictionary_learning` to get started.
+Run `bash install.sh` from within `dictionary_learning` to get started.
 
-Download feature connection graphs:
+Download tinystories connections:
 ```bash
 gdown --folder 1kxpZkpdL2Yhs3xnv2zhbDw-OnlBkzZcx 
 ```
 
-Run `bash pile.sh` to get a shard of `monology/pile-uncopyrighted`. Loading and caching this with `datasets` will take around 8 minutes.
+Download pythia-70m connections:
+```bash
+gdown --folder 1h5W_rX1DpVE937BIEkO3pcJOI5RI2tea
+```
