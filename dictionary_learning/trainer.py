@@ -10,7 +10,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.optim.lr_scheduler import LambdaLR
-from transformers import get_linear_schedule_with_warmup
 from transformer_lens import HookedTransformer
 from tqdm import tqdm
 import wandb as wb
@@ -236,15 +235,14 @@ class SCAETrainer:
         """Helper function to get the autoencoder for a given module."""
         return self.model.module.scae_suite.module_dict[name].ae
 
-    def _compute_losses(self, y, pre_acts, sae_out, decode, dead_mask=None):
+    def _compute_losses(self, y, sae_out, ae, dead_mask=None):
         """Compute fvu and auxk loss.
         From: https://github.com/EleutherAI/sparsify/blob/main/sparsify/sparse_coder.py
 
         Args:
             y: Target activations
-            pre_acts: Feature activations
             sae_out: Current reconstruction
-            decode: Decoder function
+            ae: Autoencoder
             dead_mask: Boolean mask indicating dead features
         """
 
@@ -263,6 +261,12 @@ class SCAETrainer:
             scale = min(num_dead / k_aux, 1.0)
             k_aux = min(k_aux, num_dead)
 
+            # We're autoencoding, so x = y
+            orig_shape = y.shape
+            x_flat = y.flatten(0, 1)
+            pre_acts = ae.encoder(x_flat - ae.b_dec)
+            pre_acts = pre_acts.reshape(orig_shape[0], orig_shape[1], -1)
+
             # Don't include living latents in this loss
             auxk_latents = t.where(dead_mask[None], pre_acts, -t.inf)
 
@@ -271,7 +275,7 @@ class SCAETrainer:
 
             # Encourage the top ~50% of dead latents to predict the residual of the
             # top k living latents
-            e_hat = self.decode(auxk_acts, auxk_indices)
+            e_hat = ae.decode(auxk_acts, auxk_indices)
             auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
@@ -302,9 +306,8 @@ class SCAETrainer:
             
             aux_k_loss, fvu = self._compute_losses(
                 y,
-                pruned_features[name],
                 reconstructions[name],
-                self._get_ae(name).decode,
+                self._get_ae(name),
                 dead_mask,
             )
 
