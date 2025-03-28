@@ -3,6 +3,9 @@ import torch as t
 import torch.nn as nn
 from abc import ABC, abstractmethod
 
+from utils import set_seed
+set_seed(42)
+
 
 class Dictionary(ABC, nn.Module):
     """
@@ -43,7 +46,7 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         self.k = k
 
         self.encoder = nn.Linear(activation_dim, dict_size)
-        self.encoder.weight.data /= 10 # TODO: make configurable, or use a better init
+        # self.encoder.weight.data /= 10 # TODO: make configurable, or use a better init
         self.encoder.bias.data.zero_()
 
         self.decoder = nn.Linear(dict_size, activation_dim, bias=False)

@@ -8,6 +8,9 @@ from transformer_lens import ActivationCache, HookedTransformer
 
 from .top_k import AutoEncoderTopK
 
+from utils import set_seed
+set_seed(42)
+
 
 Connections = Dict[str, Dict[str, t.Tensor]]
 

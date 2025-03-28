@@ -15,6 +15,29 @@ from tqdm import tqdm
 import wandb as wb
 
 from .scae import SCAESuite, MergedSCAESuite
+from utils import set_seed
+set_seed(42)
+
+def set_seed(seed=42):
+    """
+    Set seed for reproducibility across multiple libraries.
+    
+    Args:
+        seed (int): Seed value to use. Default is 42.
+    """
+    import random
+    import numpy as np
+    import torch
+    
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # For some operations in CUDA
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 
 @dataclass
@@ -299,7 +322,7 @@ class SCAETrainer:
 
             # Only set dead mask if computing AuxK loss
             dead_mask = (
-                self.num_tokens_since_fired[module_idx]
+                self.num_tokens_since_fired[module_idx] > 1_000_000
                 if self.cfg.auxk_alpha > 0
                 else None
             )

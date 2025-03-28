@@ -6,8 +6,11 @@ from transformers import AutoTokenizer
 from dictionary_learning.buffer import chunk_and_tokenize
 from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
+from utils import set_seed
+set_seed(42)
+
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 10_000_000
+N_TOKENS = 20_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_official",
@@ -19,15 +22,16 @@ CFG = SCAEConfig(
     batch_size=256,
     k=64,
     expansion_factor=4,
-    sample_length=256,
+    sample_length=128,
     track_dead_features=True,
     connections_path="", # set in sweep()
     auxk_alpha=0,
     base_lr=1e-3 # OpenAI default of 2e-4 is too low for us
 )
 
-
 if __name__ == "__main__":
+    # t.manual_seed(42)
+    # t.backends.cudnn.deterministic = True
 
     tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
     tokenizer.pad_token = tokenizer.eos_token
@@ -41,11 +45,10 @@ if __name__ == "__main__":
 
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
-    
     for connections in [100]:
         PATH_TO_CONNECTIONS = f"/root/dictionary_learning/pythia_connections/top_connections_{connections}.pkl"
         CFG.connections_path = PATH_TO_CONNECTIONS
-        CFG.wb_run_name = f"c{connections} lr{CFG.base_lr}_bs{CFG.batch_size}_auxk{CFG.auxk_alpha}"
+        CFG.wb_run_name = f"c{connections}_lr{CFG.base_lr}_bs{CFG.batch_size}_auxk{CFG.auxk_alpha}"
 
         mp.spawn(
             SCAETrainer,

@@ -7,6 +7,9 @@ from torch.utils.data import DataLoader
 from transformers import PreTrainedTokenizerBase
 from transformer_lens import HookedTransformer
 
+from utils import set_seed
+set_seed(42)
+
 
 def chunk_and_tokenize(
     dataset: Dataset,
