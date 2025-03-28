@@ -6,12 +6,16 @@ from transformers import AutoTokenizer
 from dictionary_learning.buffer import chunk_and_tokenize
 from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
-
-PATH = "/root/dictionary_learning/pythia_connections/Copy of top_connections_20.pkl"
+connections = "20"
+PATH = f"/root/dictionary_learning/pythia_connections/Copy of top_connections_{connections}.pkl"
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
 N_TOKENS = 25_000_000
 CFG = SCAEConfig(
+    model_name="EleutherAI/pythia-70m-deduped",
     wb_project="dictionary_learning",
+    wb_run_name=f"scae_test_run_2_connections_{connections}", # Used as name for saving to hf
+    save_to_hf=True,
+    hf_username="Elriggs",
     warmup_ratio=0.00,
     epochs=1,
     batch_size=64,
@@ -19,12 +23,12 @@ CFG = SCAEConfig(
     expansion_factor=4,
     sample_length=256,
     track_dead_features=True,
-    connections_path=None,
+    connections_path=PATH,
 )
 
 
 def main():
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
+    tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset(
         PATH_TO_PILE,

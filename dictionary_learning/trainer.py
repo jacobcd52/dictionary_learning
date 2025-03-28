@@ -24,10 +24,14 @@ class SCAEConfig:
     expansion_factor: int
     connections_path: str
 
+    model_name: str ="EleutherAI/pythia-70m-deduped"
+
     wb_project: str = "pythia_scae_caden"
     wb_run_name: str = "scae_bae"
     wb_entity: str = "training-saes"
     lr: float = None
+    save_to_hf: bool = False
+    hf_username: str = None
 
     track_dead_features: bool = False
     compute_fvu_loss: bool = False
@@ -173,7 +177,7 @@ class SCAETrainer:
     def load_model(self, device, dtype, cfg: SCAEConfig):
         transformer = (
             HookedTransformer.from_pretrained(
-                "EleutherAI/pythia-70m-deduped",
+                self.cfg.model_name,
             )
             .to(device)
             .to(dtype)
@@ -381,4 +385,8 @@ class SCAETrainer:
 
                 self.global_step += 1
 
+        if self.cfg.save_to_hf:
+            model_save_name = self.cfg.model_name.split("/")[-1]
+            hf_repo_save_id = f"{self.cfg.hf_username}/{model_save_name}_{self.cfg.wb_run_name}"
+            self.model.module.scae_suite.upload_to_hf(repo_id=hf_repo_save_id)
         cleanup()

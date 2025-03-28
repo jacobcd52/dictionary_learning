@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Literal, Tuple
-
+from typing import Dict, List, NamedTuple, Literal, Tuple, Optional, Union
+import json
 import einops
 import torch as t
 import torch.nn as nn
@@ -358,8 +358,9 @@ class SCAESuite(nn.Module):
         self.n_features = n_features
 
         self.connections = connections
+        self.device = device
         if connections is not None:
-            self.connection_masks = self._process_connections(connections, device)
+            self.connection_masks = self._process_connections()
         else:
             self.connection_masks = None
 
@@ -415,11 +416,11 @@ class SCAESuite(nn.Module):
 
         return nn.ModuleDict(module_dict)
 
-    def _process_connections(self, connections: Connections, device: t.device):
+    def _process_connections(self):
         """Process connections to create connection masks and validate input."""
 
         connection_masks = {}
-        for down_name, up_dict in connections.items():
+        for down_name, up_dict in self.connections.items():
             connection_masks[down_name] = {}
             for up_name, conn_tensor in up_dict.items():
                 valid_indices = (conn_tensor >= -1) & (
@@ -445,7 +446,7 @@ class SCAESuite(nn.Module):
                 connection_mask = t.zeros(
                     n_features,
                     n_features,
-                    device=device,
+                    device=self.device,
                     dtype=t.bool,
                 )
                 connection_mask[i_indices, targets] = True
@@ -498,6 +499,131 @@ class SCAESuite(nn.Module):
         loss = nn.functional.cross_entropy(logits, tokens, reduction="mean")
         return loss
 
+    @classmethod
+    def from_pretrained(
+        cls,
+        repo_id: str,
+        model,
+        connections: Optional[Union[Dict[str, Dict[str, t.Tensor]], str]] = None,
+        device: Optional[str] = None,
+        dtype: t.dtype = t.float32
+    ) -> "SCAESuite":
+        """
+        Load a pretrained SCAESuite from HuggingFace.
+        
+        Args:
+            repo_id: HuggingFace repository ID containing the saved model
+            model: TransformerLens model
+            connections: Optional connections to override loaded ones
+            device: Device to load the model on
+            dtype: Data type for model parameters
+            
+        Returns:
+            Initialized SCAESuite with pretrained weights
+        """
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            raise ImportError(
+                "huggingface_hub package is required to load pretrained models. "
+                "Install with: pip install huggingface_hub"
+            )
+
+        # Download configuration
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        
+        # Initialize suite with possible user-provided connections
+        suite = cls(
+            model=model,
+            k=config["k"],
+            n_features=config["n_features"],
+            connections=connections,
+            dtype=dtype,
+            device=device
+        )
+        
+        # Download and load state dict
+        checkpoint_path = hf_hub_download(repo_id=repo_id, filename="checkpoint.pt")
+        state_dict = t.load(checkpoint_path, map_location='cpu')
+        
+        # Extract connections from state_dict if present
+        loaded_connections = state_dict.pop('connections', None)
+        
+        # Handle connections override
+        if loaded_connections is not None:
+            if connections is not None:
+                print("Warning: Provided connections argument overrides the loaded connections from HuggingFace.")
+            else:
+                suite.connections = loaded_connections
+                suite._process_connections()
+        
+        # Load the state_dict into the suite
+        missing_keys, unexpected_keys = suite.load_state_dict(state_dict, strict=False)
+        
+        if len(missing_keys) > 0:
+            print(f"Warning: Missing keys in state dict: {missing_keys}")
+        if len(unexpected_keys) > 0:
+            print(f"Warning: Unexpected keys in state dict: {unexpected_keys}")
+        
+        suite.is_pretrained = True
+        return suite
+
+    def upload_to_hf(self, repo_id: str, private: bool = False):
+        """
+        Upload the model to HuggingFace Hub. Creates the repository if it doesn't exist.
+        
+        Args:
+            repo_id: HuggingFace repository ID to upload to
+            private: Whether the repository should be private if created (default: False)
+        """
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            raise ImportError(
+                "huggingface_hub package is required to upload models. "
+                "Install with: pip install huggingface_hub"
+            )
+
+        # Create config
+        config = {
+            "k": self.k,
+            "n_features": self.n_features,
+        }
+        
+        # Save config and state dict with connections
+        import tempfile
+        import os
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, "config.json")
+            with open(config_path, 'w') as f:
+                json.dump(config, f)
+            
+            checkpoint_path = os.path.join(tmp_dir, "checkpoint.pt")
+            state_dict = self.state_dict()
+            state_dict['connections'] = self.connections
+            t.save(state_dict, checkpoint_path)
+            
+            # Upload files
+            api = HfApi()
+            
+            # Check if repo exists and create it if it doesn't
+            try:
+                api.repo_info(repo_id=repo_id, repo_type="model")
+            except Exception:  # Repository doesn't exist
+                api.create_repo(
+                    repo_id=repo_id,
+                    repo_type="model",
+                    private=private
+                )
+                
+            api.upload_folder(
+                folder_path=tmp_dir,
+                repo_id=repo_id,
+                repo_type="model"
+            )
 
 class MergedSCAESuite(nn.Module):
     def __init__(self, transformer: HookedTransformer, scae_suite: SCAESuite):
