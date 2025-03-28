@@ -6,26 +6,26 @@ from transformers import AutoTokenizer
 from dictionary_learning.buffer import chunk_and_tokenize
 from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
-connections = "20"
-PATH = f"/root/dictionary_learning/pythia_connections/Copy of top_connections_{connections}.pkl"
+connections = "100"
+PATH = f"/root/dictionary_learning/pythia_connections/top_connections_{connections}.pkl"
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 100_000_000
+N_TOKENS = 10_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_official",
-    wb_run_name=f"I'll add this below", # Used as name for saving to hf
     save_to_hf=True,
     hf_username="jacobcd52",
     warmup_ratio=0.00,
+    decay_start_ratio=0.7, # this has a significant effect!
     epochs=1,
     batch_size=256,
     k=64,
     expansion_factor=4,
-    sample_length=256,
+    sample_length=128,
     track_dead_features=True,
     connections_path=PATH,
-    auxk_alpha=1e-2,
-    base_lr=1e-3 # OpenAI recommends 2e-4, but our setup is v different
+    auxk_alpha=0,
+    base_lr=1e-3 # OpenAI default of 2e-4 is too low for us
 )
 
 CFG.wb_run_name = f"lr{CFG.base_lr}_bs{CFG.batch_size}_auxk{CFG.auxk_alpha}"
