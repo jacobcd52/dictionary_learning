@@ -34,7 +34,7 @@ class SCAEConfig:
     hf_username: str = None
 
     track_dead_features: bool = False
-    compute_fvu_loss: bool = False
+    fvu_loss_coeff: float = 0.0
     auxk_alpha: float = 0.0
 
     warmup_ratio: float = 0.05
@@ -311,7 +311,9 @@ class SCAETrainer:
                 dead_mask,
             )
 
-            component_loss = fvu + self.cfg.auxk_alpha * aux_k_loss
+            fvu = fvu * self.cfg.fvu_loss_coeff
+            aux_k_loss = aux_k_loss * self.cfg.auxk_loss_coeff
+            component_loss = fvu + aux_k_loss
             total_loss = total_loss + component_loss
 
             if self.rank == 0:
@@ -359,7 +361,7 @@ class SCAETrainer:
 
         total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
 
-        if self.cfg.compute_fvu_loss:
+        if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0:
             reconstruction_loss = self.get_losses(
                 pruned_features, reconstructions, cache
             )
