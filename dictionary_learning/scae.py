@@ -391,7 +391,8 @@ class SCAESuite(nn.Module):
             upstream_aes = {}
 
             for up in submodule_names:
-                if up.layer >= down.layer:
+                if self.does_precede(up, down):
+                    # Skip if upstream module does not precede downstream module
                     continue
 
                 if self.connections is None or (
@@ -415,6 +416,14 @@ class SCAESuite(nn.Module):
             )
 
         return nn.ModuleDict(module_dict)
+    
+    def does_precede(self, up_name: SubmoduleName, down_name: SubmoduleName):
+        if "pythia" in self.model.cfg.model_name:
+            # attn and mlp are parallel
+            return up_name.layer < down_name.layer
+        else:
+            # attn and mlp are sequential
+            return (up_name.layer < down_name.layer) or (up_name.layer == down_name.layer and up_name.submodule_type == "attn" and down_name.submodule_type == "mlp")
 
     def _process_connections(self):
         """Process connections to create connection masks and validate input."""
@@ -469,12 +478,17 @@ class SCAESuite(nn.Module):
             dtype=dtype,
         )
 
-        for module_name, module in self.module_dict.items():
-            feature_buffer, reconstruction = module(
-                cache, pruned_features, feat_buffer
-            )
-            pruned_features[module_name] = feature_buffer
-            reconstructions[module_name] = reconstruction
+        # Iterate with correct ordering
+        for layer in range(self.model.cfg.n_layers):
+            for module_type in ["attn", "mlp"]:
+                module_name = f"{module_type}_{layer}"
+                module = self.module_dict[module_name]
+            
+                feature_buffer, reconstruction = module(
+                    cache, pruned_features, feat_buffer
+                )
+                pruned_features[module_name] = feature_buffer
+                reconstructions[module_name] = reconstruction
 
         return reconstructions, pruned_features
 
