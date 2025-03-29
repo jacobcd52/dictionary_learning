@@ -394,7 +394,7 @@ class SCAESuite(nn.Module):
             upstream_aes = {}
 
             for up in submodule_names:
-                if self.does_precede(up, down):
+                if not self.does_precede(up, down):
                     # Skip if upstream module does not precede downstream module
                     continue
 
