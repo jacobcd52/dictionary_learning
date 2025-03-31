@@ -291,14 +291,18 @@ class SCAETrainer:
             pre_acts = pre_acts.reshape(orig_shape[0], orig_shape[1], -1)
 
             # Don't include living latents in this loss
-            auxk_latents = t.where(dead_mask[None], pre_acts, -t.inf)
+            auxk_latents = t.where(dead_mask[None].to(pre_acts.device), pre_acts, -t.inf)
 
+            # Encourage the top ~50% of dead latents to predict the residual of the
             # Top-k dead latents
             auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
 
-            # Encourage the top ~50% of dead latents to predict the residual of the
+            buffer_BF = t.zeros_like(pre_acts)
+            encoded_acts_BF = buffer_BF.scatter_(
+                dim=-1, index=auxk_indices, src=t.nn.functional.relu(auxk_acts)
+            )
             # top k living latents
-            e_hat = ae.decode(auxk_acts, auxk_indices)
+            e_hat = ae.decode(encoded_acts_BF)
             auxk_loss = (e_hat - e.detach()).pow(2).sum()
             auxk_loss = scale * auxk_loss / total_variance
         else:
@@ -341,6 +345,7 @@ class SCAETrainer:
 
             if self.rank == 0:
                 wb.log({f"fvu/{name}": fvu.item()}, step=self.global_step)
+                wb.log({f"auxk/{name}": aux_k_loss.item()}, step=self.global_step)
 
         return total_loss
 
@@ -429,6 +434,8 @@ class SCAETrainer:
 
                 if self.rank == 0:
                     wb.log({"train/loss": loss.item()}, step=self.global_step)
+                    # log number of tokens trained so far
+                    wb.log({"train/tokens": self.global_step * self.cfg.batch_size * self.cfg.sample_length}, step=self.global_step)
 
                 self.global_step += 1
 
