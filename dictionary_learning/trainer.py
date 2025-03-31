@@ -335,7 +335,7 @@ class SCAETrainer:
             )
 
             fvu = fvu * self.cfg.fvu_loss_coeff
-            aux_k_loss = aux_k_loss * self.cfg.auxk_loss_coeff
+            aux_k_loss = aux_k_loss * self.cfg.auxk_alpha
             component_loss = fvu + aux_k_loss
             total_loss = total_loss + component_loss
 
