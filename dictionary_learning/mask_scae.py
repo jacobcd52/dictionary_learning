@@ -645,6 +645,8 @@ class MergedSCAESuite(nn.Module):
             for submodule in module.modules():
                 if isinstance(submodule, AutoEncoderTopK):
                     params.extend(submodule.parameters())
+                if isinstance(submodule, LearnableMask):
+                    params.extend(submodule.parameters())
 
         return params
 
