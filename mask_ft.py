@@ -9,6 +9,10 @@ from dictionary_learning.mask_trainer import SCAETrainer, SCAEConfig
 from utils import set_seed
 set_seed(42)
 
+
+N_CPUS = 19 //2
+
+
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
 N_TOKENS = 20_000_000
 CFG = SCAEConfig(
@@ -24,7 +28,7 @@ CFG = SCAEConfig(
     expansion_factor=4,
     sample_length=128,
     track_dead_features=True,
-    auxk_alpha=0,
+    auxk_alpha=1/32,
     base_lr=1e-3, # OpenAI default of 2e-4 is too low for us
     target_connection_l0=100
 )
@@ -38,9 +42,10 @@ if __name__ == "__main__":
     dataset = load_dataset(
         PATH_TO_PILE,
         split="train[:10%]",
-        num_proc=10,
+        num_proc=N_CPUS,
     )
-    dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length)
+
+    dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length, num_proc=N_CPUS)
     dataset = dataset.select(range(N_TOKENS // CFG.sample_length))
 
     world_size = t.cuda.device_count()

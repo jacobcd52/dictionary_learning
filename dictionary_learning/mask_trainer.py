@@ -353,7 +353,7 @@ class SCAETrainer:
                     {
                         f"fvu/{name}": fvu.item(),
                         f"auxk/{name}": aux_k_loss.item(),
-                        f"mask_loss/{name}": mask_loss.item(),
+                        f"mask_loss/{name}": mask_loss,
                     },
                     step=self.global_step,
                 )
@@ -405,7 +405,7 @@ class SCAETrainer:
 
         if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0:
             reconstruction_loss = self.get_losses(
-                pruned_features, reconstructions, cache
+                temperature, pruned_features, reconstructions, cache
             )
             total_loss += reconstruction_loss
 

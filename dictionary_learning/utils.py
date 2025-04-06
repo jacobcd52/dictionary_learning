@@ -86,6 +86,7 @@ class LearnableMask(nn.Module):
         else:
             mask = mask_relaxed
 
+        mask = mask.to(torch.bfloat16)
         return mask
 
     def l0_regularization(self, temperature):

@@ -95,7 +95,7 @@ class SCAEModule(nn.Module, ABC):
         return feat_buffer, reconstructions
 
     def get_mask_loss(self, temperature: float):
-        mask_loss = 0
+        mask_loss = 0.
         for mask in self.connection_masks.values():
             mask_loss += mask.l0_regularization(temperature)
         return mask_loss
@@ -409,12 +409,12 @@ class SCAESuite(nn.Module):
             connection_masks = None
             if self.target_l0 != -1:
                 connection_masks = {
-                    up.name: LearnableMask(
+                    up: LearnableMask(
                         aes[down.name].dict_size,
-                        aes[up.name].dict_size,
+                        aes[up].dict_size,
                         self.target_l0,
                     ).to(self.device).to(self.dtype)
-                    for up in upstream_aes
+                    for up in upstream_aes.keys()
                 }
 
             module_dict[down.name] = _make_module(
