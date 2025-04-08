@@ -45,7 +45,7 @@ class SCAEConfig:
     # SCAE Arguments
     k: int
     expansion_factor: int
-    target_connection_l0: int = 100
+    target_C: int = 100
 
     model_name: str = "EleutherAI/pythia-70m-deduped"
 
@@ -59,6 +59,7 @@ class SCAEConfig:
     track_dead_features: bool = False
     fvu_loss_coeff: float = 0.0
     auxk_alpha: float = 0.0
+    mask_loss_coeff: float = 1e-5
 
     warmup_ratio: float = 0.05
     decay_start_ratio: float = 0.7
@@ -80,7 +81,8 @@ class SCAEConfig:
             "quantize_optimizer": self.quantize_optimizer,
             "sample_length": self.sample_length,
             "auxk_alpha": self.auxk_alpha,
-            "target_connection_l0": self.target_connection_l0,
+            "target_C": self.target_C,
+            "mask_loss_coeff": self.mask_loss_coeff,
         }
 
 
@@ -237,7 +239,7 @@ class SCAETrainer:
         scae = SCAESuite(
             transformer,
             cfg.k,
-            cfg.target_connection_l0,
+            cfg.target_C,
             n_features,
             device=device,
             dtype=dtype,
@@ -343,10 +345,11 @@ class SCAETrainer:
             )
 
             mask_loss = module.get_mask_loss(temperature)
-            fvu = fvu * self.cfg.fvu_loss_coeff
-            aux_k_loss = aux_k_loss * self.cfg.auxk_alpha
-            component_loss = fvu + aux_k_loss
-            total_loss = total_loss + component_loss + mask_loss
+            print("mask_loss", mask_loss)
+        
+            total_loss = total_loss + self.cfg.fvu_loss_coeff * fvu 
+            total_loss = total_loss + self.cfg.mask_loss_coeff * mask_loss
+            total_loss = total_loss + self.cfg.auxk_alpha * aux_k_loss
 
             if self.rank == 0:
                 wb.log(
@@ -403,7 +406,7 @@ class SCAETrainer:
 
         total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
 
-        if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0:
+        if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0 or self.cfg.mask_loss_coeff > 0:
             reconstruction_loss = self.get_losses(
                 temperature, pruned_features, reconstructions, cache
             )

@@ -8,7 +8,7 @@ class LearnableMask(nn.Module):
     """
     Learnable binary mask using the Hard Concrete distribution
     (the binary equivalent of Gumbel-Softmax). Allows annealing
-    towards a target L0 norm via regularization. Includes option
+    towards a target C via regularization. Includes option
     for temperature annealing.
     """
 
@@ -16,7 +16,7 @@ class LearnableMask(nn.Module):
         self,
         n_features_down,
         n_features_up,
-        target_l0,
+        target_C,
         init_mean=0.0,
         init_std=0.01,
     ):
@@ -24,7 +24,7 @@ class LearnableMask(nn.Module):
         Args:
             n_features_down: Dimension 1 size.
             n_features_up: Dimension 2 size.
-            target_l0: Target L0 norm.
+            target_C: Target num connections per feature.
             init_mean: Mean for initializing log_alpha parameters.
             init_std: Standard deviation for initializing log_alpha parameters.
         """
@@ -44,7 +44,7 @@ class LearnableMask(nn.Module):
         # These are typically fixed constants.
         self.register_buffer("gamma", torch.tensor(-0.1))
         self.register_buffer("zeta", torch.tensor(1.1))
-        self.target_l0 = target_l0
+        self.target_C = target_C
 
     def forward(self, temperature, hard=True):  # Default temp = 2/3
         """
@@ -79,8 +79,10 @@ class LearnableMask(nn.Module):
         mask_relaxed = torch.clamp(s_stretched, 0.0, 1.0)
 
         if hard:
+            # print(f"mask_relaxed: {mask_relaxed.sum()}")
             # Binarize using Straight-Through Estimator (STE)
             mask_hard = (mask_relaxed > 0.5).float()
+            # print(f"mask_hard: {mask_hard.sum()}")
             # STE: Use hard values but pass gradients through the relaxed version
             mask = mask_hard - mask_relaxed.detach() + mask_relaxed
         else:
@@ -89,13 +91,13 @@ class LearnableMask(nn.Module):
         mask = mask.to(torch.bfloat16)
         return mask
 
-    def l0_regularization(self, temperature):
+    def mask_loss(self, temperature):
         """
-        Calculate the L0 regularization penalty based on expected sparsity.
-        Forces the expected number of non-zero elements towards target_l0.
+        Calculate the regularization penalty based on expected sparsity.
+        Forces the expected number of non-zero elements per row towards target_C.
 
         Args:
-            target_l0: The desired number of non-zero elements (sparsity target).
+            target_C: The desired number of connections per feature.
             temperature: The current temperature (beta) used in the forward pass.
                          Must match the one used if consistency is needed,
                          or can be fixed if regularization target is independent
@@ -117,10 +119,11 @@ class LearnableMask(nn.Module):
             log_alpha - beta * math.log(-self.gamma / self.zeta)
         )
 
-        # Calculate the expected total number of non-zero elements (expected L0 norm)
-        expected_l0 = p_nonzero.sum()
+        # Calculate the expected total number of non-zero elements per row (expected C)
+        expected_p_nonzero = p_nonzero.mean()
 
-        # Calculate the L2 penalty between expected L0 and target L0
-        l0_penalty = (expected_l0 - self.target_l0) ** 2
+        target_p_nonzero = self.target_C / p_nonzero.numel()
+        # Calculate the L2 penalty between expected C and target C
+        mask_loss = (expected_p_nonzero - target_p_nonzero) ** 2
 
-        return l0_penalty
+        return mask_loss

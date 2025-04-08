@@ -6,8 +6,8 @@ uv pip install flash-attn --no-build-isolation
 uv pip install -e .
 
 # Pythia connections
-pip install gdown
-gdown --folder 1cvEOuMIho4NN-wwWTU2cQ4GdMkLncZtL
+# pip install gdown
+# gdown --folder 1cvEOuMIho4NN-wwWTU2cQ4GdMkLncZtL
 
 # monology/pile-uncopyrighted
 # Make sure hf-transfer is installed
