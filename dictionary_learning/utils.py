@@ -87,7 +87,6 @@ class LearnableMask(nn.Module):
             mask = mask_hard - mask_relaxed.detach() + mask_relaxed
         else:
             mask = mask_relaxed
-
         mask = mask.to(torch.bfloat16)
         return mask
 
@@ -114,6 +113,7 @@ class LearnableMask(nn.Module):
         # Calculate the probability of each element being non-zero (P(s > 0))
         # This uses the CDF of the Hard Concrete distribution.
         log_alpha = self.log_alpha
+        # print("log_alpha.mean()", log_alpha.mean())
         # Use the same beta as in the forward calculation for consistency
         p_nonzero = torch.sigmoid(
             log_alpha - beta * math.log(-self.gamma / self.zeta)
@@ -122,7 +122,8 @@ class LearnableMask(nn.Module):
         # Calculate the expected total number of non-zero elements per row (expected C)
         expected_p_nonzero = p_nonzero.mean()
 
-        target_p_nonzero = self.target_C / p_nonzero.numel()
+        target_p_nonzero = self.target_C / p_nonzero.shape[0]  # this is C / num_features
+        # print(f"expected_p_nonzero: {expected_p_nonzero}, target_p_nonzero: {target_p_nonzero}")
         # Calculate the L2 penalty between expected C and target C
         mask_loss = (expected_p_nonzero - target_p_nonzero) ** 2
 

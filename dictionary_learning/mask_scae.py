@@ -41,7 +41,7 @@ class SCAEModule(nn.Module, ABC):
         model: HookedTransformer,
         ae: AutoEncoderTopK,
         upstream_aes: Dict[str, AutoEncoderTopK],
-        connection_masks: Dict[str, LearnableMask],
+        connection_masks: nn.ModuleDict,
         name: SubmoduleName,
     ):
         super().__init__()
@@ -416,6 +416,7 @@ class SCAESuite(nn.Module):
                     ).to(self.device).to(self.dtype)
                     for up in upstream_aes.keys()
                 }
+                connection_masks = nn.ModuleDict(connection_masks)
 
             module_dict[down.name] = _make_module(
                 down.submodule_type,

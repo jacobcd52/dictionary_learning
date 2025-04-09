@@ -345,7 +345,11 @@ class SCAETrainer:
             )
 
             mask_loss = module.get_mask_loss(temperature)
-            print("mask_loss", mask_loss)
+
+            C = 0
+            for learnable_mask in module.connection_masks.values():
+                mask = learnable_mask(temperature, hard=True)
+                C += mask.sum() / mask.shape[0]
         
             total_loss = total_loss + self.cfg.fvu_loss_coeff * fvu 
             total_loss = total_loss + self.cfg.mask_loss_coeff * mask_loss
@@ -357,6 +361,7 @@ class SCAETrainer:
                         f"fvu/{name}": fvu.item(),
                         f"auxk/{name}": aux_k_loss.item(),
                         f"mask_loss/{name}": mask_loss,
+                        f"C/{name}": C,
                     },
                     step=self.global_step,
                 )
