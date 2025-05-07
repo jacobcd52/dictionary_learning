@@ -404,20 +404,32 @@ class SCAESuite(nn.Module):
                     # Skip if upstream module does not precede downstream module
                     continue
                     
-                # Removed check here
                 upstream_aes[up.name] = aes[up.name]
                 
             connection_masks = None
             if self.target_C != -1:
-                connection_masks = {
-                    up: LearnableMask(
-                        aes[down.name].dict_size,
-                        aes[up].dict_size,
-                        self.target_C,
-                    ).to(self.device).to(self.dtype)
-                    for up in upstream_aes.keys()
-                }
-                connection_masks = nn.ModuleDict(connection_masks)
+                mask_components = {}
+                for up_key_loop_var in upstream_aes.keys():
+                    n_down_features = aes[down.name].dict_size
+                    n_up_features = aes[up_key_loop_var].dict_size
+
+                    if self.mask_type == "learnable":
+                        mask_instance = LearnableMask(
+                            n_features_down=n_down_features,
+                            n_features_up=n_up_features,
+                            target_C=self.target_C,
+                        )
+                    elif self.mask_type == "simple":
+                        mask_instance = SimpleBinaryMask(
+                            n_features_down=n_down_features,
+                            n_features_up=n_up_features,
+                            target_C=self.target_C,
+                        )
+                    else:
+                        raise ValueError(f"Unsupported mask_type: {self.mask_type}. Choose 'learnable' or 'simple'.")
+                    
+                    mask_components[up_key_loop_var] = mask_instance.to(self.device).to(self.dtype)
+                connection_masks = nn.ModuleDict(mask_components)
 
             module_dict[down.name] = _make_module(
                 down.submodule_type,

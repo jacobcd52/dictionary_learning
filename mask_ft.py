@@ -33,7 +33,7 @@ CFG = SCAEConfig(
     target_C=100,
     fvu_loss_coeff=0.0,
     mask_loss_coeff=1,
-    mask_type="learnable",
+    mask_type="simple",
 
 )
 
