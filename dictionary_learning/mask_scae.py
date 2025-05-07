@@ -7,7 +7,7 @@ import torch.nn as nn
 from transformer_lens import ActivationCache, HookedTransformer
 
 from .top_k import AutoEncoderTopK
-from .utils import LearnableMask
+from .utils import LearnableMask, SimpleBinaryMask
 
 from utils import set_seed
 
@@ -350,6 +350,7 @@ class SCAESuite(nn.Module):
         k: int,
         target_C: int,
         n_features: int,
+        mask_type: str,
         device: str,
         dtype: t.dtype,
     ):
@@ -369,7 +370,7 @@ class SCAESuite(nn.Module):
         self.k = k
         self.n_features = n_features
         self.target_C = target_C
-
+        self.mask_type = mask_type
         self.device = device
 
         submodule_names = [
@@ -534,7 +535,7 @@ class SCAESuite(nn.Module):
             model=model,
             k=config["k"],
             n_features=config["n_features"],
-            connections=connections,
+            mask_type=config.get("mask_type", "learnable"),
             dtype=dtype,
             device=device,
         )
@@ -591,6 +592,7 @@ class SCAESuite(nn.Module):
         config = {
             "k": self.k,
             "n_features": self.n_features,
+            "mask_type": self.mask_type,
         }
 
         # Save config and state dict with connections
@@ -640,13 +642,16 @@ class MergedSCAESuite(nn.Module):
                 f"blocks.{layer}.attn.hook_pattern",
             ]
 
+    # TODO check this!
     def get_trainable_params(self):
         params = []
         for module in self.scae_suite.module_dict.values():
             for submodule in module.modules():
                 if isinstance(submodule, AutoEncoderTopK):
                     params.extend(submodule.parameters())
-                if isinstance(submodule, LearnableMask):
+                elif isinstance(submodule, LearnableMask):
+                    params.extend(submodule.parameters())
+                elif isinstance(submodule, SimpleBinaryMask):
                     params.extend(submodule.parameters())
 
         return params

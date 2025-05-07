@@ -46,6 +46,7 @@ class SCAEConfig:
     k: int
     expansion_factor: int
     target_C: int = 100
+    mask_type: str = "simple"
 
     model_name: str = "EleutherAI/pythia-70m-deduped"
 
@@ -83,6 +84,7 @@ class SCAEConfig:
             "auxk_alpha": self.auxk_alpha,
             "target_C": self.target_C,
             "mask_loss_coeff": self.mask_loss_coeff,
+            "mask_type": self.mask_type,
         }
 
 
@@ -241,6 +243,7 @@ class SCAETrainer:
             cfg.k,
             cfg.target_C,
             n_features,
+            mask_type=cfg.mask_type,
             device=device,
             dtype=dtype,
         )
