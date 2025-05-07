@@ -345,7 +345,7 @@ class SCAETrainer:
                 reconstructions[name],
                 module.ae,
                 dead_mask,
-            )
+            ) 
 
             mask_loss = module.get_mask_loss(temperature)
 

@@ -17,7 +17,7 @@ PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
 N_TOKENS = 20_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
-    wb_project="pythia_scae_hard_concrete",
+    wb_project="pythia_scae_simple_binary",
     save_to_hf=True,
     hf_username="jacobcd52",
     warmup_ratio=0.00,
@@ -32,7 +32,7 @@ CFG = SCAEConfig(
     base_lr=1e-3, # OpenAI default of 2e-4 is too low for us
     target_C=100,
     fvu_loss_coeff=0.0,
-    mask_loss_coeff=1,
+    mask_loss_coeff=1e-4,
     mask_type="simple",
 
 )

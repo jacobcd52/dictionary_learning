@@ -140,7 +140,7 @@ class SimpleBinaryMask(nn.Module):
         n_features_down,
         n_features_up,
         target_C,
-        init_mean=-2.2,  # Adjusted to align initial density with typical target_C
+        init_mean=0.0, # this is weirdly important... might indicate that something is set up wrong
         init_std=0.01,
     ):
         """
@@ -201,22 +201,15 @@ class SimpleBinaryMask(nn.Module):
         """
         probs = torch.sigmoid(self.logits) # (n_features_down, n_features_up)
 
-        # Expected number of connections for each 'n_features_up' feature
-        # (summing probabilities over the 'n_features_down' dimension - i.e., column sums)
-        expected_connections_to_f_up = probs.sum(dim=0)
+        # Expected number of connections for each 'n_features_down' feature
+        # (summing probabilities over the 'n_features_up' dimension - i.e., row sums)
+        expected_connections_to_f_down = probs.sum(dim=1)
         
         # L1 penalty: sum |expected_connections_j - target_C|
         # This calculates the sum of absolute differences between the expected sum of connections
         # for each n_features_up column and the target_C.
-        loss_val = (expected_connections_to_f_up - self.target_C).abs().sum()
+        loss_val = (expected_connections_to_f_down - self.target_C).abs().sum()
         
-        # Scale loss for consistency. 
-        # The original LearnableMask effectively scales by (1/n_features_down) due to its p_nonzero calculation.
-        # We sum over n_features_up elements, so to average the penalty per n_features_up element, divide by n_features_up.
-        # To be comparable to LearnableMask's loss magnitude which is a sum over n_features_up of (mean_col_prob - target_col_prob)^2,
-        # and our loss_val is a sum over n_features_up of |sum_col_prob - target_C|, 
-        # a simple scaling might be by (1 / self.n_features_up) if we want an average per-column penalty, or by (1 / self.n_features_down) if matching LearnableMask's C/N_down factor.
-        # The previous version used self.n_features_down. Let's stick to that for now if the goal was to match the scale.
         scaled_loss = loss_val / self.n_features_down 
         
         return scaled_loss
