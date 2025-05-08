@@ -30,9 +30,9 @@ CFG = SCAEConfig(
     track_dead_features=True,
     auxk_alpha=0,
     base_lr=1e-3, # OpenAI default of 2e-4 is too low for us
-    target_C=100,
+    target_C=0,
     fvu_loss_coeff=0.0,
-    mask_loss_coeff=1e-4,
+    mask_loss_coeff=1e-5,
     mask_type="simple",
 
 )

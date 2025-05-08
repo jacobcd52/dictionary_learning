@@ -349,11 +349,14 @@ class SCAETrainer:
 
             mask_loss = module.get_mask_loss(temperature)
 
-            C = 0
-            for learnable_mask in module.connection_masks.values():
-                mask = learnable_mask(temperature, hard=True)
-                C += mask.sum() / mask.shape[0]
-        
+            C_total_for_module = 0
+            for up_name, learnable_mask_instance in module.connection_masks.items():
+                mask = learnable_mask_instance(temperature, hard=True)
+                # C is defined as the average number of active incoming connections *per downstream feature*
+                # So, for a given upstream mask, this is mask.sum() / mask.shape[0] (mask.shape[0] is n_features_down)
+                c_contribution = mask.sum().item() / mask.shape[0]
+                C_total_for_module += c_contribution
+            
             total_loss = total_loss + self.cfg.fvu_loss_coeff * fvu 
             total_loss = total_loss + self.cfg.mask_loss_coeff * mask_loss
             total_loss = total_loss + self.cfg.auxk_alpha * aux_k_loss
@@ -363,8 +366,8 @@ class SCAETrainer:
                     {
                         f"fvu/{name}": fvu.item(),
                         f"auxk/{name}": aux_k_loss.item(),
-                        f"mask_loss/{name}": mask_loss,
-                        f"C/{name}": C,
+                        f"mask_loss/{name}": mask_loss, # Log the specific mask loss for this module
+                        f"C/{name}": C_total_for_module, # Log the total C for this module
                     },
                     step=self.global_step,
                 )
