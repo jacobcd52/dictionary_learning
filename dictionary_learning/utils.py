@@ -138,7 +138,7 @@ class SimpleBinaryMask(nn.Module):
     def __init__(
         self,
         n_features_down,
-        n_features_up,
+        n_features_up, 
         target_C,
         init_mean=0.0, # this is weirdly important... might indicate that something is set up wrong
         init_std=0.01,

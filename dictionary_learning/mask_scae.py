@@ -510,9 +510,6 @@ class SCAESuite(nn.Module):
         cls,
         repo_id: str,
         model,
-        connections: Optional[
-            Union[Dict[str, Dict[str, t.Tensor]], str]
-        ] = None,
         device: Optional[str] = None,
         dtype: t.dtype = t.float32,
     ) -> "SCAESuite":
@@ -522,7 +519,6 @@ class SCAESuite(nn.Module):
         Args:
             repo_id: HuggingFace repository ID containing the saved model
             model: TransformerLens model
-            connections: Optional connections to override loaded ones
             device: Device to load the model on
             dtype: Data type for model parameters
 
@@ -542,10 +538,11 @@ class SCAESuite(nn.Module):
         with open(config_path, "r") as f:
             config = json.load(f)
 
-        # Initialize suite with possible user-provided connections
+        # Initialize suite
         suite = cls(
             model=model,
             k=config["k"],
+            target_C=config.get("target_C", -1),
             n_features=config["n_features"],
             mask_type=config.get("mask_type", "learnable"),
             dtype=dtype,
@@ -557,19 +554,6 @@ class SCAESuite(nn.Module):
             repo_id=repo_id, filename="checkpoint.pt"
         )
         state_dict = t.load(checkpoint_path, map_location="cpu")
-
-        # Extract connections from state_dict if present
-        loaded_connections = state_dict.pop("connections", None)
-
-        # Handle connections override
-        if loaded_connections is not None:
-            if connections is not None:
-                print(
-                    "Warning: Provided connections argument overrides the loaded connections from HuggingFace."
-                )
-            else:
-                suite.connections = loaded_connections
-                suite._process_connections()
 
         # Load the state_dict into the suite
         missing_keys, unexpected_keys = suite.load_state_dict(
@@ -605,6 +589,7 @@ class SCAESuite(nn.Module):
             "k": self.k,
             "n_features": self.n_features,
             "mask_type": self.mask_type,
+            "target_C": self.target_C,
         }
 
         # Save config and state dict with connections
@@ -618,7 +603,6 @@ class SCAESuite(nn.Module):
 
             checkpoint_path = os.path.join(tmp_dir, "checkpoint.pt")
             state_dict = self.state_dict()
-            state_dict["connections"] = self.connections
             t.save(state_dict, checkpoint_path)
 
             # Upload files

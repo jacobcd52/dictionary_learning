@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCAE Feature Viewer</title> <!-- Title updated -->
+    <style>
+        /* Reset and base styles */
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f5f5f5;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: #fff;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+            overflow: hidden;
+        }
+        
+        /* Header styles */
+        .header {
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        
+        /* Controls section */
+        .controls {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-bottom: 1px solid #e9ecef;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        
+        .control-group {
+            flex: 1;
+            min-width: 200px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #495057;
+        }
+        
+        select, input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ced4da;
+            border-radius: 4px;
+            background-color: #fff;
+            font-size: 16px;
+        }
+        
+        .feature-input-container {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .feature-input-container input {
+            flex: 1;
+        }
+        
+        .feature-input-container button {
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        
+        /* Navigation section */
+        .navigation {
+            display: flex;
+            justify-content: space-between;
+            padding: 15px 20px;
+            background-color: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .button {
+            padding: 8px 16px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+        
+        .button:hover {
+            background-color: #0069d9;
+        }
+        
+        .button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        
+        /* Multi-panel layout */
+        .upper-panels-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        
+        .panel-cell {
+            width: 50%;
+            padding: 0 10px;
+            vertical-align: top;
+        }
+        
+        .panel {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            height: 100%;
+        }
+        
+        .panel-header {
+            background-color: #f1f1f1;
+            padding: 10px;
+            font-weight: bold;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .panel-content {
+            padding: 15px;
+            overflow: auto;
+            min-height: 225px; /* Adjusted min-height */
+        }
+        
+        /* Content section for token activations */
+        .token-activations-container {
+            background-color: black;
+            color: white;
+            min-height: 300px; /* Adjusted min-height */
+            padding: 20px;
+            overflow: auto;
+            margin: 0 20px 20px 20px;
+            border-radius: 4px;
+        }
+        
+        /* Connections section */
+        .connections-section {
+            margin: 0 20px 20px 20px;
+        }
+        
+        /* Loading indicator */
+        .loading {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 150px; /* Adjusted height */
+            font-size: 18px;
+            color: #6c757d;
+        }
+        
+        /* Footer section */
+        .footer {
+            background-color: #f8f9fa;
+            text-align: center;
+            padding: 15px;
+            color: #6c757d;
+            border-top: 1px solid #e9ecef;
+        }
+        
+        /* Content styles for token activations */
+        .content {
+            font-family: monospace;
+            line-height: 1.4;
+            white-space: pre-wrap; /* Changed from pre to pre-wrap */
+        }
+
+        /* Error panel */
+        .error-panel {
+            background-color: #ffe6e6;
+            border: 1px solid #ffcccc;
+            color: #990000;
+            padding: 15px;
+            border-radius: 4px;
+            text-align: center;
+        }
+        
+        /* Show/hide elements */
+        .hidden {
+            display: none !important;
+        }
+        
+        /* Token table (for logit lens) */
+        .token-table {
+            font-family: Arial, sans-serif;
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 10px;
+        }
+        
+        .token-table td {
+            padding: 8px;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .title { /* Shared by logit lens and potentially others */
+            font-size: 18px; /* Adjusted size */
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        
+        /* Fix for histogram images */
+        .histogram-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            width: 100%; /* Ensure it takes full cell width */
+            height: 100%; /* Ensure it takes full cell height if panel-content has fixed height */
+        }
+        
+        .histogram-container img {
+            max-width: 100%;
+            max-height: 280px; /* Max height for histogram image */
+            width: auto;
+            height: auto;
+            object-fit: contain;
+        }
+        
+        /* Connections styles */
+        .connections-container {
+            margin-top: 15px; /* Adjusted margin */
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            border: 1px solid #e9ecef;
+        }
+        
+        .connections-container h3 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            font-size: 16px; /* Adjusted size */
+            color: #495057;
+        }
+        
+        .connections-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-family: Arial, sans-serif;
+        }
+        
+        .connections-table th {
+            background-color: #e9ecef;
+            padding: 8px;
+            text-align: left;
+            border-bottom: 2px solid #dee2e6;
+        }
+        
+        .connections-table td {
+            padding: 8px;
+            border-bottom: 1px solid #dee2e6;
+        }
+        
+        .feature-link {
+            color: #007bff;
+            text-decoration: none;
+        }
+        
+        .feature-link:hover {
+            text-decoration: underline;
+        }
+        
+        .positive-connection {
+            color: #28a745;
+            font-weight: bold;
+        }
+        
+        .negative-connection {
+            color: #dc3545;
+            font-weight: bold;
+        }
+        
+        .no-connections {
+            font-style: italic;
+            color: #6c757d;
+            padding: 10px;
+            text-align: center;
+        }
+    </style>
+    <script src="manifest.js"></script>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>SCAE Feature Viewer</h1> <!-- Title updated -->
+        </div>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label for="keySelect">Select Module:</label> <!-- Label updated -->
+                <select id="keySelect">
+                    <option value="" disabled selected>Choose a module</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label for="featureInput">Go to Feature # (in selected module):</label> <!-- Label updated -->
+                <div class="feature-input-container">
+                    <input type="number" id="featureInput" min="0" placeholder="Enter feature number">
+                    <button id="goToFeature" class="button">Go</button>
+                </div>
+            </div>
+        </div>
+        
+        <div class="navigation">
+            <button id="prevFeature" class="button" disabled>Previous Feature</button>
+            <div>
+                <span id="featureInfo">No feature selected</span>
+            </div>
+            <button id="nextFeature" class="button" disabled>Next Feature</button>
+        </div>
+        
+        <table class="upper-panels-table">
+            <tr>
+                <td class="panel-cell">
+                    <div class="panel">
+                        <div class="panel-header">Logit Lens</div>
+                        <div id="logitLensPanel" class="panel-content">
+                            <div class="loading">Select a feature to view logit lens</div>
+                        </div>
+                    </div>
+                </td>
+                <td class="panel-cell">
+                    <div class="panel">
+                        <div class="panel-header">Activation Histogram</div>
+                        <div id="histogramPanel" class="panel-content histogram-container"> <!-- Added histogram-container class -->
+                            <div class="loading">Select a feature to view histogram</div>
+                        </div>
+                    </div>
+                </td>
+            </tr>
+        </table>
+        
+        <div class="token-activations-container">
+            <div id="loadingIndicator" class="loading">
+                <p>Select a module and feature to view token activations</p>
+            </div>
+            <div id="contentDisplay" class="content hidden"></div>
+        </div>
+        
+        <div class="connections-section">
+            <div id="connectionsPanel"> <!-- Content will be filled here -->
+                 <div class="loading">Select a feature to view connections</div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>SCAE Feature Viewer | Features Explorer</p>
+        </div>
+    </div>
+    
+    <script>
+        const keySelect = document.getElementById('keySelect');
+        const featureInput = document.getElementById('featureInput');
+        const goToFeatureBtn = document.getElementById('goToFeature');
+        const prevFeatureBtn = document.getElementById('prevFeature');
+        const nextFeatureBtn = document.getElementById('nextFeature');
+        const featureInfo = document.getElementById('featureInfo');
+        const loadingIndicator = document.getElementById('loadingIndicator');
+        const contentDisplay = document.getElementById('contentDisplay');
+        const logitLensPanel = document.getElementById('logitLensPanel');
+        const histogramPanel = document.getElementById('histogramPanel');
+        const connectionsPanel = document.getElementById('connectionsPanel');
+     
+        let currentFeatureData = null;
+        let currentSelectedKey = null;
+        let currentSelectedFeature = null;
+        
+        function getUrlParams() {
+            const params = {};
+            const searchParams = new URLSearchParams(window.location.search);
+            for (const [key, value] of searchParams) params[key] = value;
+            return params;
+        }
+        
+        function getChunkIndex(feature) {
+            return Math.floor(parseInt(feature) / CHUNK_SIZE);
+        }
+        
+        function loadFeatureData(key, feature) {
+            return new Promise((resolve, reject) => {
+                const timeout = setTimeout(() => reject(new Error('Timeout loading feature data')), 10000);
+                const chunkIndex = getChunkIndex(feature);
+                const existingScript = document.getElementById('featureChunkScript');
+                if (existingScript) document.head.removeChild(existingScript);
+                window.featureChunk = null;
+                const script = document.createElement('script');
+                script.id = 'featureChunkScript';
+                script.src = `data/${key}/chunk_${chunkIndex}.js`;
+                script.onload = () => {
+                    clearTimeout(timeout);
+                    if (window.featureChunk && window.featureChunk[feature]) {
+                        resolve(window.featureChunk[feature]);
+                    } else {
+                        reject(new Error(`Feature ${feature} not found in chunk ${chunkIndex} for module ${key}. Chunk content: ${JSON.stringify(window.featureChunk)}`));
+                    }
+                };
+                script.onerror = () => {
+                    clearTimeout(timeout);
+                    reject(new Error(`Failed to load chunk ${chunkIndex} for ${key}`));
+                };
+                document.head.appendChild(script);
+            });
+        }
+        
+        function initViewer() {
+            if (!window.manifestData || !manifestData.keys || !manifestData.features) {
+                showError('Failed to load manifest data. Check manifest.js and ensure it is correctly formatted and loaded.');
+                return;
+            }
+            
+            manifestData.keys.forEach(key => {
+                const option = document.createElement('option');
+                option.value = key; option.textContent = key;
+                keySelect.appendChild(option);
+            });
+            
+            keySelect.addEventListener('change', handleKeyChange);
+            goToFeatureBtn.addEventListener('click', handleGoToFeature);
+            featureInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') handleGoToFeature(); });
+            prevFeatureBtn.addEventListener('click', showPreviousFeature);
+            nextFeatureBtn.addEventListener('click', showNextFeature);
+            
+            const params = getUrlParams();
+            if (params.key && params.feature && manifestData.keys.includes(params.key)) {
+                keySelect.value = params.key;
+                // Delay handleKeyChange slightly to ensure event listeners are ready and manifest fully parsed
+                setTimeout(() => {
+                     handleKeyChange(false); // Pass false to not load first feature by default yet
+                     loadFeature(params.key, params.feature);
+                }, 50);
+            } else if (manifestData.keys.length > 0) {
+                keySelect.value = manifestData.keys[0];
+                setTimeout(() => handleKeyChange(true), 50); // Load first feature of first key
+            }
+        }
+        
+        function showError(message, panelId = null) {
+            const errorHtml = `<div class="error-panel">${message}</div>`;
+            if (panelId) {
+                const panel = document.getElementById(panelId);
+                if (panel) panel.innerHTML = errorHtml;
+            } else { // Global error for token activations section or if panelId is null
+                 loadingIndicator.classList.remove('hidden');
+                 loadingIndicator.innerHTML = errorHtml;
+                 contentDisplay.classList.add('hidden');
+            }
+            // Clear other panels to avoid confusion
+            if (panelId !== 'logitLensPanel') logitLensPanel.innerHTML = '<div class="loading">Error loading data.</div>';
+            if (panelId !== 'histogramPanel') histogramPanel.innerHTML = '<div class="loading">Error loading data.</div>';
+            if (panelId !== 'connectionsPanel') connectionsPanel.innerHTML = '<div class="loading">Error loading data.</div>';
+            if (panelId !== 'loadingIndicator') contentDisplay.classList.add('hidden');
+        }
+        
+        function handleKeyChange(loadFirstFeature = true) {
+            currentSelectedKey = keySelect.value;
+            featureInput.value = ''; // Clear feature input
+            resetDisplaysToLoading();
+
+            if (currentSelectedKey && loadFirstFeature) {
+                const featuresForThisKey = manifestData.features[currentSelectedKey];
+                if (featuresForThisKey && featuresForThisKey.length > 0) {
+                    const firstFeature = featuresForThisKey[0];
+                    loadFeature(currentSelectedKey, firstFeature);
+                } else {
+                    featureInfo.textContent = `${currentSelectedKey} - No features available`;
+                    showError(`No features available or defined for module ${currentSelectedKey}. Check features_to_save_scae.`, 'loadingIndicator');
+                }
+            } else if (currentSelectedKey) {
+                 featureInfo.textContent = `${currentSelectedKey} - Select a feature`;
+                 loadingIndicator.innerHTML = '<p>Please enter a feature number to view</p>';
+            } else {
+                featureInfo.textContent = 'No module selected';
+            }
+            updateNavigationButtons(null, null); // Reset nav buttons
+        }
+
+        function resetDisplaysToLoading(){
+            featureInfo.textContent = 'No feature selected';
+            contentDisplay.classList.add('hidden');
+            loadingIndicator.classList.remove('hidden');
+            loadingIndicator.innerHTML = '<p>Select a module and feature.</p>';
+            logitLensPanel.innerHTML = '<div class="loading">Select a feature.</div>';
+            histogramPanel.innerHTML = '<div class="loading">Select a feature.</div>';
+            connectionsPanel.innerHTML = '<div class="loading">Select a feature.</div>';
+            prevFeatureBtn.disabled = true;
+            nextFeatureBtn.disabled = true;
+            currentFeatureData = null;
+        }
+        
+        function handleGoToFeature() {
+            const featureNumStr = featureInput.value.trim();
+            if (!currentSelectedKey) {
+                alert('Please select a module first.'); return;
+            }
+            if (!featureNumStr) {
+                alert('Please enter a feature number.'); return;
+            }
+            const featureNum = parseInt(featureNumStr);
+            const featuresForThisKey = manifestData.features[currentSelectedKey].map(f => parseInt(f));            
+            if (!featuresForThisKey.includes(featureNum)){
+                 alert(`Feature ${featureNum} is not in the list of available features for module ${currentSelectedKey}. Available: ${featuresForThisKey.join(', ')}`)
+                 return;
+            }
+            loadFeature(currentSelectedKey, featureNumStr);
+        }
+        
+        async function loadFeature(key, feature) {
+            currentSelectedKey = key;
+            currentSelectedFeature = feature;
+            featureInfo.textContent = `${key} - Feature ${feature}`;
+            featureInput.value = feature;
+            
+            loadingIndicator.classList.remove('hidden');
+            loadingIndicator.innerHTML = '<p>Loading content...</p>';
+            contentDisplay.classList.add('hidden');
+            logitLensPanel.innerHTML = '<div class="loading">Loading logit lens...</div>';
+            histogramPanel.innerHTML = '<div class="loading">Loading histogram...</div>';
+            connectionsPanel.innerHTML = '<div class="loading">Loading connections...</div>';
+            
+            const newUrl = new URL(window.location.href);
+            newUrl.searchParams.set('key', key);
+            newUrl.searchParams.set('feature', feature);
+            window.history.pushState({ key, feature }, '', newUrl.href);
+            
+            try {
+                currentFeatureData = await loadFeatureData(key, feature);
+                displayFeatureData();
+                updateNavigationButtons(key, feature);
+            } catch (error) {
+                console.error('Error loading feature data:', error);
+                showError(`Failed to load data for ${key} - Feature ${feature}. Error: ${error.message}`, 'loadingIndicator');
+            }
+        }
+        
+        function displayFeatureData() {
+            if (!currentFeatureData) return;
+            contentDisplay.innerHTML = currentFeatureData.tokenActivations || '<div class="error-panel">Token activation data missing.</div>';
+            contentDisplay.classList.remove('hidden');
+            loadingIndicator.classList.add('hidden');
+            logitLensPanel.innerHTML = currentFeatureData.logitLens || '<div class="error-panel">Logit lens data missing.</div>';
+            histogramPanel.innerHTML = currentFeatureData.histogram || '<div class="error-panel">Histogram data missing.</div>';
+            connectionsPanel.innerHTML = currentFeatureData.connections || '<div class="error-panel">Connections data missing.</div>';
+        }
+        
+        function showPreviousFeature() {
+            if (!currentSelectedKey || currentSelectedFeature === null) return;
+            const featuresForThisKey = manifestData.features[currentSelectedKey].map(f => parseInt(f));
+            const currentIdx = featuresForThisKey.indexOf(parseInt(currentSelectedFeature));
+            if (currentIdx > 0) {
+                loadFeature(currentSelectedKey, featuresForThisKey[currentIdx - 1].toString());
+            }
+        }
+        
+        function showNextFeature() {
+            if (!currentSelectedKey || currentSelectedFeature === null) return;
+            const featuresForThisKey = manifestData.features[currentSelectedKey].map(f => parseInt(f));
+            const currentIdx = featuresForThisKey.indexOf(parseInt(currentSelectedFeature));
+            if (currentIdx < featuresForThisKey.length - 1) {
+                loadFeature(currentSelectedKey, featuresForThisKey[currentIdx + 1].toString());
+            }
+        }
+        
+        function updateNavigationButtons(key, feature) {
+            if (!key || feature === null || !manifestData.features[key]) {
+                prevFeatureBtn.disabled = true;
+                nextFeatureBtn.disabled = true;
+                return;
+            }
+            const featuresForThisKey = manifestData.features[key].map(f => parseInt(f));
+            const featureNum = parseInt(feature);
+            const currentIdx = featuresForThisKey.indexOf(featureNum);
+            prevFeatureBtn.disabled = currentIdx <= 0;
+            nextFeatureBtn.disabled = currentIdx >= featuresForThisKey.length - 1;
+        }
+        
+        window.addEventListener('popstate', function(event) {
+            const params = getUrlParams();
+            if (params.key && params.feature) {
+                if (keySelect.value !== params.key || currentSelectedFeature !== params.feature) {
+                    keySelect.value = params.key;
+                    // handleKeyChange will be implicitly called by changing keySelect.value if there's a listener,
+                    // but we need to ensure it doesn't auto-load the first feature if we have a specific one from URL.
+                    handleKeyChange(false); // Don't auto-load first feature of this new key
+                    loadFeature(params.key, params.feature);
+                }
+            } else {
+                 resetDisplaysToLoading(); // Or load default if no params
+                 if (manifestData.keys.length > 0) {
+                    keySelect.value = manifestData.keys[0];
+                    handleKeyChange(true); 
+                 }
+            }
+        });
+        
+        window.addEventListener('DOMContentLoaded', initViewer);
+    </script>
+</body>
+</html>
