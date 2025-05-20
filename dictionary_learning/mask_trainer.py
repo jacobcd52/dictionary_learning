@@ -60,8 +60,13 @@ class SCAEConfig:
     hf_username: str = None
 
     track_dead_features: bool = False
-    fvu_loss_coeff: float = 0.0
-    auxk_alpha: float = 0.0
+    fvu_loss_coeff: float = 1.0
+    ce_loss_coeff: float = 1.0
+
+    # New loss coefficients
+    ce_loss_sparse_coeff: float = 0.0
+    fvu_loss_sparse_coeff: float = 1.0
+    feature_act_fvu_coeff: float = 0.0
     mask_loss_coeff: float = 1e-5
 
     warmup_ratio: float = 0.05
@@ -70,6 +75,7 @@ class SCAEConfig:
     batch_size: int = 16
     quantize_optimizer: bool = False
     sample_length: int = 512
+    use_sparse_connections: bool = True
 
     @property
     def wb_cfg(self):
@@ -83,10 +89,14 @@ class SCAEConfig:
             "batch_size": self.batch_size,
             "quantize_optimizer": self.quantize_optimizer,
             "sample_length": self.sample_length,
-            "auxk_alpha": self.auxk_alpha,
             "target_C": self.target_C,
-            "mask_loss_coeff": self.mask_loss_coeff,
             "mask_type": self.mask_type,
+            "ce_loss_coeff": self.ce_loss_coeff,
+            "fvu_loss_coeff": self.fvu_loss_coeff,
+            "ce_loss_sparse_coeff": self.ce_loss_sparse_coeff,
+            "fvu_loss_sparse_coeff": self.fvu_loss_sparse_coeff,
+            "feature_act_fvu_coeff": self.feature_act_fvu_coeff,
+            "mask_loss_coeff": self.mask_loss_coeff,
         }
 
 
@@ -264,6 +274,7 @@ class SCAETrainer:
             cfg.target_C,
             n_features,
             mask_type=cfg.mask_type,
+            use_sparse_connections=True,
             device=device,
             dtype=dtype,
         )
@@ -405,9 +416,25 @@ class SCAETrainer:
         self,
         reconstructions: Dict[str, t.Tensor],
         cache: Dict[str, t.Tensor],
+        log_prefix: str,
     ) -> t.Tensor:
-        total_fvu_l2_loss = 0.0
-        total_fvu_variance = 0.0
+        # Initialize sum_of_individual_fvus on the correct device and dtype
+        # Try to get a template tensor from reconstructions or cache, otherwise fallback.
+        example_tensor = None
+        if reconstructions:
+            example_tensor = next(iter(reconstructions.values()), None)
+        
+        if example_tensor is None and cache:
+             # Fallback to cache if reconstructions is empty
+            example_tensor = next(iter(cache.values()), None)
+
+        if example_tensor is not None:
+            sum_of_individual_fvus = example_tensor.new_tensor(0.0)
+        else:
+            # Fallback if both are empty: use model's dtype and trainer's device
+            # This case should ideally not happen if FVU loss is being meaningfully computed.
+            sum_of_individual_fvus = t.tensor(0.0, device=self.device, dtype=self.model.module.transformer.dtype) # Assumes transformer.dtype is accessible
+
         n_layers = self.model.module.transformer.cfg.n_layers
 
         # ATTN FVU
@@ -424,12 +451,13 @@ class SCAETrainer:
                 l2_loss_attn = (y_attn - recon_attn).pow(2).sum()
                 variance_attn = (y_attn - y_attn.mean(dim=(0,1), keepdim=True)).pow(2).sum() + 1e-8
                 
-                total_fvu_l2_loss += l2_loss_attn
-                total_fvu_variance += variance_attn
+                current_fvu_attn = l2_loss_attn / variance_attn
+                sum_of_individual_fvus += current_fvu_attn
+                
                 if self.rank == 0:
-                    wb.log({f"fvu_l2_loss/attn_{l}": l2_loss_attn.item()}, step=self.global_step)
-                    wb.log({f"fvu_variance/attn_{l}": variance_attn.item()}, step=self.global_step)
-                    wb.log({f"fvu_contrib/{attn_module_name}": (l2_loss_attn / variance_attn).item()}, step=self.global_step)
+                    # wb.log({f"fvu_l2_loss/attn_{l}": l2_loss_attn.item()}, step=self.global_step) # Already removed by user
+                    wb.log({f"{log_prefix}fvu_variance/attn_{l}": variance_attn.item()}, step=self.global_step)
+                    wb.log({f"{log_prefix}fvu_contrib/attn_{attn_module_name}": current_fvu_attn.item()}, step=self.global_step)
 
 
         # MLP FVU (from CCs)
@@ -456,88 +484,100 @@ class SCAETrainer:
                     if 0 <= output_head_idx < cc_i_all_outputs.shape[2]:
                         contrib_from_cc_i = cc_i_all_outputs[:, :, output_head_idx, :]
                         accumulated_recon_for_mlp_j += contrib_from_cc_i
-                    # else: # This cc_i does not have an output head for mlp_j (e.g. j < i, or j is too far for cc_i's n_outputs)
-                        # This case is naturally handled by loop range and check
-                        # if self.rank == 0: print(f"Debug: CC_{i} output head {output_head_idx} for MLP_{j} is out of bounds ({cc_i_all_outputs.shape[2]} heads)")
 
 
             l2_loss_mlp_j = (y_mlp_j - accumulated_recon_for_mlp_j).pow(2).sum()
             variance_mlp_j = (y_mlp_j - y_mlp_j.mean(dim=(0,1), keepdim=True)).pow(2).sum() + 1e-8
+            
+            current_fvu_mlp = l2_loss_mlp_j / variance_mlp_j
+            sum_of_individual_fvus += current_fvu_mlp
 
-            total_fvu_l2_loss += l2_loss_mlp_j
-            total_fvu_variance += variance_mlp_j
             if self.rank == 0:
-                wb.log({f"fvu_l2_loss/mlp_{j}": l2_loss_mlp_j.item()}, step=self.global_step)
-                wb.log({f"fvu_variance/mlp_{j}": variance_mlp_j.item()}, step=self.global_step)
-                wb.log({f"fvu_contrib/mlp_{j}": (l2_loss_mlp_j / variance_mlp_j).item()}, step=self.global_step)
+                # wb.log({f"fvu_l2_loss/mlp_{j}": l2_loss_mlp_j.item()}, step=self.global_step) # Already removed by user
+                wb.log({f"{log_prefix}fvu_variance/mlp_{j}": variance_mlp_j.item()}, step=self.global_step)
+                wb.log({f"{log_prefix}fvu_contrib/mlp_{j}": current_fvu_mlp.item()}, step=self.global_step)
 
-        if total_fvu_variance == 0: return total_fvu_l2_loss.new_tensor(0.0) # Avoid division by zero if all variances are zero
+        final_fvu = sum_of_individual_fvus
         
-        final_fvu = total_fvu_l2_loss / total_fvu_variance
         if self.rank == 0:
-            wb.log({f"fvu/total_fvu": final_fvu.item()}, step=self.global_step)
+            wb.log({f"{log_prefix}fvu/total_fvu": final_fvu.item()}, step=self.global_step)
             
         return final_fvu
 
-
-    def get_losses(
+    def get_feature_act_fvu_loss(
         self,
-        temperature: float,
-        pruned_features: Dict[str, t.Tensor],
-        reconstructions: Dict[str, t.Tensor],
-        cache: Dict[str, t.Tensor],
-    ):
-        # Initialize total_loss, which will be the sum of auxk, fvu, and mask losses
-        # CE loss is handled separately and added first in train_step.
-        combined_loss = 0.0
+        features_sparse_dict: Dict[str, t.Tensor],
+        features_non_sparse_dict: Dict[str, t.Tensor],
+    ) -> t.Tensor:
+        total_feature_fvu = features_sparse_dict.get(next(iter(features_sparse_dict.keys()))).new_tensor(0.0) if features_sparse_dict else t.tensor(0.0)
 
-        # 1. AuxK Loss
-        if self.cfg.auxk_alpha > 0:
-            auxk_loss_val = self.get_auxk_loss(pruned_features, reconstructions, cache)
-            combined_loss += self.cfg.auxk_alpha * auxk_loss_val
-            if self.rank == 0:
-                wb.log({"train/total_auxk_loss_scaled": (self.cfg.auxk_alpha * auxk_loss_val).item()}, step=self.global_step)
+        for name, features_sparse in features_sparse_dict.items():
+            if name not in features_non_sparse_dict:
+                if self.rank == 0: print(f"Warning: Module {name} features missing in non-sparse dict for feature FVU.")
+                continue
+            
+            features_non_sparse = features_non_sparse_dict[name]
 
-        # 2. FVU Loss
-        if self.cfg.fvu_loss_coeff > 0:
-            fvu_loss_val = self.get_fvu_loss(reconstructions, cache)
-            combined_loss += self.cfg.fvu_loss_coeff * fvu_loss_val
+            # Ensure shapes match
+            if features_sparse.shape != features_non_sparse.shape:
+                if self.rank == 0: print(f"Warning: Shape mismatch for module {name} features for feature FVU. Sparse: {features_sparse.shape}, Non-sparse: {features_non_sparse.shape}")
+                continue
+
+            l2_loss = (features_non_sparse - features_sparse).pow(2).sum()
+            variance = (features_non_sparse - features_non_sparse.mean(dim=(0, 1), keepdim=True)).pow(2).sum() + 1e-8
+            
+            current_fvu = l2_loss / variance
+            total_feature_fvu += current_fvu
+            
             if self.rank == 0:
-                 wb.log({"train/total_fvu_loss_scaled": (self.cfg.fvu_loss_coeff * fvu_loss_val).item()}, step=self.global_step)
+                # wb.log({f"feature_act_fvu_l2_loss/{name}": l2_loss.item()}, step=self.global_step) # Optional: log L2
+                # wb.log({f"feature_act_fvu_variance/{name}": variance.item()}, step=self.global_step) # Optional: log variance
+                wb.log({f"feature_act_fvu_contrib/{name}": current_fvu.item()}, step=self.global_step)
         
-        # 3. Mask Loss and C-Metric (Sparsity of connections)
-        total_mask_loss = 0.0
-        # Iterate over modules to get their mask losses and C metrics
+        if self.rank == 0:
+            wb.log({f"feature_act_fvu/total": total_feature_fvu.item()}, step=self.global_step)
+            
+        return total_feature_fvu
+
+    def get_mask_loss_and_log_c_metric(self, temperature: float) -> t.Tensor:
+        total_mask_loss = t.tensor(0.0, device=self.device) # Ensure tensor is on correct device
         module_names_ordered = list(self.model.module.scae_suite.module_dict.keys())
+
         for name in module_names_ordered:
             module_meta = self._get_module(name) # SCAEModule instance
             
             # Mask Loss
-            if module_meta.connection_masks: # Check if connection_masks exist
+            if hasattr(module_meta, 'connection_masks') and module_meta.connection_masks: # Check if connection_masks exist and populated
                 current_mask_loss = module_meta.get_mask_loss(temperature)
-                total_mask_loss += current_mask_loss
+                if isinstance(current_mask_loss, t.Tensor):
+                    total_mask_loss += current_mask_loss.to(self.device)
+                else: # if it's a float from get_mask_loss returning 0.
+                    total_mask_loss += t.tensor(current_mask_loss, device=self.device)
+                
                 if self.rank == 0:
-                    wb.log({f"mask_loss_module/{name}": current_mask_loss}, step=self.global_step) # current_mask_loss is scalar tensor or float
+                    log_value = current_mask_loss.item() if isinstance(current_mask_loss, t.Tensor) else current_mask_loss
+                    wb.log({f"mask_loss_module/{name}": log_value}, step=self.global_step)
 
             # C-Metric
-            if module_meta.connection_masks and self.rank == 0 : # Only log C for rank 0
-                C_total_for_module = 0
+            if hasattr(module_meta, 'connection_masks') and module_meta.connection_masks and self.rank == 0:
+                C_total_for_module = 0.0
                 num_mask_components = 0
-                for up_mask_name, learnable_mask_instance in module_meta.connection_masks.items():
+                for _up_mask_name, learnable_mask_instance in module_meta.connection_masks.items():
+                    # Ensure learnable_mask_instance is on the correct device before calling it
+                    # This might not be necessary if they are already correctly moved during model setup.
+                    # learnable_mask_instance = learnable_mask_instance.to(self.device) 
                     mask = learnable_mask_instance(temperature, hard=True) # Get hard mask for C metric
-                    if mask.shape[0] > 0 : # n_features_down > 0
+                    if mask.numel() > 0 and mask.shape[0] > 0 : # n_features_down > 0 and mask is not empty
                          c_contribution = mask.sum().item() / mask.shape[0]
                          C_total_for_module += c_contribution
-                         num_mask_components+=1
-                avg_C_for_module = C_total_for_module / num_mask_components if num_mask_components > 0 else 0
+                         num_mask_components += 1
+                avg_C_for_module = C_total_for_module / num_mask_components if num_mask_components > 0 else 0.0
                 wb.log({f"C_metric/{name}": avg_C_for_module}, step=self.global_step)
-
-        if self.cfg.mask_loss_coeff > 0:
-            combined_loss += self.cfg.mask_loss_coeff * total_mask_loss
-            if self.rank == 0:
-                 wb.log({"train/total_mask_loss_scaled": (self.cfg.mask_loss_coeff * total_mask_loss).item()}, step=self.global_step)
         
-        return combined_loss
+        if self.rank == 0:
+            wb.log({"train/total_mask_loss_unscaled": total_mask_loss.item()}, step=self.global_step)
+            
+        return total_mask_loss
 
     def update_dead_features(
         self, pruned_features: Dict[str, t.Tensor], num_tokens: int
@@ -572,30 +612,81 @@ class SCAETrainer:
 
     def train_step(self, model: MergedSCAESuite, input_ids: t.Tensor):
         temperature = self._get_temperature()
-        reconstructions, pruned_features, cache = model(
-            input_ids, temperature
+        
+        # First Pass: sparse_connections = False
+        reconstructions_non_sparse, pruned_features_non_sparse, cache_non_sparse = model(
+            input_ids, temperature, runtime_use_sparse_connections_override=False
         )
 
-        # Update dead feature tracker
-        if self.cfg.track_dead_features:
-            # Pass num_tokens based on input_ids for the current batch on this rank
-            # DDP handles gradient accumulation; feature firing should be per batch on each GPU then reduced.
-            # The current update_dead_features has dist.all_reduce.
-            self.update_dead_features(pruned_features, input_ids.numel())
+        # Calculate losses for non-sparse pass
+        ce_loss_non_sparse_val = self.get_ce_loss(model, cache_non_sparse, input_ids, reconstructions_non_sparse)
+        fvu_loss_non_sparse_val = self.get_fvu_loss(reconstructions_non_sparse, cache_non_sparse, log_prefix="non_sparse_")
 
-        # 1. Cross-Entropy Loss
-        total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
         if self.rank == 0:
-            wb.log({"train/ce_loss_unscaled": total_loss.item()}, step=self.global_step)
+            wb.log({"train/ce_loss_non_sparse_unscaled": ce_loss_non_sparse_val.item()}, step=self.global_step)
+            wb.log({"train/fvu_loss_non_sparse_unscaled": fvu_loss_non_sparse_val.item()}, step=self.global_step)
 
+        # Second Pass: sparse_connections = True
+        # Note: This reuses the input_ids and temperature. If the model or cache needs to be reset or handled differently,
+        # adjustments would be needed. The current MergedSCAESuite.forward re-calculates cache.
+        reconstructions_sparse, pruned_features_sparse, cache_sparse = model(
+            input_ids, temperature, runtime_use_sparse_connections_override=True
+        )
 
-        # 2. Other losses (FVU, AuxK, Mask)
-        # These coefficients are cfg.fvu_loss_coeff, cfg.auxk_alpha, cfg.mask_loss_coeff
-        if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0 or self.cfg.mask_loss_coeff > 0:
-            other_losses = self.get_losses(
-                temperature, pruned_features, reconstructions, cache
-            )
-            total_loss += other_losses # other_losses is already scaled by coefficients
+        # Calculate losses for sparse pass
+        ce_loss_sparse_val = self.get_ce_loss(model, cache_sparse, input_ids, reconstructions_sparse)
+        fvu_loss_sparse_val = self.get_fvu_loss(reconstructions_sparse, cache_sparse, log_prefix="sparse_")
+        
+        if self.rank == 0:
+            wb.log({"train/ce_loss_sparse_unscaled": ce_loss_sparse_val.item()}, step=self.global_step)
+            wb.log({"train/fvu_loss_sparse_unscaled": fvu_loss_sparse_val.item()}, step=self.global_step)
+
+        # Calculate Feature Activation FVU Loss
+        feature_act_fvu_val = self.get_feature_act_fvu_loss(pruned_features_sparse, pruned_features_non_sparse)
+        if self.rank == 0:
+             wb.log({"train/feature_act_fvu_unscaled": feature_act_fvu_val.item()}, step=self.global_step)
+
+        # Mask Loss (calculated once per step, relevant to sparse structure)
+        mask_loss_val = self.get_mask_loss_and_log_c_metric(temperature)
+
+        # Update dead feature tracker (using sparse features as decided)
+        if self.cfg.track_dead_features: # AuxK is ignored, but dead feature tracking might still be useful for observation
+            self.update_dead_features(pruned_features_sparse, input_ids.numel())
+
+        # Combine losses with coefficients
+        total_loss = 0.0
+        
+        # Non-sparse losses
+        scaled_ce_loss_non_sparse = self.cfg.ce_loss_coeff * ce_loss_non_sparse_val
+        total_loss += scaled_ce_loss_non_sparse
+        if self.rank == 0: wb.log({"train/ce_loss_non_sparse_scaled": scaled_ce_loss_non_sparse.item()}, step=self.global_step)
+
+        scaled_fvu_loss_non_sparse = self.cfg.fvu_loss_coeff * fvu_loss_non_sparse_val
+        total_loss += scaled_fvu_loss_non_sparse
+        if self.rank == 0: wb.log({"train/fvu_loss_non_sparse_scaled": scaled_fvu_loss_non_sparse.item()}, step=self.global_step)
+
+        # Sparse losses
+        scaled_ce_loss_sparse = self.cfg.ce_loss_sparse_coeff * ce_loss_sparse_val
+        total_loss += scaled_ce_loss_sparse
+        if self.rank == 0: wb.log({"train/ce_loss_sparse_scaled": scaled_ce_loss_sparse.item()}, step=self.global_step)
+        
+        scaled_fvu_loss_sparse = self.cfg.fvu_loss_sparse_coeff * fvu_loss_sparse_val
+        total_loss += scaled_fvu_loss_sparse
+        if self.rank == 0: wb.log({"train/fvu_loss_sparse_scaled": scaled_fvu_loss_sparse.item()}, step=self.global_step)
+
+        # Feature Activation FVU loss
+        scaled_feature_act_fvu = self.cfg.feature_act_fvu_coeff * feature_act_fvu_val
+        total_loss += scaled_feature_act_fvu
+        if self.rank == 0: wb.log({"train/feature_act_fvu_scaled": scaled_feature_act_fvu.item()}, step=self.global_step)
+        
+        # Mask Loss
+        scaled_mask_loss = self.cfg.mask_loss_coeff * mask_loss_val
+        total_loss += scaled_mask_loss
+        if self.rank == 0: wb.log({"train/total_mask_loss_scaled": scaled_mask_loss.item()}, step=self.global_step)
+
+        # AuxK and Mask losses are currently ignored as per instruction.
+        # If they were to be added, their calculation would need to consider which pass (sparse/non-sparse)
+        # they apply to, or if they apply to both, and have their own coefficients.
 
         return total_loss
 

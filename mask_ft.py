@@ -1,3 +1,5 @@
+import sys
+print(sys.executable)
 from datasets import load_dataset
 import torch as t
 import torch.multiprocessing as mp
@@ -10,14 +12,14 @@ from utils import set_seed
 set_seed(42)
 
 
-N_CPUS = 19 //2
+N_CPUS = 19 // 2
 
 
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 10_000_000
+N_TOKENS = 50_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
-    wb_project="pythia_scae_simple_binary",
+    wb_project="pythia_scae_cc",
     save_to_hf=True,
     hf_username="jacobcd52",
     warmup_ratio=0.00,
@@ -30,10 +32,15 @@ CFG = SCAEConfig(
     track_dead_features=True,
     base_lr=1e-3,
     target_C=100,
-    fvu_loss_coeff=1.0,
-    mask_loss_coeff=1e-5,
-    auxk_alpha=0.0,
+    # auxk_alpha=0.0,
     mask_type="simple",
+    use_sparse_connections=False,
+    ce_loss_coeff=0.0,
+    fvu_loss_coeff=1.0,
+    ce_loss_sparse_coeff=0.0,
+    fvu_loss_sparse_coeff=1.0,
+    feature_act_fvu_coeff=0.0,
+    mask_loss_coeff=0.0,
 
 )
 
@@ -55,7 +62,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    CFG.wb_run_name = f"c{CFG.target_C}_lr{CFG.base_lr}_bs{CFG.batch_size}_auxk{CFG.auxk_alpha}"
+    CFG.wb_run_name = f"c{CFG.target_C}_lr{CFG.base_lr}_bs{CFG.batch_size}"
 
     mp.spawn(
         SCAETrainer,

@@ -52,15 +52,16 @@ class SCAEModule(nn.Module, ABC):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
+        use_sparse_connections: bool,
     ):
         super().__init__()
 
         self.model = model
         self.ae = ae
         self.upstream_aes = upstream_aes
-
         self.connection_masks = connection_masks
         self.name = name
+        self.use_sparse_connections = use_sparse_connections
 
     def forward(
         self,
@@ -68,44 +69,52 @@ class SCAEModule(nn.Module, ABC):
         pruned_features: Dict[str, t.Tensor],
         feature_buffer: t.Tensor,
         temperature: float,
+        runtime_use_sparse_connections_override: Optional[bool] = None,
     ) -> t.Tensor:
-        approx_acts = self.get_initial_contribs(cache)
+        actual_run_mode_is_sparse: bool
+        if runtime_use_sparse_connections_override is not None:
+            actual_run_mode_is_sparse = runtime_use_sparse_connections_override
+        else:
+            actual_run_mode_is_sparse = self.use_sparse_connections
+
+        approx_acts = self.get_initial_contribs(cache, actual_run_mode_is_sparse)
 
         upstream_bias_sum_for_current_module = None
 
-        for up_name, up_ae_instance in self.upstream_aes.items():
-            current_b_dec_contrib = None
-            if isinstance(up_ae_instance, AutoEncoderTopK):
-                current_b_dec_contrib = up_ae_instance.b_dec
-            elif isinstance(up_ae_instance, CrosscoderTopK):
-                up_sm_name = SubmoduleName.from_str(up_name)
+        if self.use_sparse_connections and actual_run_mode_is_sparse:
+            for up_name, up_ae_instance in self.upstream_aes.items():
+                current_b_dec_contrib = None
+                if isinstance(up_ae_instance, AutoEncoderTopK):
+                    current_b_dec_contrib = up_ae_instance.b_dec
+                elif isinstance(up_ae_instance, CrosscoderTopK):
+                    up_sm_name = SubmoduleName.from_str(up_name)
+                    
+                    target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae_instance.n_outputs))
+                    
+                    relevant_indices = [
+                        idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
+                        if target_layer < self.name.layer 
+                    ]
+                    
+                    if relevant_indices:
+                        current_b_dec_contrib = up_ae_instance.b_dec[relevant_indices, :].sum(dim=0)
                 
-                target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae_instance.n_outputs))
-                
-                relevant_indices = [
-                    idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
-                    if target_layer < self.name.layer 
-                ]
-                
-                if relevant_indices:
-                    current_b_dec_contrib = up_ae_instance.b_dec[relevant_indices, :].sum(dim=0)
-            
-            if current_b_dec_contrib is not None:
-                if upstream_bias_sum_for_current_module is None:
-                    upstream_bias_sum_for_current_module = current_b_dec_contrib.clone()
+                if current_b_dec_contrib is not None:
+                    if upstream_bias_sum_for_current_module is None:
+                        upstream_bias_sum_for_current_module = current_b_dec_contrib.clone()
+                    else:
+                        upstream_bias_sum_for_current_module = upstream_bias_sum_for_current_module + current_b_dec_contrib
+
+                if self.connection_masks is not None and up_name in self.connection_masks:
+                    connection_mask = self.connection_masks[up_name](temperature)
                 else:
-                    upstream_bias_sum_for_current_module = upstream_bias_sum_for_current_module + current_b_dec_contrib
+                    connection_mask = None
 
-            if self.connection_masks is not None and up_name in self.connection_masks:
-                connection_mask = self.connection_masks[up_name](temperature)
-            else:
-                connection_mask = None
-
-            up_pruned_features = pruned_features[up_name]
-            pruned_contribs = self.get_pruned_contribs(
-                cache, up_name, up_ae_instance, connection_mask, up_pruned_features
-            )
-            approx_acts = approx_acts + pruned_contribs
+                up_pruned_features = pruned_features[up_name]
+                pruned_contribs = self.get_pruned_contribs(
+                    cache, up_name, up_ae_instance, connection_mask, up_pruned_features
+                )
+                approx_acts = approx_acts + pruned_contribs
 
         approx_acts = self.compute_bias(approx_acts, upstream_bias_sum_for_current_module, cache)
 
@@ -134,7 +143,7 @@ class SCAEModule(nn.Module, ABC):
         return mask_loss
 
     @abstractmethod
-    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
+    def get_initial_contribs(self, cache: ActivationCache, actual_run_mode_is_sparse: bool) -> t.Tensor:
         pass
 
     @abstractmethod
@@ -166,8 +175,9 @@ class SCAEAttention(SCAEModule):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
+        use_sparse_connections: bool,
     ):
-        super().__init__(model, ae, upstream_aes, connection_masks, name)
+        super().__init__(model, ae, upstream_aes, connection_masks, name, use_sparse_connections)
 
         W_O = model.W_O[self.name.layer]
         W_V = model.W_V[self.name.layer]
@@ -178,9 +188,14 @@ class SCAEAttention(SCAEModule):
             "n_heads d_head d_out, n_heads d_model d_head -> n_heads d_model d_out",
         )
 
-    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
+    def get_initial_contribs(self, cache: ActivationCache, actual_run_mode_is_sparse: bool) -> t.Tensor:
+        if actual_run_mode_is_sparse:
+            initial_act_hook_name = "blocks.0.hook_resid_pre"
+        else:
+            initial_act_hook_name = f"blocks.{self.name.layer}.hook_resid_pre"
+        
         initial_act_post_ln = (
-            cache["blocks.0.hook_resid_pre"]
+            cache[initial_act_hook_name]
             / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
 
@@ -309,17 +324,23 @@ class SCAECrossCoder(SCAEModule):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
+        use_sparse_connections: bool,
     ):
-        super().__init__(model, ae, upstream_aes, connection_masks, name)
+        super().__init__(model, ae, upstream_aes, connection_masks, name, use_sparse_connections)
 
-    def get_initial_contribs(self, cache: ActivationCache) -> t.Tensor:
+    def get_initial_contribs(self, cache: ActivationCache, actual_run_mode_is_sparse: bool) -> t.Tensor:
         down_enc = self.ae.encoder.weight
 
-        initial_act_post_ln = (
-            cache["blocks.0.hook_resid_pre"]
+        if actual_run_mode_is_sparse:
+            initial_act_hook_name = "blocks.0.hook_resid_pre"
+        else:
+            initial_act_hook_name = f"blocks.{self.name.layer}.hook_resid_pre"
+
+        initial_act_input = (
+            cache[initial_act_hook_name]
         )
 
-        return initial_act_post_ln @ down_enc.T
+        return initial_act_input @ down_enc.T
 
     def get_pruned_contribs(
         self,
@@ -396,6 +417,7 @@ class SCAESuite(nn.Module):
         target_C: int,
         n_features: int,
         mask_type: str,
+        use_sparse_connections: bool,
         device: str,
         dtype: t.dtype,
     ):
@@ -416,6 +438,7 @@ class SCAESuite(nn.Module):
         self.n_features = n_features
         self.target_C = target_C
         self.mask_type = mask_type
+        self.use_sparse_connections = use_sparse_connections
         self.device = device
 
         submodule_names = [
@@ -454,24 +477,24 @@ class SCAESuite(nn.Module):
 
         module_dict = {}
         for down in submodule_names:
-            upstream_aes = {}
-
-            for up in submodule_names:
-                if not self.does_precede(up, down):
-                    continue
-                    
-                if up.name in aes:
-                    upstream_aes[up.name] = aes[up.name]
-                else:
-                    print(f"Warning: Upstream AE {up.name} not found in aes dictionary.")
-                    continue
-                
-            connection_masks = None
-            if self.target_C != -1 and upstream_aes:
+            upstream_aes_for_module = {}
+            if self.use_sparse_connections:
+                for up in submodule_names:
+                    if not self.does_precede(up, down):
+                        continue
+                        
+                    if up.name in aes:
+                        upstream_aes_for_module[up.name] = aes[up.name]
+                    else:
+                        print(f"Warning: Upstream AE {up.name} not found in aes dictionary.")
+                        continue
+            
+            connection_masks_for_module = None
+            if self.use_sparse_connections and self.target_C != -1 and upstream_aes_for_module:
                 mask_components = {}
-                for up_key_loop_var in upstream_aes.keys():
+                for up_key_loop_var in upstream_aes_for_module.keys():
                     down_ae_instance = aes[down.name]
-                    up_ae_instance = upstream_aes[up_key_loop_var]
+                    up_ae_instance = upstream_aes_for_module[up_key_loop_var]
 
                     n_down_features = down_ae_instance.dict_size
                     n_up_features = up_ae_instance.dict_size
@@ -492,15 +515,16 @@ class SCAESuite(nn.Module):
                         raise ValueError(f"Unsupported mask_type: {self.mask_type}. Choose 'learnable' or 'simple'.")
                     
                     mask_components[up_key_loop_var] = mask_instance.to(self.device).to(self.dtype)
-                connection_masks = nn.ModuleDict(mask_components)
+                connection_masks_for_module = nn.ModuleDict(mask_components)
 
             module_dict[down.name] = _make_module(
                 down.submodule_type,
                 self.model,
                 aes[down.name],
-                upstream_aes,
-                connection_masks,
+                upstream_aes_for_module,
+                connection_masks_for_module,
                 down,
+                self.use_sparse_connections,
             )
 
         return nn.ModuleDict(module_dict)
@@ -510,7 +534,8 @@ class SCAESuite(nn.Module):
     
 
     def forward(
-        self, cache: ActivationCache, temperature: float
+        self, cache: ActivationCache, temperature: float,
+        runtime_use_sparse_connections_override: Optional[bool] = None,
     ) -> t.Tensor:
         reconstructions = {}
         pruned_features = {}
@@ -542,7 +567,11 @@ class SCAESuite(nn.Module):
                 )
 
                 module_output_features, reconstruction = module(
-                    cache, pruned_features, current_feat_buffer, temperature
+                    cache, 
+                    pruned_features, 
+                    current_feat_buffer, 
+                    temperature,
+                    runtime_use_sparse_connections_override,
                 )
                 
                 pruned_features[module_name] = module_output_features
@@ -608,6 +637,7 @@ class SCAESuite(nn.Module):
             target_C=config.get("target_C", -1),
             n_features=config["n_features"],
             mask_type=config.get("mask_type", "learnable"),
+            use_sparse_connections=config.get("use_sparse_connections", True),
             dtype=dtype,
             device=device,
         )
@@ -650,6 +680,7 @@ class SCAESuite(nn.Module):
             "n_features": self.n_features,
             "mask_type": self.mask_type,
             "target_C": self.target_C,
+            "use_sparse_connections": self.use_sparse_connections,
         }
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -729,10 +760,13 @@ class MergedSCAESuite(nn.Module):
 
         return cache
 
-    def forward(self, input_ids: t.Tensor, temperature: float):
+    def forward(self, input_ids: t.Tensor, temperature: float,
+                runtime_use_sparse_connections_override: Optional[bool] = None,
+                ):
         cache = self._get_cache(input_ids)
         reconstructions, pruned_features = self.scae_suite(
-            cache, temperature
+            cache, temperature,
+            runtime_use_sparse_connections_override=runtime_use_sparse_connections_override,
         )
 
         return reconstructions, pruned_features, cache
