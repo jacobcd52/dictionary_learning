@@ -30,15 +30,14 @@ CFG = SCAEConfig(
     expansion_factor=4,
     sample_length=128,
     track_dead_features=True,
-    base_lr=1e-3,
-    target_C=100,
+    base_lr=1e-4,
+    target_C=0,
     # auxk_alpha=0.0,
     mask_type="simple",
-    use_sparse_connections=False,
     ce_loss_coeff=0.0,
     fvu_loss_coeff=1.0,
     ce_loss_sparse_coeff=0.0,
-    fvu_loss_sparse_coeff=1.0,
+    fvu_loss_sparse_coeff=0.0,
     feature_act_fvu_coeff=0.0,
     mask_loss_coeff=0.0,
 
@@ -62,7 +61,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    CFG.wb_run_name = f"c{CFG.target_C}_lr{CFG.base_lr}_bs{CFG.batch_size}"
+    CFG.wb_run_name = f"mask{CFG.mask_loss_coeff} fact_fvu{CFG.feature_act_fvu_coeff} fvu_sparse{CFG.fvu_loss_sparse_coeff} fvu{CFG.fvu_loss_coeff} lr{CFG.base_lr}"
 
     mp.spawn(
         SCAETrainer,
