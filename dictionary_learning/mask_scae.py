@@ -6,7 +6,7 @@ import torch as t
 import torch.nn as nn
 from transformer_lens import ActivationCache, HookedTransformer
 
-from .top_k import AutoEncoderTopK
+from .top_k import AutoEncoderTopK, CrosscoderTopK
 from .utils import LearnableMask, SimpleBinaryMask
 
 from utils import set_seed
@@ -19,7 +19,7 @@ Connections = Dict[str, Dict[str, t.Tensor]]
 
 class SubmoduleName(NamedTuple):
     layer: int
-    submodule_type: Literal["attn", "mlp"]
+    submodule_type: Literal["attn", "cc"]
 
     @property
     def name(self):
@@ -34,13 +34,22 @@ class SubmoduleName(NamedTuple):
             and self.submodule_type == other.submodule_type
         )
 
+    @classmethod
+    def from_str(cls, name_str: str) -> "SubmoduleName":
+        parts = name_str.split("_")
+        submodule_type = parts[0]
+        if submodule_type not in ("attn", "cc"):
+            raise ValueError(f"Invalid submodule type in name string: {submodule_type}")
+        layer = int(parts[1])
+        return cls(layer=layer, submodule_type=submodule_type)
+
 
 class SCAEModule(nn.Module, ABC):
     def __init__(
         self,
         model: HookedTransformer,
-        ae: AutoEncoderTopK,
-        upstream_aes: Dict[str, AutoEncoderTopK],
+        ae: Union[AutoEncoderTopK, CrosscoderTopK],
+        upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
     ):
@@ -62,42 +71,66 @@ class SCAEModule(nn.Module, ABC):
     ) -> t.Tensor:
         approx_acts = self.get_initial_contribs(cache)
 
-        upstream_bias = None
+        upstream_bias_sum_for_current_module = None
 
-        for up_name, ae in self.upstream_aes.items():
-            if upstream_bias is None:
-                upstream_bias = ae.b_dec
-            else:
-                upstream_bias = upstream_bias + ae.b_dec
+        for up_name, up_ae_instance in self.upstream_aes.items():
+            current_b_dec_contrib = None
+            if isinstance(up_ae_instance, AutoEncoderTopK):
+                current_b_dec_contrib = up_ae_instance.b_dec
+            elif isinstance(up_ae_instance, CrosscoderTopK):
+                up_sm_name = SubmoduleName.from_str(up_name)
+                
+                target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae_instance.n_outputs))
+                
+                relevant_indices = [
+                    idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
+                    if target_layer < self.name.layer 
+                ]
+                
+                if relevant_indices:
+                    current_b_dec_contrib = up_ae_instance.b_dec[relevant_indices, :].sum(dim=0)
+            
+            if current_b_dec_contrib is not None:
+                if upstream_bias_sum_for_current_module is None:
+                    upstream_bias_sum_for_current_module = current_b_dec_contrib.clone()
+                else:
+                    upstream_bias_sum_for_current_module = upstream_bias_sum_for_current_module + current_b_dec_contrib
 
-            if self.connection_masks is not None:
+            if self.connection_masks is not None and up_name in self.connection_masks:
                 connection_mask = self.connection_masks[up_name](temperature)
             else:
                 connection_mask = None
 
             up_pruned_features = pruned_features[up_name]
             pruned_contribs = self.get_pruned_contribs(
-                cache, ae, connection_mask, up_pruned_features
+                cache, up_name, up_ae_instance, connection_mask, up_pruned_features
             )
             approx_acts = approx_acts + pruned_contribs
 
-        approx_acts = self.compute_bias(approx_acts, upstream_bias, cache)
+        approx_acts = self.compute_bias(approx_acts, upstream_bias_sum_for_current_module, cache)
 
-        # NOTE: Sorting is off here, check if that's okay.
-        top_vals, top_idx = approx_acts.topk(self.ae.k, dim=-1, sorted=False)
+        k_to_use = self.ae.k if isinstance(self.ae, AutoEncoderTopK) else self.ae.k
+        top_vals, top_idx = approx_acts.topk(k_to_use, dim=-1, sorted=False)
         top_vals = t.relu(top_vals)
 
         feat_buffer = t.zeros_like(feature_buffer)
-        feat_buffer = feat_buffer.scatter(-1, top_idx, top_vals)
+        current_ae_dict_size = self.ae.dict_size
+        scatter_buffer = t.zeros(
+            (*top_idx.shape[:-1], current_ae_dict_size), 
+            device=approx_acts.device, 
+            dtype=approx_acts.dtype
+        )
+        scatter_buffer = scatter_buffer.scatter_(-1, top_idx, top_vals)
 
-        reconstructions = self.ae.decode(feat_buffer)
+        reconstructions = self.ae.decode(scatter_buffer)
 
-        return feat_buffer, reconstructions
+        return scatter_buffer, reconstructions
 
     def get_mask_loss(self, temperature: float):
         mask_loss = 0.
-        for mask in self.connection_masks.values():
-            mask_loss += mask.mask_loss(temperature)
+        if self.connection_masks:
+            for mask in self.connection_masks.values():
+                mask_loss += mask.mask_loss(temperature)
         return mask_loss
 
     @abstractmethod
@@ -108,7 +141,8 @@ class SCAEModule(nn.Module, ABC):
     def get_pruned_contribs(
         self,
         cache: ActivationCache,
-        up_ae: AutoEncoderTopK,
+        up_name: str,
+        up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
         connection_mask: t.Tensor,
         up_pruned_features: t.Tensor,
     ) -> t.Tensor:
@@ -129,8 +163,8 @@ class SCAEAttention(SCAEModule):
         self,
         model: HookedTransformer,
         ae: AutoEncoderTopK,
-        upstream_aes: List[AutoEncoderTopK],
-        connection_masks: Dict[str, LearnableMask],
+        upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
+        connection_masks: nn.ModuleDict,
         name: SubmoduleName,
     ):
         super().__init__(model, ae, upstream_aes, connection_masks, name)
@@ -150,8 +184,6 @@ class SCAEAttention(SCAEModule):
             / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
 
-        # batch seq d_model_in, n_heads d_model_in d_model_out, n_features_down d_model_out
-        # -> batch seq n_heads n_features_down
         down_enc = self.ae.encoder.weight
         initial_contrib_pre_moving = t.einsum(
             "b s i, h i o, d o -> b s h d",
@@ -160,11 +192,8 @@ class SCAEAttention(SCAEModule):
             down_enc,
         )
 
-        # Mix between positions using attention pattern
         probs = cache[f"blocks.{self.name.layer}.attn.hook_pattern"]
 
-        # batch n_heads qseq kseq, batch kseq n_heads n_features_down
-        # -> batch qseq n_features_down
         initial_contrib = t.einsum(
             "b h q k, b k h d -> b q d", probs, initial_contrib_pre_moving
         )
@@ -174,23 +203,42 @@ class SCAEAttention(SCAEModule):
     def get_pruned_contribs(
         self,
         cache: ActivationCache,
-        up_ae: AutoEncoderTopK,
+        up_name: str,
+        up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
         connection_mask: t.Tensor,
         up_pruned_features: t.Tensor,
     ) -> t.Tensor:
-        """Compute pruned contributions for attention autoencoder."""
-
         down_enc = self.ae.encoder.weight
-        up_dec = up_ae.decoder.weight
+        
+        effective_up_dec_matrix = None
 
-        # n_features_down d_model_out, n_heads d_model_in d_model_out, d_model_in n_features_up
-        # -> n_heads n_features_down n_features_up
+        if isinstance(up_ae, AutoEncoderTopK):
+            effective_up_dec_matrix = up_ae.decoder.weight
+        elif isinstance(up_ae, CrosscoderTopK):
+            up_sm_name = SubmoduleName.from_str(up_name)
+            target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae.n_outputs))
+            relevant_indices = [
+                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
+                if target_layer < self.name.layer 
+            ]
+            
+            if relevant_indices:
+                summed_dec_transposed = up_ae.decoder_weight[:, relevant_indices, :].sum(dim=1) 
+                effective_up_dec_matrix = summed_dec_transposed.transpose(-1,-2)
+            else:
+                effective_up_dec_matrix = t.zeros(
+                    (self.model.cfg.d_model, up_ae.dict_size), 
+                    device=up_ae.decoder_weight.device, 
+                    dtype=up_ae.decoder_weight.dtype
+                )
+ 
         virtual_weights = t.einsum(
             "d o, h i o, i u -> h d u",
             down_enc,
             self.W_OV,
-            up_dec,
+            effective_up_dec_matrix,
         )
+
         if connection_mask is not None:
             virtual_weights = virtual_weights * connection_mask.unsqueeze(0)
 
@@ -198,19 +246,14 @@ class SCAEAttention(SCAEModule):
             up_pruned_features
             / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
         )
-        # batch qseq n_features_up, n_heads n_features_down n_features_up
-        # -> batch n_heads qseq n_features_down
         contributions_post_ov = t.einsum(
             "b q u, h d u -> b h q d",
             up_facts_post_ln,
             virtual_weights,
         )
 
-        # Mix between positions using attention pattern
         probs = cache[f"blocks.{self.name.layer}.attn.hook_pattern"]
 
-        # batch n_heads qseq kseq, batch n_heads kseq n_features_down
-        # -> batch qseq n_features_down
         contributions = t.einsum(
             "b h q k, b h k d -> b q d", probs, contributions_post_ov
         )
@@ -228,48 +271,43 @@ class SCAEAttention(SCAEModule):
         b_O_contribution = b_O @ down_enc.T
         approx_acts = approx_acts + b_O_contribution
 
-        # Add downstream b_enc
         down_enc_bias = self.ae.encoder.bias
         approx_acts = approx_acts + down_enc_bias
 
-        # Subtract downstream b_dec contribution
-        approx_acts = approx_acts - down_enc @ self.ae.b_dec
-
-        # Add upstream b_dec contributions
         if upstream_bias is not None:
             upstream_bias_post_ln = (
                 upstream_bias.unsqueeze(0).unsqueeze(0)
                 / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
             )
 
-            # n_heads d_model_in d_model_out, batch seq d_model_in
-            # -> batch seq d_out
-            upstream_bias_post_ln = t.einsum(
-                "h i o, b s i -> b s o",
+            projected_through_ov_bias = t.einsum(
+                "h i o, b s i -> b s h o",
                 self.W_OV,
                 upstream_bias_post_ln,
             )
-
-            # n_features_down d_model_in, batch seq d_model_in
-            # -> batch seq n_features_down
-            projected_bias = t.einsum(
-                "d i, b s i -> b s d",
-                down_enc,
+            
+            bias_contrib_pre_moving = t.einsum(
+                "b s i, h i o, d o -> b s h d",
                 upstream_bias_post_ln,
+                self.W_OV,
+                down_enc,
             )
-
+            probs = cache[f"blocks.{self.name.layer}.attn.hook_pattern"]
+            projected_bias = t.einsum(
+                "b h q k, b k h d -> b q d", probs, bias_contrib_pre_moving
+            )
             return approx_acts + projected_bias
 
         return approx_acts
 
 
-class SCAEMLP(SCAEModule):
+class SCAECrossCoder(SCAEModule):
     def __init__(
         self,
         model: HookedTransformer,
-        ae: AutoEncoderTopK,
-        upstream_aes: List[AutoEncoderTopK],
-        connection_masks: Dict[str, LearnableMask],
+        ae: CrosscoderTopK,
+        upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
+        connection_masks: nn.ModuleDict,
         name: SubmoduleName,
     ):
         super().__init__(model, ae, upstream_aes, connection_masks, name)
@@ -279,29 +317,49 @@ class SCAEMLP(SCAEModule):
 
         initial_act_post_ln = (
             cache["blocks.0.hook_resid_pre"]
-            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
-        # batch seq d_model, n_features d_model -> batch seq n_features
         return initial_act_post_ln @ down_enc.T
 
     def get_pruned_contribs(
         self,
         cache: ActivationCache,
-        up_ae: AutoEncoderTopK,
+        up_name: str,
+        up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
         connection_mask: t.Tensor,
         up_pruned_features: t.Tensor,
     ) -> t.Tensor:
-        up_dec = up_ae.decoder.weight
         down_enc = self.ae.encoder.weight
 
-        virtual_weights = down_enc @ up_dec
+        effective_up_dec_matrix = None
+
+        if isinstance(up_ae, AutoEncoderTopK):
+            effective_up_dec_matrix = up_ae.decoder.weight
+        elif isinstance(up_ae, CrosscoderTopK):
+            up_sm_name = SubmoduleName.from_str(up_name)
+            target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae.n_outputs))
+            relevant_indices = [
+                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
+                if target_layer < self.name.layer
+            ]
+            
+            if relevant_indices:
+                summed_dec_transposed = up_ae.decoder_weight[:, relevant_indices, :].sum(dim=1)
+                effective_up_dec_matrix = summed_dec_transposed.transpose(-1,-2)
+            else:
+                effective_up_dec_matrix = t.zeros(
+                    (self.model.cfg.d_model, up_ae.dict_size),
+                    device=up_ae.decoder_weight.device,
+                    dtype=up_ae.decoder_weight.dtype
+                )
+        
+        virtual_weights = down_enc @ effective_up_dec_matrix
+        
         if connection_mask is not None:
             virtual_weights = virtual_weights * connection_mask
 
         up_facts_post_ln = (
             up_pruned_features
-            / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
         )
 
         contributions = up_facts_post_ln @ virtual_weights.T
@@ -314,30 +372,17 @@ class SCAEMLP(SCAEModule):
         upstream_bias: t.Tensor,
         cache: ActivationCache,
     ):
-        down_enc = self.ae.encoder.weight
-        down_enc_bias = self.ae.encoder.bias
-
-        # bias = bias.unsqueeze(0) if bias.dim() < approx_acts.dim() else bias
-        approx_acts = approx_acts + down_enc_bias
-        approx_acts = approx_acts - down_enc @ self.ae.b_dec
+        if self.ae.encoder.bias is not None:
+            approx_acts = approx_acts + self.ae.encoder.bias
 
         if upstream_bias is not None:
-            # Add upstream b_dec contributions
             upstream_bias_post_ln = (
                 upstream_bias.unsqueeze(0).unsqueeze(0)
-                / cache[f"blocks.{self.name.layer}.ln2.hook_scale"]
             )
-
-            # n_features_down d_model_in, batch seq d_model_in
-            # -> batch seq n_features_down
-            projected_bias = t.einsum(
-                "d i, b s i -> b s d",
-                down_enc,
-                upstream_bias_post_ln,
-            )
-
-            return approx_acts + projected_bias
-
+            
+            projected_bias = upstream_bias_post_ln @ self.ae.encoder.weight.T
+            approx_acts = approx_acts + projected_bias
+            
         return approx_acts
 
 
@@ -376,24 +421,36 @@ class SCAESuite(nn.Module):
         submodule_names = [
             SubmoduleName(layer=i, submodule_type=submodule_type)
             for i in range(model.cfg.n_layers)
-            for submodule_type in ["attn", "mlp"]
+            for submodule_type in ["attn", "cc"]
         ]
 
-        aes = {
-            sm.name: AutoEncoderTopK(model.cfg.d_model, n_features, k)
-            .to(device)
-            .to(dtype)
-            for sm in submodule_names
-        }
+        aes = {}
+        for sm in submodule_names:
+            if sm.submodule_type == "attn":
+                aes[sm.name] = AutoEncoderTopK(model.cfg.d_model, n_features, k).to(device).to(dtype)
+            elif sm.submodule_type == "cc":
+                n_outputs = model.cfg.n_layers - sm.layer
+                if n_outputs <=0:
+                    n_outputs = 1
+                aes[sm.name] = CrosscoderTopK(
+                    activation_dim=model.cfg.d_model, 
+                    dict_size=n_features, 
+                    k=k, 
+                    n_outputs=n_outputs
+                ).to(device).to(dtype)
 
         self.module_dict = self._make_module_dict(submodule_names, aes)
 
     def _make_module_dict(
-        self, submodule_names: List[SubmoduleName], aes: List[AutoEncoderTopK]
+        self, submodule_names: List[SubmoduleName], aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]]
     ) -> nn.ModuleDict:
-        def _make_module(submodule_type: Literal["attn", "mlp"], *args):
-            submodule = SCAEAttention if submodule_type == "attn" else SCAEMLP
-            return submodule(*args)
+        def _make_module(submodule_type: Literal["attn", "cc"], *args):
+            if submodule_type == "attn":
+                return SCAEAttention(*args)
+            elif submodule_type == "cc":
+                return SCAECrossCoder(*args)
+            else:
+                raise ValueError(f"Unknown submodule type: {submodule_type}")
 
         module_dict = {}
         for down in submodule_names:
@@ -401,17 +458,23 @@ class SCAESuite(nn.Module):
 
             for up in submodule_names:
                 if not self.does_precede(up, down):
-                    # Skip if upstream module does not precede downstream module
                     continue
                     
-                upstream_aes[up.name] = aes[up.name]
+                if up.name in aes:
+                    upstream_aes[up.name] = aes[up.name]
+                else:
+                    print(f"Warning: Upstream AE {up.name} not found in aes dictionary.")
+                    continue
                 
             connection_masks = None
-            if self.target_C != -1:
+            if self.target_C != -1 and upstream_aes:
                 mask_components = {}
                 for up_key_loop_var in upstream_aes.keys():
-                    n_down_features = aes[down.name].dict_size
-                    n_up_features = aes[up_key_loop_var].dict_size
+                    down_ae_instance = aes[down.name]
+                    up_ae_instance = upstream_aes[up_key_loop_var]
+
+                    n_down_features = down_ae_instance.dict_size
+                    n_up_features = up_ae_instance.dict_size
 
                     if self.mask_type == "learnable":
                         mask_instance = LearnableMask(
@@ -443,16 +506,8 @@ class SCAESuite(nn.Module):
         return nn.ModuleDict(module_dict)
 
     def does_precede(self, up_name: SubmoduleName, down_name: SubmoduleName):
-        if "pythia" in self.model.cfg.model_name:
-            # attn and mlp are parallel
-            return up_name.layer < down_name.layer
-        else:
-            # attn and mlp are sequential
-            return (up_name.layer < down_name.layer) or (
-                up_name.layer == down_name.layer
-                and up_name.submodule_type == "attn"
-                and down_name.submodule_type == "mlp"
-            )
+        return up_name.layer < down_name.layer # note difference to old, non-crosscoder suite
+    
 
     def forward(
         self, cache: ActivationCache, temperature: float
@@ -470,16 +525,27 @@ class SCAESuite(nn.Module):
             dtype=dtype,
         )
 
-        # Iterate with correct ordering
         for layer in range(self.model.cfg.n_layers):
-            for module_type in ["attn", "mlp"]:
+            for module_type in ["attn", "cc"]:
                 module_name = f"{module_type}_{layer}"
+                
+                if module_name not in self.module_dict:
+                    continue
                 module = self.module_dict[module_name]
 
-                feature_buffer, reconstruction = module(
-                    cache, pruned_features, feat_buffer, temperature
+                current_module_ae_dict_size = module.ae.dict_size
+                
+                current_feat_buffer = t.zeros(
+                    (*feat_buffer.shape[:2], current_module_ae_dict_size),
+                    device=device,
+                    dtype=dtype,
                 )
-                pruned_features[module_name] = feature_buffer
+
+                module_output_features, reconstruction = module(
+                    cache, pruned_features, current_feat_buffer, temperature
+                )
+                
+                pruned_features[module_name] = module_output_features
                 reconstructions[module_name] = reconstruction
 
         return reconstructions, pruned_features
@@ -495,7 +561,6 @@ class SCAESuite(nn.Module):
 
         logits = self.model.unembed(self.model.ln_final(resid_final))
 
-        # Shift sequences by 1
         logits = logits[:, :-1, :]
         tokens = tokens[:, 1:]
 
@@ -533,12 +598,10 @@ class SCAESuite(nn.Module):
                 "Install with: pip install huggingface_hub"
             )
 
-        # Download configuration
         config_path = hf_hub_download(repo_id=repo_id, filename="config.json")
         with open(config_path, "r") as f:
             config = json.load(f)
 
-        # Initialize suite
         suite = cls(
             model=model,
             k=config["k"],
@@ -549,13 +612,11 @@ class SCAESuite(nn.Module):
             device=device,
         )
 
-        # Download and load state dict
         checkpoint_path = hf_hub_download(
             repo_id=repo_id, filename="checkpoint.pt"
         )
         state_dict = t.load(checkpoint_path, map_location="cpu")
 
-        # Load the state_dict into the suite
         missing_keys, unexpected_keys = suite.load_state_dict(
             state_dict, strict=False
         )
@@ -584,17 +645,12 @@ class SCAESuite(nn.Module):
                 "Install with: pip install huggingface_hub"
             )
 
-        # Create config
         config = {
             "k": self.k,
             "n_features": self.n_features,
             "mask_type": self.mask_type,
             "target_C": self.target_C,
         }
-
-        # Save config and state dict with connections
-        import tempfile
-        import os
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, "config.json")
@@ -605,13 +661,11 @@ class SCAESuite(nn.Module):
             state_dict = self.state_dict()
             t.save(state_dict, checkpoint_path)
 
-            # Upload files
             api = HfApi()
 
-            # Check if repo exists and create it if it doesn't
             try:
                 api.repo_info(repo_id=repo_id, repo_type="model")
-            except Exception:  # Repository doesn't exist
+            except Exception:
                 api.create_repo(
                     repo_id=repo_id, repo_type="model", private=private
                 )
@@ -628,22 +682,21 @@ class MergedSCAESuite(nn.Module):
         self.transformer = transformer
         self.scae_suite = scae_suite
 
-        self.hook_list = ["blocks.0.hook_resid_pre"]
+        self.hook_list = []
         for layer in range(self.transformer.cfg.n_layers):
             self.hook_list += [
                 f"blocks.{layer}.ln1.hook_scale",
-                f"blocks.{layer}.ln2.hook_scale",
                 f"blocks.{layer}.hook_attn_out",
                 f"blocks.{layer}.hook_mlp_out",
                 f"blocks.{layer}.attn.hook_pattern",
+                f"blocks.{layer}.hook_resid_pre",
             ]
 
-    # TODO check this!
     def get_trainable_params(self):
         params = []
         for module in self.scae_suite.module_dict.values():
             for submodule in module.modules():
-                if isinstance(submodule, AutoEncoderTopK):
+                if isinstance(submodule, (AutoEncoderTopK, CrosscoderTopK)):
                     params.extend(submodule.parameters())
                 elif isinstance(submodule, LearnableMask):
                     params.extend(submodule.parameters())
@@ -655,8 +708,10 @@ class MergedSCAESuite(nn.Module):
     def clip_grad_norm(self, max_norm: float = 1.0):
         for module in self.scae_suite.module_dict.values():
             for submodule in module.modules():
-                is_ae = isinstance(submodule, AutoEncoderTopK)
-                if is_ae and submodule.decoder.weight.grad is not None:
+                is_ae = isinstance(submodule, (AutoEncoderTopK, CrosscoderTopK))
+                if is_ae and hasattr(submodule, 'decoder') and submodule.decoder.weight.grad is not None:
+                    t.nn.utils.clip_grad_norm_(submodule.parameters(), max_norm)
+                elif is_ae and hasattr(submodule, 'decoder_weight') and submodule.decoder_weight.grad is not None:
                     t.nn.utils.clip_grad_norm_(submodule.parameters(), max_norm)
 
     @t.no_grad()

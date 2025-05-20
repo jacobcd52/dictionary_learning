@@ -2,7 +2,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Union, Optional
 
 import torch as t
 import torch.distributed as dist
@@ -14,6 +14,8 @@ from tqdm import tqdm
 import wandb as wb
 
 from .mask_scae import SCAESuite, MergedSCAESuite
+from .top_k import AutoEncoderTopK, CrosscoderTopK
+
 from utils import set_seed
 
 set_seed(42)
@@ -194,12 +196,30 @@ class SCAETrainer:
     def get_ce_loss(
         self,
         model: MergedSCAESuite,
-        cache,
+        cache: Dict[str, t.Tensor],
         input_ids: t.Tensor,
-        reconstructions,
+        reconstructions: Dict[str, t.Tensor],
     ):
-        resid_final = sum(reconstructions.values())
-        resid_final = resid_final + cache["blocks.0.hook_resid_pre"]
+        # model is DDP, so access actual model via model.module
+        scae_suite = model.module.scae_suite
+        
+        total_reconstruction_for_ce = t.zeros_like(cache["blocks.0.hook_resid_pre"])
+
+        for name, recon_val in reconstructions.items():
+            module_type = name.split("_")[0]
+            if module_type == "cc":
+                # recon_val for cc is [B, S, N_outputs, D_model]
+                # Sum over N_outputs dimension for CE loss contribution
+                total_reconstruction_for_ce += recon_val.sum(dim=2)
+            elif module_type == "attn":
+                # recon_val for attn is [B, S, D_model]
+                total_reconstruction_for_ce += recon_val
+            else:
+                # Should not happen
+                print(f"Warning: Unknown module type {module_type} in get_ce_loss")
+
+
+        resid_final = total_reconstruction_for_ce + cache["blocks.0.hook_resid_pre"]
 
         unembed = model.module.transformer.unembed
         ln_final = model.module.transformer.ln_final
@@ -261,64 +281,204 @@ class SCAETrainer:
 
     def _get_module(self, name: str):
         """Helper function to get the autoencoder for a given module."""
+        # Accessing model.module because self.model is DDP wrapped
         return self.model.module.scae_suite.module_dict[name]
 
-    def _compute_losses(self, y, sae_out, ae, dead_mask=None):
-        """Compute fvu and auxk loss.
-        From: https://github.com/EleutherAI/sparsify/blob/main/sparsify/sparse_coder.py
-
-        Args:
-            y: Target activations
-            sae_out: Current reconstruction
-            ae: Autoencoder
-            dead_mask: Boolean mask indicating dead features
+    def _compute_single_auxk_loss(self, y: t.Tensor, sae_out: t.Tensor, ae: Union[AutoEncoderTopK, CrosscoderTopK], dead_mask: Optional[t.Tensor] = None):
         """
-
+        Compute auxk loss for a single autoencoder.
+        ae is the actual AutoEncoderTopK or CrosscoderTopK instance.
+        y is the target activation [B, S, D_model].
+        sae_out is the reconstruction from this ae for y, also [B, S, D_model].
+        """
         # Compute the residual
         e = y - sae_out
+        total_variance = (y - y.mean(dim=(0,1), keepdim=True)).pow(2).sum() + 1e-8
 
-        # Used as a denominator for putting everything on a reasonable scale
-        total_variance = (y - y.mean(0)).pow(2).sum()
 
-        # Second decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
-            # Heuristic from Appendix B.1 in the paper
+        if dead_mask is not None and ae.encoder.bias is not None and (num_dead := int(dead_mask.sum())) > 0 :
             k_aux = y.shape[-1] // 2
-
-            # Reduce the scale of the loss if there are a small number of dead latents
             scale = min(num_dead / k_aux, 1.0)
             k_aux = min(k_aux, num_dead)
 
-            # We're autoencoding, so x = y
             orig_shape = y.shape
-            x_flat = y.flatten(0, 1)
-            pre_acts = ae.encoder(x_flat - ae.b_dec)
-            pre_acts = pre_acts.reshape(orig_shape[0], orig_shape[1], -1)
+            x_flat = y.flatten(0, 1) # Shape: [B*S, D_model]
+            
+            # AuxK for AutoEncoderTopK (assumes ae.b_dec is single vector or None)
+            # AuxK for CrosscoderTopK needs careful handling of b_dec if it's per output.
+            # For cc_L's own AuxK, we care about its 0-th head.
+            # AutoEncoderTopK.encode does not subtract b_dec. CrosscoderTopK.encode also does not.
+            # So, direct encoding of x_flat is fine.
+            pre_acts_flat = ae.encoder(x_flat) # Shape [B*S, ae.dict_size]
+            
+            pre_acts = pre_acts_flat.reshape(orig_shape[0], orig_shape[1], -1)
 
-            # Don't include living latents in this loss
             auxk_latents = t.where(
-                dead_mask[None].to(pre_acts.device), pre_acts, -t.inf
+                dead_mask[None, None, :].to(pre_acts.device), pre_acts, -t.inf
             )
-
-            # Encourage the top ~50% of dead latents to predict the residual of the
-            # Top-k dead latents
-            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, dim=-1, sorted=False)
 
             buffer_BF = t.zeros_like(pre_acts)
             encoded_acts_BF = buffer_BF.scatter_(
                 dim=-1, index=auxk_indices, src=t.nn.functional.relu(auxk_acts)
             )
-            # top k living latents
-            e_hat = ae.decode(encoded_acts_BF)
-            auxk_loss = (e_hat - e.detach()).pow(2).sum()
-            auxk_loss = scale * auxk_loss / total_variance
+            
+            # For decoding, CrosscoderTopK needs features of its dict_size.
+            # Its decode method returns [B,S,N,D]. We need [B,S,D] for e_hat.
+            # If ae is CrosscoderTopK, we should use its 0-th output head for this auxk.
+            if isinstance(ae, CrosscoderTopK):
+                # encoded_acts_BF is [B,S, ae.dict_size]
+                decoded_all_outputs = ae.decode(encoded_acts_BF) # [B,S,N,D]
+                e_hat = decoded_all_outputs[:,:,0,:] # Use 0-th head for its "own" reconstruction
+            else: # AutoEncoderTopK
+                e_hat = ae.decode(encoded_acts_BF) # [B,S,D]
+            
+            auxk_loss_val = (e_hat - e.detach()).pow(2).sum()
+            auxk_loss_val = scale * auxk_loss_val / total_variance
         else:
-            auxk_loss = sae_out.new_tensor(0.0)
+            auxk_loss_val = sae_out.new_tensor(0.0)
+        
+        return auxk_loss_val
 
-        l2_loss = e.pow(2).sum()
-        fvu = l2_loss / total_variance
+    def get_auxk_loss(
+        self,
+        pruned_features: Dict[str, t.Tensor],
+        reconstructions: Dict[str, t.Tensor],
+        cache: Dict[str, t.Tensor],
+    ) -> t.Tensor:
+        total_auxk_loss = 0.0
+        
+        # Note: self.num_tokens_since_fired is indexed based on the order of module_dict
+        # We need to ensure this order matches pruned_features.keys() if we iterate that.
+        # Or, better, iterate module_dict keys and get items from pruned_features and reconstructions.
+        
+        module_names_ordered = list(self.model.module.scae_suite.module_dict.keys())
 
-        return auxk_loss, fvu
+        for module_idx, name in enumerate(module_names_ordered):
+            if name not in reconstructions or name not in pruned_features:
+                continue # Skip if this module didn't produce output (e.g. if handling of last layer cc is special)
+
+            module_meta = self._get_module(name) # This is the SCAEModule (e.g. SCAEAttention, SCAECrossCoder)
+            actual_ae = module_meta.ae # This is AutoEncoderTopK or CrosscoderTopK
+
+            layer_str = name.split("_")[1]
+            module_type = name.split("_")[0]
+            
+            y_target = None
+            sae_direct_reconstruction = None
+
+            if module_type == "attn":
+                y_target = cache.get(f"blocks.{layer_str}.hook_attn_out")
+                sae_direct_reconstruction = reconstructions.get(name)
+            elif module_type == "cc":
+                y_target = cache.get(f"blocks.{layer_str}.hook_mlp_out")
+                # For a CC module's own AuxK, we use its 0-th output head reconstruction
+                # against its primary target (MLP output of the same layer).
+                cc_reconstruction_all_outputs = reconstructions.get(name) # [B,S,N,D]
+                if cc_reconstruction_all_outputs is not None:
+                    sae_direct_reconstruction = cc_reconstruction_all_outputs[:,:,0,:] # [B,S,D]
+            
+            if y_target is None or sae_direct_reconstruction is None:
+                if self.rank == 0:
+                    print(f"Warning: Missing target or reconstruction for AuxK loss for module {name}")
+                continue
+
+            dead_mask = None
+            if self.cfg.track_dead_features and self.cfg.auxk_alpha > 0 and hasattr(self, 'num_tokens_since_fired'):
+                 if module_idx < self.num_tokens_since_fired.shape[0]: # Check bounds
+                    dead_mask = self.num_tokens_since_fired[module_idx] > 1_000_000 # shape [n_features_for_this_module]
+            
+            current_auxk_loss = self._compute_single_auxk_loss(
+                y_target,
+                sae_direct_reconstruction,
+                actual_ae,
+                dead_mask
+            )
+            total_auxk_loss += current_auxk_loss
+            
+            if self.rank == 0:
+                 wb.log({f"auxk_loss_module/{name}": current_auxk_loss.item()}, step=self.global_step)
+        
+        return total_auxk_loss
+
+    def get_fvu_loss(
+        self,
+        reconstructions: Dict[str, t.Tensor],
+        cache: Dict[str, t.Tensor],
+    ) -> t.Tensor:
+        total_fvu_l2_loss = 0.0
+        total_fvu_variance = 0.0
+        n_layers = self.model.module.transformer.cfg.n_layers
+
+        # ATTN FVU
+        for l in range(n_layers):
+            attn_module_name = f"attn_{l}"
+            if attn_module_name in reconstructions:
+                y_attn = cache.get(f"blocks.{l}.hook_attn_out")
+                recon_attn = reconstructions[attn_module_name]
+
+                if y_attn is None:
+                    if self.rank == 0: print(f"Warning: Target y_attn for {attn_module_name} not in cache.")
+                    continue
+                
+                l2_loss_attn = (y_attn - recon_attn).pow(2).sum()
+                variance_attn = (y_attn - y_attn.mean(dim=(0,1), keepdim=True)).pow(2).sum() + 1e-8
+                
+                total_fvu_l2_loss += l2_loss_attn
+                total_fvu_variance += variance_attn
+                if self.rank == 0:
+                    wb.log({f"fvu_l2_loss/attn_{l}": l2_loss_attn.item()}, step=self.global_step)
+                    wb.log({f"fvu_variance/attn_{l}": variance_attn.item()}, step=self.global_step)
+                    wb.log({f"fvu_contrib/{attn_module_name}": (l2_loss_attn / variance_attn).item()}, step=self.global_step)
+
+
+        # MLP FVU (from CCs)
+        for j in range(n_layers): # j is the target mlp_out layer index
+            target_mlp_hook_name = f"blocks.{j}.hook_mlp_out"
+            y_mlp_j = cache.get(target_mlp_hook_name)
+
+            if y_mlp_j is None:
+                if self.rank == 0: print(f"Warning: Target y_mlp_j for layer {j} not in cache.")
+                continue
+
+            accumulated_recon_for_mlp_j = t.zeros_like(y_mlp_j)
+            
+            # Sum contributions from all upstream CC modules cc_i (i < j)
+            # and also the cc_j module itself (its 0-th head)
+            for i in range(j + 1): # i is the layer of the CC module
+                cc_module_name = f"cc_{i}"
+                if cc_module_name in reconstructions:
+                    cc_i_all_outputs = reconstructions[cc_module_name] # [B,S,N,D]
+                    
+                    # The output head of cc_i that targets mlp_out at layer j
+                    output_head_idx = j - i 
+                    
+                    if 0 <= output_head_idx < cc_i_all_outputs.shape[2]:
+                        contrib_from_cc_i = cc_i_all_outputs[:, :, output_head_idx, :]
+                        accumulated_recon_for_mlp_j += contrib_from_cc_i
+                    # else: # This cc_i does not have an output head for mlp_j (e.g. j < i, or j is too far for cc_i's n_outputs)
+                        # This case is naturally handled by loop range and check
+                        # if self.rank == 0: print(f"Debug: CC_{i} output head {output_head_idx} for MLP_{j} is out of bounds ({cc_i_all_outputs.shape[2]} heads)")
+
+
+            l2_loss_mlp_j = (y_mlp_j - accumulated_recon_for_mlp_j).pow(2).sum()
+            variance_mlp_j = (y_mlp_j - y_mlp_j.mean(dim=(0,1), keepdim=True)).pow(2).sum() + 1e-8
+
+            total_fvu_l2_loss += l2_loss_mlp_j
+            total_fvu_variance += variance_mlp_j
+            if self.rank == 0:
+                wb.log({f"fvu_l2_loss/mlp_{j}": l2_loss_mlp_j.item()}, step=self.global_step)
+                wb.log({f"fvu_variance/mlp_{j}": variance_mlp_j.item()}, step=self.global_step)
+                wb.log({f"fvu_contrib/mlp_{j}": (l2_loss_mlp_j / variance_mlp_j).item()}, step=self.global_step)
+
+        if total_fvu_variance == 0: return total_fvu_l2_loss.new_tensor(0.0) # Avoid division by zero if all variances are zero
+        
+        final_fvu = total_fvu_l2_loss / total_fvu_variance
+        if self.rank == 0:
+            wb.log({f"fvu/total_fvu": final_fvu.item()}, step=self.global_step)
+            
+        return final_fvu
+
 
     def get_losses(
         self,
@@ -327,52 +487,57 @@ class SCAETrainer:
         reconstructions: Dict[str, t.Tensor],
         cache: Dict[str, t.Tensor],
     ):
-        total_loss = 0
-        for module_idx, name in enumerate(pruned_features.keys()):
-            module, layer = name.split("_")
-            y = cache[f"blocks.{layer}.hook_{module}_out"]
+        # Initialize total_loss, which will be the sum of auxk, fvu, and mask losses
+        # CE loss is handled separately and added first in train_step.
+        combined_loss = 0.0
 
-            # Only set dead mask if computing AuxK loss
-            dead_mask = (
-                self.num_tokens_since_fired[module_idx] > 1_000_000
-                if self.cfg.auxk_alpha > 0
-                else None
-            )
-
-            module = self._get_module(name)
-            aux_k_loss, fvu = self._compute_losses(
-                y,
-                reconstructions[name],
-                module.ae,
-                dead_mask,
-            ) 
-
-            mask_loss = module.get_mask_loss(temperature)
-
-            C_total_for_module = 0
-            for up_name, learnable_mask_instance in module.connection_masks.items():
-                mask = learnable_mask_instance(temperature, hard=True)
-                # C is defined as the average number of active incoming connections *per downstream feature*
-                # So, for a given upstream mask, this is mask.sum() / mask.shape[0] (mask.shape[0] is n_features_down)
-                c_contribution = mask.sum().item() / mask.shape[0]
-                C_total_for_module += c_contribution
-            
-            total_loss = total_loss + self.cfg.fvu_loss_coeff * fvu 
-            total_loss = total_loss + self.cfg.mask_loss_coeff * mask_loss
-            total_loss = total_loss + self.cfg.auxk_alpha * aux_k_loss
-
+        # 1. AuxK Loss
+        if self.cfg.auxk_alpha > 0:
+            auxk_loss_val = self.get_auxk_loss(pruned_features, reconstructions, cache)
+            combined_loss += self.cfg.auxk_alpha * auxk_loss_val
             if self.rank == 0:
-                wb.log(
-                    {
-                        f"fvu/{name}": fvu.item(),
-                        f"auxk/{name}": aux_k_loss.item(),
-                        f"mask_loss/{name}": mask_loss, # Log the specific mask loss for this module
-                        f"C/{name}": C_total_for_module, # Log the total C for this module
-                    },
-                    step=self.global_step,
-                )
+                wb.log({"train/total_auxk_loss_scaled": (self.cfg.auxk_alpha * auxk_loss_val).item()}, step=self.global_step)
 
-        return total_loss
+        # 2. FVU Loss
+        if self.cfg.fvu_loss_coeff > 0:
+            fvu_loss_val = self.get_fvu_loss(reconstructions, cache)
+            combined_loss += self.cfg.fvu_loss_coeff * fvu_loss_val
+            if self.rank == 0:
+                 wb.log({"train/total_fvu_loss_scaled": (self.cfg.fvu_loss_coeff * fvu_loss_val).item()}, step=self.global_step)
+        
+        # 3. Mask Loss and C-Metric (Sparsity of connections)
+        total_mask_loss = 0.0
+        # Iterate over modules to get their mask losses and C metrics
+        module_names_ordered = list(self.model.module.scae_suite.module_dict.keys())
+        for name in module_names_ordered:
+            module_meta = self._get_module(name) # SCAEModule instance
+            
+            # Mask Loss
+            if module_meta.connection_masks: # Check if connection_masks exist
+                current_mask_loss = module_meta.get_mask_loss(temperature)
+                total_mask_loss += current_mask_loss
+                if self.rank == 0:
+                    wb.log({f"mask_loss_module/{name}": current_mask_loss}, step=self.global_step) # current_mask_loss is scalar tensor or float
+
+            # C-Metric
+            if module_meta.connection_masks and self.rank == 0 : # Only log C for rank 0
+                C_total_for_module = 0
+                num_mask_components = 0
+                for up_mask_name, learnable_mask_instance in module_meta.connection_masks.items():
+                    mask = learnable_mask_instance(temperature, hard=True) # Get hard mask for C metric
+                    if mask.shape[0] > 0 : # n_features_down > 0
+                         c_contribution = mask.sum().item() / mask.shape[0]
+                         C_total_for_module += c_contribution
+                         num_mask_components+=1
+                avg_C_for_module = C_total_for_module / num_mask_components if num_mask_components > 0 else 0
+                wb.log({f"C_metric/{name}": avg_C_for_module}, step=self.global_step)
+
+        if self.cfg.mask_loss_coeff > 0:
+            combined_loss += self.cfg.mask_loss_coeff * total_mask_loss
+            if self.rank == 0:
+                 wb.log({"train/total_mask_loss_scaled": (self.cfg.mask_loss_coeff * total_mask_loss).item()}, step=self.global_step)
+        
+        return combined_loss
 
     def update_dead_features(
         self, pruned_features: Dict[str, t.Tensor], num_tokens: int
@@ -413,15 +578,24 @@ class SCAETrainer:
 
         # Update dead feature tracker
         if self.cfg.track_dead_features:
+            # Pass num_tokens based on input_ids for the current batch on this rank
+            # DDP handles gradient accumulation; feature firing should be per batch on each GPU then reduced.
+            # The current update_dead_features has dist.all_reduce.
             self.update_dead_features(pruned_features, input_ids.numel())
 
+        # 1. Cross-Entropy Loss
         total_loss = self.get_ce_loss(model, cache, input_ids, reconstructions)
+        if self.rank == 0:
+            wb.log({"train/ce_loss_unscaled": total_loss.item()}, step=self.global_step)
 
+
+        # 2. Other losses (FVU, AuxK, Mask)
+        # These coefficients are cfg.fvu_loss_coeff, cfg.auxk_alpha, cfg.mask_loss_coeff
         if self.cfg.fvu_loss_coeff > 0 or self.cfg.auxk_alpha > 0 or self.cfg.mask_loss_coeff > 0:
-            reconstruction_loss = self.get_losses(
+            other_losses = self.get_losses(
                 temperature, pruned_features, reconstructions, cache
             )
-            total_loss += reconstruction_loss
+            total_loss += other_losses # other_losses is already scaled by coefficients
 
         return total_loss
 

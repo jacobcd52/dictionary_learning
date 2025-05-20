@@ -93,6 +93,7 @@ class Buffer:
                 f"blocks.{layer}.hook_attn_out",
                 f"blocks.{layer}.hook_mlp_out",
                 f"blocks.{layer}.attn.hook_pattern",
+                f"blocks.{layer}.hook_resid_pre",
             ]
 
     @t.no_grad()
