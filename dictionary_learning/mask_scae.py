@@ -52,7 +52,6 @@ class SCAEModule(nn.Module, ABC):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
-        use_sparse_connections: bool,
     ):
         super().__init__()
 
@@ -61,7 +60,6 @@ class SCAEModule(nn.Module, ABC):
         self.upstream_aes = upstream_aes
         self.connection_masks = connection_masks
         self.name = name
-        self.use_sparse_connections = use_sparse_connections
 
     def forward(
         self,
@@ -75,13 +73,14 @@ class SCAEModule(nn.Module, ABC):
         if runtime_use_sparse_connections_override is not None:
             actual_run_mode_is_sparse = runtime_use_sparse_connections_override
         else:
-            actual_run_mode_is_sparse = self.use_sparse_connections
+            print("Warning: runtime_use_sparse_connections_override is None in SCAEModule.forward. Defaulting to False.")
+            actual_run_mode_is_sparse = False
 
         approx_acts = self.get_initial_contribs(cache, actual_run_mode_is_sparse)
 
         upstream_bias_sum_for_current_module = None
 
-        if self.use_sparse_connections and actual_run_mode_is_sparse:
+        if actual_run_mode_is_sparse:
             for up_name, up_ae_instance in self.upstream_aes.items():
                 current_b_dec_contrib = None
                 if isinstance(up_ae_instance, AutoEncoderTopK):
@@ -118,11 +117,27 @@ class SCAEModule(nn.Module, ABC):
 
         approx_acts = self.compute_bias(approx_acts, upstream_bias_sum_for_current_module, cache)
 
-        k_to_use = self.ae.k if isinstance(self.ae, AutoEncoderTopK) else self.ae.k
-        top_vals, top_idx = approx_acts.topk(k_to_use, dim=-1, sorted=False)
-        top_vals = t.relu(top_vals)
+        # # Plot histogram of first feature's preactivations
+        # import matplotlib.pyplot as plt
+        # import os
 
-        feat_buffer = t.zeros_like(feature_buffer)
+        # plt.figure(figsize=(10, 6))
+        # plt.hist(approx_acts[:, :, 0].flatten().detach().float().cpu().numpy(), bins=50, alpha=0.7)
+        # plt.title('Histogram of First Feature Preactivations')
+        # plt.xlabel('Preactivation Value')
+        # plt.ylabel('Count')
+
+        # # Create directory for plots if it doesn't exist
+        # os.makedirs('plots', exist_ok=True)
+
+        # plt.savefig(f'plots/{self.name.name}_preact_hist_feature_0.png')
+        # plt.close()
+        
+        # approx_acts = t.relu(approx_acts)
+
+        k_to_use = self.ae.k if isinstance(self.ae, AutoEncoderTopK) else self.ae.k
+        top_vals, top_idx = approx_acts.topk(k_to_use, dim=-1)
+
         current_ae_dict_size = self.ae.dict_size
         scatter_buffer = t.zeros(
             (*top_idx.shape[:-1], current_ae_dict_size), 
@@ -175,9 +190,8 @@ class SCAEAttention(SCAEModule):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
-        use_sparse_connections: bool,
     ):
-        super().__init__(model, ae, upstream_aes, connection_masks, name, use_sparse_connections)
+        super().__init__(model, ae, upstream_aes, connection_masks, name)
 
         W_O = model.W_O[self.name.layer]
         W_V = model.W_V[self.name.layer]
@@ -324,9 +338,8 @@ class SCAECrossCoder(SCAEModule):
         upstream_aes: Dict[str, Union[AutoEncoderTopK, CrosscoderTopK]],
         connection_masks: nn.ModuleDict,
         name: SubmoduleName,
-        use_sparse_connections: bool,
     ):
-        super().__init__(model, ae, upstream_aes, connection_masks, name, use_sparse_connections)
+        super().__init__(model, ae, upstream_aes, connection_masks, name)
 
     def get_initial_contribs(self, cache: ActivationCache, actual_run_mode_is_sparse: bool) -> t.Tensor:
         down_enc = self.ae.encoder.weight
@@ -417,7 +430,6 @@ class SCAESuite(nn.Module):
         target_C: int,
         n_features: int,
         mask_type: str,
-        use_sparse_connections: bool,
         device: str,
         dtype: t.dtype,
     ):
@@ -438,7 +450,6 @@ class SCAESuite(nn.Module):
         self.n_features = n_features
         self.target_C = target_C
         self.mask_type = mask_type
-        self.use_sparse_connections = use_sparse_connections
         self.device = device
 
         submodule_names = [
@@ -478,19 +489,18 @@ class SCAESuite(nn.Module):
         module_dict = {}
         for down in submodule_names:
             upstream_aes_for_module = {}
-            if self.use_sparse_connections:
-                for up in submodule_names:
-                    if not self.does_precede(up, down):
-                        continue
-                        
-                    if up.name in aes:
-                        upstream_aes_for_module[up.name] = aes[up.name]
-                    else:
-                        print(f"Warning: Upstream AE {up.name} not found in aes dictionary.")
-                        continue
+            for up in submodule_names:
+                if not self.does_precede(up, down):
+                    continue
+                    
+                if up.name in aes:
+                    upstream_aes_for_module[up.name] = aes[up.name]
+                else:
+                    print(f"Warning: Upstream AE {up.name} not found in aes dictionary.")
+                    continue
             
             connection_masks_for_module = None
-            if self.use_sparse_connections and self.target_C != -1 and upstream_aes_for_module:
+            if self.target_C != -1 and upstream_aes_for_module:
                 mask_components = {}
                 for up_key_loop_var in upstream_aes_for_module.keys():
                     down_ae_instance = aes[down.name]
@@ -524,7 +534,6 @@ class SCAESuite(nn.Module):
                 upstream_aes_for_module,
                 connection_masks_for_module,
                 down,
-                self.use_sparse_connections,
             )
 
         return nn.ModuleDict(module_dict)
@@ -637,9 +646,8 @@ class SCAESuite(nn.Module):
             target_C=config.get("target_C", -1),
             n_features=config["n_features"],
             mask_type=config.get("mask_type", "learnable"),
-            use_sparse_connections=config.get("use_sparse_connections", True),
-            dtype=dtype,
             device=device,
+            dtype=dtype,
         )
 
         checkpoint_path = hf_hub_download(
@@ -680,7 +688,6 @@ class SCAESuite(nn.Module):
             "n_features": self.n_features,
             "mask_type": self.mask_type,
             "target_C": self.target_C,
-            "use_sparse_connections": self.use_sparse_connections,
         }
 
         with tempfile.TemporaryDirectory() as tmp_dir:

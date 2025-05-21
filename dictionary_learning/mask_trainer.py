@@ -13,6 +13,10 @@ from transformer_lens import HookedTransformer
 from tqdm import tqdm
 import wandb as wb
 
+# Added imports
+import matplotlib.pyplot as plt
+import numpy as np
+
 from .mask_scae import SCAESuite, MergedSCAESuite
 from .top_k import AutoEncoderTopK, CrosscoderTopK
 
@@ -75,7 +79,6 @@ class SCAEConfig:
     batch_size: int = 16
     quantize_optimizer: bool = False
     sample_length: int = 512
-    use_sparse_connections: bool = True
 
     @property
     def wb_cfg(self):
@@ -189,12 +192,27 @@ class SCAETrainer:
 
         self.cfg = cfg
         self.rank = rank
+        self.world_size = world_size
+
+        # Histogram directory setup
+        self.histogram_dir = "feature_activation_histograms"
+        if self.rank == 0:
+            os.makedirs(self.histogram_dir, exist_ok=True)
 
         # Prepare optimizer and distributed dataloader
+        self.dataset = dataset
         self.model = self.load_model(self.device, dtype, cfg)
         self.loader = prepare_dataloader(dataset, world_size, rank, cfg)
 
         self.global_step = 0
+
+        if self.rank == 0:
+            print("SCAE Suite Module Dictionary Sizes:")
+            for name, module_instance in self.model.scae_suite.module_dict.items():
+                if hasattr(module_instance, 'ae') and hasattr(module_instance.ae, 'dict_size'):
+                    print(f"  Module {name}: Dict Size = {module_instance.ae.dict_size}")
+                else:
+                    print(f"  Module {name}: Dict Size not found or AE not as expected.")
 
         self.train()
 
@@ -274,21 +292,108 @@ class SCAETrainer:
             cfg.target_C,
             n_features,
             mask_type=cfg.mask_type,
-            use_sparse_connections=True,
             device=device,
             dtype=dtype,
         )
 
-        model = MergedSCAESuite(transformer, scae)
+        # --- New Encoder Bias Initialization based on Mean SCAE Feature Activations ---
+        temp_merged_model = MergedSCAESuite(transformer, scae)
+        num_batches_for_init = 10
+        final_mean_F_vectors_synced = {}
+        mean_F_values_rank0_cpu = {}
+
+        if self.rank == 0:
+            print("Rank 0: Starting NEW encoder bias initialization based on mean SCAE feature activations...")
+            temp_init_dataloader = DataLoader(self.dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+            module_feature_means_accumulator = {name: [] for name in scae.module_dict.keys()}
+            batches_processed_count = 0
+            initial_temperature = 1.0
+
+            print(f"Rank 0: Processing up to {num_batches_for_init} batches for SCAE feature activation collection...")
+            for i, batch_data in enumerate(temp_init_dataloader):
+                if i >= num_batches_for_init: break
+                current_input_ids = batch_data["input_ids"].to(device)
+                
+                with t.no_grad():
+                    _, pruned_features_output, _ = temp_merged_model(
+                        current_input_ids, 
+                        temperature=initial_temperature, 
+                        runtime_use_sparse_connections_override=False
+                    )
+                
+                for module_name, features_tensor in pruned_features_output.items():
+                    if module_name in module_feature_means_accumulator and features_tensor.numel() > 0:
+                        mean_batch_seq_features = features_tensor.mean(dim=(0, 1)).cpu()
+                        module_feature_means_accumulator[module_name].append(mean_batch_seq_features)
+                batches_processed_count += 1
+            
+            print(f"Rank 0: Processed {batches_processed_count} batches for SCAE feature activations.")
+
+            for module_name, means_list in module_feature_means_accumulator.items():
+                if means_list:
+                    final_F_cpu = t.stack(means_list).mean(dim=0)
+                    mean_F_values_rank0_cpu[module_name] = final_F_cpu
+                else:
+                    module_ae_dict_size = scae.module_dict[module_name].ae.dict_size
+                    mean_F_values_rank0_cpu[module_name] = t.zeros(module_ae_dict_size, dtype=dtype) # CPU tensor
+                    if batches_processed_count > 0: # Only warn if we expected data
+                       print(f"Rank 0: Warning - No SCAE features collected for module {module_name}. Using zeros for F.")
+            if batches_processed_count == 0:
+                print("Rank 0: Warning - No batches processed for SCAE features. All F values will be zero.")
+
+        ordered_module_names = list(scae.module_dict.keys())
+        broadcast_F_list = []
+        if self.rank == 0:
+            for name in ordered_module_names:
+                cpu_tensor = mean_F_values_rank0_cpu.get(name)
+                if cpu_tensor is None: # Fallback, though should be populated by prior logic
+                    module_ae_dict_size = scae.module_dict[name].ae.dict_size
+                    cpu_tensor = t.zeros(module_ae_dict_size, dtype=dtype)
+                broadcast_F_list.append(cpu_tensor.to(device=device, dtype=dtype))
+        else:
+            for name in ordered_module_names:
+                module_ae_dict_size = scae.module_dict[name].ae.dict_size
+                broadcast_F_list.append(t.zeros(module_ae_dict_size, device=device, dtype=dtype))
+        
+        if self.world_size > 1:
+            if self.rank == 0: print("Rank 0: Broadcasting mean SCAE feature F vectors...")
+            for i_tensor in range(len(broadcast_F_list)):
+                dist.broadcast(broadcast_F_list[i_tensor], src=0)
+            if self.rank == 0: print("Rank 0: Broadcast complete.")
+
+        for i_name, name in enumerate(ordered_module_names):
+            final_mean_F_vectors_synced[name] = broadcast_F_list[i_name]
+
+        if final_mean_F_vectors_synced:
+            if self.rank == 0: print("Applying synchronized mean SCAE F vectors to encoder biases...")
+            for module_idx, (module_name, scae_module_instance) in enumerate(scae.module_dict.items()):
+                if module_name in final_mean_F_vectors_synced:
+                    mean_F_for_module = final_mean_F_vectors_synced[module_name]
+                    actual_ae_instance = scae_module_instance.ae
+                    
+                    if hasattr(actual_ae_instance, 'encoder') and actual_ae_instance.encoder.bias is not None:
+                        with t.no_grad():
+                            actual_ae_instance.encoder.bias.copy_(-mean_F_for_module)
+                        if self.rank == 0 and module_idx < 5:
+                             print(f"Rank 0: Initialized bias for {module_name} using -F method.")
+                    elif self.rank == 0:
+                        print(f"Rank 0: Module {module_name} AE has no encoder with bias, skipping -F init for it.")
+                elif self.rank == 0:
+                     print(f"Rank 0: Mean SCAE F vector for module {module_name} not found after sync, skipping bias init.")
+        elif self.rank == 0:
+            print("Rank 0: Skipped -F encoder bias initialization as no mean SCAE F vectors were effectively computed/synced.")
+        # --- End of New Bias Initialization Logic ---
+
+        final_model_to_return = MergedSCAESuite(transformer, scae)
 
         # Create dead feature tracker
         if cfg.track_dead_features:
-            n_modules = len(model.scae_suite.module_dict)
+            n_modules = len(final_model_to_return.scae_suite.module_dict)
             self.num_tokens_since_fired = t.zeros(
                 (n_modules, n_features), device="cpu"
             )
 
-        return model
+        return final_model_to_return
 
     def _get_module(self, name: str):
         """Helper function to get the autoencoder for a given module."""
@@ -539,6 +644,72 @@ class SCAETrainer:
             
         return total_feature_fvu
 
+    def _log_feature_activation_histograms(
+        self,
+        pruned_features_dict: Dict[str, t.Tensor],
+        current_global_step: int,
+        batch_size: int,
+        seq_len: int,
+        log_suffix: str = "non_sparse"
+    ):
+        if self.rank != 0:
+            return
+
+        total_tokens_in_batch = batch_size * seq_len
+        if total_tokens_in_batch == 0:
+            print("Rank 0: Skipping histogram logging due to zero tokens in batch.")
+            return
+
+        for module_name, feature_acts_tensor in pruned_features_dict.items():
+            if not isinstance(feature_acts_tensor, t.Tensor) or feature_acts_tensor.numel() == 0:
+                print(f"Rank 0: Skipping histogram for {module_name} due to empty or invalid features tensor.")
+                continue
+
+            # feature_acts_tensor shape: [batch_size, seq_len, n_features_for_module]
+            # Move to CPU for numpy operations
+            feature_acts_cpu = feature_acts_tensor.detach().cpu()
+
+            # Count how many tokens each feature was active on
+            # A feature is active if its value > 1e-7 (to handle float precision)
+            num_active_tokens_per_feature = (feature_acts_cpu > 1e-7).sum(dim=(0, 1))
+
+            # Calculate proportion
+            proportions = num_active_tokens_per_feature / total_tokens_in_batch
+            
+            # log10(proportion + epsilon)
+            log_proportions_np = np.log10(proportions.numpy() + 1e-10)
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(log_proportions_np, bins=200, alpha=0.75, color='skyblue', edgecolor='black')
+            
+            # Add horizontal dotted line at y=64
+            ax.axhline(y=64, color='red', linestyle=':', alpha=0.7)
+            
+            title_suffix = "Sparse Connections: False" if log_suffix == "non_sparse" else "Sparse Connections: True"
+            ax.set_title(f"Feature Activation Frequencies: {module_name}\\nStep: {current_global_step} ({title_suffix})", fontsize=12)
+            ax.set_xlabel("log10(Proportion of Tokens Feature is Active)", fontsize=10)
+            ax.set_ylabel("Number of Features", fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            ax.set_yscale('log')  # Set y-axis to log scale
+            
+            # Set x and y axis limits
+            ax.set_xlim(-10, 0)
+            ax.set_ylim(1, 4000)
+            
+            # Improve layout
+            fig.tight_layout()
+
+            plot_filename = f"{module_name}_step{current_global_step}_{log_suffix}_act_hist.png"
+            plot_filepath = os.path.join(self.histogram_dir, plot_filename)
+            
+            try:
+                fig.savefig(plot_filepath)
+            except Exception as e:
+                print(f"Rank 0: Failed to save histogram {plot_filepath}. Error: {e}")
+            plt.close(fig) # Close the figure to free memory
+        if self.rank == 0:
+            print(f"Rank 0: Saved feature activation histograms for step {current_global_step} to {self.histogram_dir}")
+
     def get_mask_loss_and_log_c_metric(self, temperature: float) -> t.Tensor:
         total_mask_loss = t.tensor(0.0, device=self.device) # Ensure tensor is on correct device
         module_names_ordered = list(self.model.module.scae_suite.module_dict.keys())
@@ -626,6 +797,17 @@ class SCAETrainer:
             wb.log({"train/ce_loss_non_sparse_unscaled": ce_loss_non_sparse_val.item()}, step=self.global_step)
             wb.log({"train/fvu_loss_non_sparse_unscaled": fvu_loss_non_sparse_val.item()}, step=self.global_step)
 
+            # Log histograms for non-sparse features
+            if self.global_step in [0, 10, 20, 50, 100, 150, 200, 400, 800, 1200, 1600, 2000, 2400, 2800, 3200]:
+                b_size, s_len = input_ids.shape[0], input_ids.shape[1]
+                self._log_feature_activation_histograms(
+                    pruned_features_non_sparse,
+                    self.global_step,
+                    b_size,
+                    s_len,
+                    log_suffix="non_sparse"
+                )
+
         # Second Pass: sparse_connections = True
         # Note: This reuses the input_ids and temperature. If the model or cache needs to be reset or handled differently,
         # adjustments would be needed. The current MergedSCAESuite.forward re-calculates cache.
@@ -684,9 +866,9 @@ class SCAETrainer:
         total_loss += scaled_mask_loss
         if self.rank == 0: wb.log({"train/total_mask_loss_scaled": scaled_mask_loss.item()}, step=self.global_step)
 
-        # AuxK and Mask losses are currently ignored as per instruction.
-        # If they were to be added, their calculation would need to consider which pass (sparse/non-sparse)
-        # they apply to, or if they apply to both, and have their own coefficients.
+        # AuxK is currently ignored as per instruction.
+        # If it were to be added, its calculation would need to consider which pass (sparse/non-sparse)
+        # it applies to, or if it applies to both, and have its own coefficient.
 
         return total_loss
 

@@ -46,7 +46,7 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         self.k = k
 
         self.encoder = nn.Linear(activation_dim, dict_size)
-        self.encoder.weight.data /= 1000 # TODO: make configurable, or use a better init
+        self.encoder.weight.data /= 10 # TODO: make configurable, or use a better init
         self.encoder.bias.data.zero_()
 
         self.decoder = nn.Linear(dict_size, activation_dim, bias=False)
@@ -79,6 +79,7 @@ class AutoEncoderTopK(Dictionary, nn.Module):
             x = x.reshape(-1, orig_shape[-1])
 
         preact_BF = self.encoder(x)
+
         post_relu_feat_acts_BF = nn.functional.relu(preact_BF)
         post_topk = post_relu_feat_acts_BF.topk(
             self.k + n_threshold, sorted=True, dim=-1
@@ -93,6 +94,7 @@ class AutoEncoderTopK(Dictionary, nn.Module):
         encoded_acts_BF = buffer_BF.scatter_(
             dim=-1, index=top_indices_BK, src=tops_acts_BK
         )
+        
 
         # Reshape back to original batch dimensions if needed
         if len(orig_shape) == 3:
@@ -189,7 +191,7 @@ class CrosscoderTopK(Dictionary, nn.Module):
         self.n_outputs = n_outputs
 
         self.encoder = nn.Linear(activation_dim, dict_size)
-        self.encoder.weight.data /= 1000 # TODO: make configurable, or use a better init
+        self.encoder.weight.data /= 10 # TODO: make configurable, or use a better init
         self.encoder.bias.data.zero_()
 
         # Decoder weights [dict_size, n_outputs, activation_dim]
