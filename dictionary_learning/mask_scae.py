@@ -5,6 +5,9 @@ import einops
 import torch as t
 import torch.nn as nn
 from transformer_lens import ActivationCache, HookedTransformer
+import tempfile
+import os
+
 
 from .top_k import AutoEncoderTopK, CrosscoderTopK
 from .utils import LearnableMask, SimpleBinaryMask

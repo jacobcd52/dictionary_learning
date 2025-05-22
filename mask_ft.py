@@ -16,7 +16,7 @@ N_CPUS = 19 // 2
 
 
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 50_000_000
+N_TOKENS = 10_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_cc",
@@ -38,8 +38,8 @@ CFG = SCAEConfig(
     ce_loss_sparse_coeff=0,
     fvu_loss_coeff = 1.0,
     fvu_loss_sparse_coeff=1.0,
-    feature_act_fvu_coeff=0.1,
-    mask_loss_coeff=1e-5,
+    feature_act_fvu_coeff=0.02,
+    mask_loss_coeff=2e-5,
 )
 
 if __name__ == "__main__":

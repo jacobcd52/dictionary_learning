@@ -1,6 +1,7 @@
 import os
 import signal
 import sys
+import re # Added import for re
 from dataclasses import dataclass
 from typing import Dict, Union, Optional
 
@@ -183,6 +184,16 @@ def signal_handler(sig, frame):
 
 # Register signal handler for keyboard interrupts
 signal.signal(signal.SIGINT, signal_handler)
+
+
+# Helper function to sanitize repository names
+def sanitize_hf_name(name: str) -> str:
+    # Replace spaces and invalid characters with underscores
+    name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
+    # Remove leading/trailing hyphens or dots
+    name = re.sub(r"^[.-]+|[.-]+$", "", name)
+    # Ensure max length
+    return name[:96]
 
 
 class SCAETrainer:
@@ -833,7 +844,7 @@ class SCAETrainer:
 
         # Update dead feature tracker (using sparse features as decided)
         if self.cfg.track_dead_features: # AuxK is ignored, but dead feature tracking might still be useful for observation
-            self.update_dead_features(pruned_features_sparse, input_ids.numel())
+            self.update_dead_features(pruned_features_non_sparse, input_ids.numel())
 
         # Combine losses with coefficients
         total_loss = 0.0
@@ -922,7 +933,24 @@ class SCAETrainer:
                 self.global_step += 1
 
         if self.cfg.save_to_hf:
-            model_save_name = self.cfg.model_name.split("/")[-1]
-            hf_repo_save_id = f"{self.cfg.hf_username}/{model_save_name}_{self.cfg.wb_run_name}"
+            username = self.cfg.hf_username
+            model_name_part = self.cfg.model_name.split("/")[-1]
+            run_name_part = self.cfg.wb_run_name
+
+            # Sanitize the run name part specifically, as it's most likely to contain invalid characters
+            sanitized_run_name_specific = sanitize_hf_name(run_name_part)
+
+            # Combine model name and the specifically sanitized run name to form the repository name
+            repo_name_candidate = f"{model_name_part}_{sanitized_run_name_specific}"
+
+            # Sanitize the combined repository name to ensure it meets all HF naming rules
+            final_repo_name = sanitize_hf_name(repo_name_candidate)
+
+            # Construct the full repo_id, ensuring the slash is preserved
+            hf_repo_save_id = f"{username}/{final_repo_name}"
+            # No further global sanitization on hf_repo_save_id to protect the '/'
+
+            if self.rank == 0:
+                print(f"Attempting to use Hugging Face repo ID: {hf_repo_save_id}")
             self.model.module.scae_suite.upload_to_hf(repo_id=hf_repo_save_id)
         cleanup()
