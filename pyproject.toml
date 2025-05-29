@@ -17,6 +17,7 @@ dependencies = [
     "nnsight==0.3.7",
     "pandas>=2.2.1",
     "plotly>=5.18.0",
+    "sae_lens>=5.10.5",
     "torch>=2.1.2",
     "torchtyping>=0.1.4",
     "tqdm>=4.66.1",

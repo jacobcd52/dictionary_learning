@@ -519,13 +519,15 @@ def generate_feature_dashboard(
             act_data = torch.load(current_batch_activations_file, map_location='cpu')
             idx_tuple, val_tensor, shp = act_data['indices'], act_data['values'], act_data['shape']
             
-            dense_sample_feature_activations = torch.zeros(shp[1], dtype=torch.float32) 
+            dense_sample_feature_activations = torch.zeros(shp[1], dtype=val_tensor.dtype) # Use dtype from loaded tensor
             mask_for_sample_and_feature = (idx_tuple[0] == sample_idx_in_batch) & (idx_tuple[2] == feature_idx_in_module)
             seq_indices_for_s_f = idx_tuple[1][mask_for_sample_and_feature]
             vals_for_s_f = val_tensor[mask_for_sample_and_feature]
             
             if seq_indices_for_s_f.numel() > 0:
                  dense_sample_feature_activations.scatter_(0, seq_indices_for_s_f, vals_for_s_f)
+            else: # Handle case where there are no activations for this specific sample and feature
+                 dense_sample_feature_activations = torch.zeros(shp[1], dtype=val_tensor.dtype) # Still need to define it
             
             activations_for_context_window = dense_sample_feature_activations[start_idx:end_idx].tolist()
 
@@ -572,8 +574,12 @@ def generate_feature_dashboard(
                     logit_lens_html_content = "<p style='color: #ffcc00;'>Unknown AE type for logit lens.</p>"
 
                 if feature_vector_for_logit_lens is not None:
-                    feature_vector_for_logit_lens = feature_vector_for_logit_lens.to(model.W_U.device) # Ensure device match
+                    # Ensure feature_vector matches the dtype of model.W_U for matmul
+                    feature_vector_for_logit_lens = feature_vector_for_logit_lens.to(dtype=model.W_U.dtype, device=model.W_U.device)
                     with torch.no_grad():
+                        # ln_final typically expects float32 or the model's main working dtype
+                        # If ln_final itself is bfloat16 and W_U is bfloat16, this is fine.
+                        # If ln_final is float32, it's good feature_vector is also float32 (or compatible).
                         logit_lens_logits = model.ln_final(feature_vector_for_logit_lens) @ model.W_U
                     
                     top_val, top_ind = torch.topk(logit_lens_logits, k=10, dim=-1)

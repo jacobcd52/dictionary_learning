@@ -217,6 +217,7 @@ class SCAEAttention(SCAEModule):
         )
 
         down_enc = self.ae.encoder.weight
+
         initial_contrib_pre_moving = t.einsum(
             "b s i, h i o, d o -> b s h d",
             initial_act_post_ln,
@@ -668,6 +669,7 @@ class SCAESuite(nn.Module):
             print(f"Warning: Unexpected keys in state dict: {unexpected_keys}")
 
         suite.is_pretrained = True
+
         return suite
 
     def upload_to_hf(self, repo_id: str, private: bool = False):
