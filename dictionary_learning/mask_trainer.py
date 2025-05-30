@@ -286,7 +286,7 @@ class SCAETrainer:
 
     def load_model(self, device, dtype, cfg: SCAEConfig):
         transformer = (
-            HookedTransformer.from_pretrained_no_processing(
+            HookedTransformer.from_pretrained(
                 self.cfg.model_name,
             )
             .to(device)
