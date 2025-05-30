@@ -12,11 +12,10 @@ from utils import set_seed
 set_seed(42)
 
 
-N_CPUS = 19 // 2
-
+N_CPUS = mp.cpu_count() // 2
 
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 200_000_000
+N_TOKENS = 100_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_cc",
@@ -26,7 +25,7 @@ CFG = SCAEConfig(
     decay_start_ratio=0.7,
     epochs=1,
     batch_size=64,
-    k=128,
+    k=16,
     expansion_factor=10,
     sample_length=128,
     track_dead_features=True,
@@ -50,7 +49,7 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     dataset = load_dataset(
         PATH_TO_PILE,
-        split="train[:40%]",
+        split="train[:20%]",
         num_proc=N_CPUS,
     )
 
@@ -60,7 +59,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    mask_loss_coeffs_sweep = [0]
+    mask_loss_coeffs_sweep = [0, 1e-5]
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val
