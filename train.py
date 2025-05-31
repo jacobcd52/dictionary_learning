@@ -18,15 +18,15 @@ PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
 N_TOKENS = 100_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
-    wb_project="pythia_scae_cc",
+    wb_project="pythia_scae_cc_sweep",
     save_to_hf=True,
     hf_username="jacobcd52",
     warmup_ratio=0.00,
     decay_start_ratio=0.7,
     epochs=1,
-    batch_size=64,
+    batch_size=128,
     k=16,
-    expansion_factor=10,
+    expansion_factor=8,
     sample_length=128,
     track_dead_features=True,
     base_lr=5e-4,
@@ -36,8 +36,8 @@ CFG = SCAEConfig(
     ce_loss_coeff=0,
     ce_loss_sparse_coeff=0,
     fvu_loss_coeff = 1.0,
-    fvu_loss_sparse_coeff=0,
-    feature_act_fvu_coeff=0,
+    fvu_loss_sparse_coeff=1.0,
+    feature_act_fvu_coeff=0.1,
     mask_loss_coeff=0,
 )
 
@@ -59,7 +59,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    mask_loss_coeffs_sweep = [0, 1e-5]
+    mask_loss_coeffs_sweep = [1e-3, 3e-4, 1e-4, 3e-5]
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val

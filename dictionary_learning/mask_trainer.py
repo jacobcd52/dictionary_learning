@@ -309,7 +309,7 @@ class SCAETrainer:
 
         # --- New Encoder Bias Initialization based on Mean SCAE Feature Activations ---
         temp_merged_model = MergedSCAESuite(transformer, scae)
-        num_batches_for_init = 10
+        num_batches_for_init = 100
         final_mean_F_vectors_synced = {}
         mean_F_values_rank0_cpu = {}
 
@@ -572,7 +572,7 @@ class SCAETrainer:
                 
                 if self.rank == 0:
                     # wb.log({f"fvu_l2_loss/attn_{l}": l2_loss_attn.item()}, step=self.global_step) # Already removed by user
-                    wb.log({f"{log_prefix}fvu_variance/attn_{l}": variance_attn.item()}, step=self.global_step)
+                    # wb.log({f"{log_prefix}fvu_variance/attn_{l}": variance_attn.item()}, step=self.global_step) # Removed
                     wb.log({f"{log_prefix}fvu_contrib/attn_{attn_module_name}": current_fvu_attn.item()}, step=self.global_step)
 
 
@@ -610,7 +610,7 @@ class SCAETrainer:
 
             if self.rank == 0:
                 # wb.log({f"fvu_l2_loss/mlp_{j}": l2_loss_mlp_j.item()}, step=self.global_step) # Already removed by user
-                wb.log({f"{log_prefix}fvu_variance/mlp_{j}": variance_mlp_j.item()}, step=self.global_step)
+                # wb.log({f"{log_prefix}fvu_variance/mlp_{j}": variance_mlp_j.item()}, step=self.global_step) # Removed
                 wb.log({f"{log_prefix}fvu_contrib/mlp_{j}": current_fvu_mlp.item()}, step=self.global_step)
 
         final_fvu = sum_of_individual_fvus
@@ -743,7 +743,6 @@ class SCAETrainer:
             # C-Metric
             if hasattr(module_meta, 'connection_masks') and module_meta.connection_masks and self.rank == 0:
                 C_total_for_module = 0.0
-                num_mask_components = 0
                 for _up_mask_name, learnable_mask_instance in module_meta.connection_masks.items():
                     # Ensure learnable_mask_instance is on the correct device before calling it
                     # This might not be necessary if they are already correctly moved during model setup.
@@ -752,9 +751,7 @@ class SCAETrainer:
                     if mask.numel() > 0 and mask.shape[0] > 0 : # n_features_down > 0 and mask is not empty
                          c_contribution = mask.sum().item() / mask.shape[0]
                          C_total_for_module += c_contribution
-                         num_mask_components += 1
-                avg_C_for_module = C_total_for_module / num_mask_components if num_mask_components > 0 else 0.0
-                wb.log({f"C_metric/{name}": avg_C_for_module}, step=self.global_step)
+                wb.log({f"C/{name}": C_total_for_module}, step=self.global_step)
         
         if self.rank == 0:
             wb.log({"train/total_mask_loss_unscaled": total_mask_loss.item()}, step=self.global_step)
@@ -852,30 +849,30 @@ class SCAETrainer:
         # Non-sparse losses
         scaled_ce_loss_non_sparse = self.cfg.ce_loss_coeff * ce_loss_non_sparse_val
         total_loss += scaled_ce_loss_non_sparse
-        if self.rank == 0: wb.log({"train/ce_loss_non_sparse_scaled": scaled_ce_loss_non_sparse.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/ce_loss_non_sparse_scaled": scaled_ce_loss_non_sparse.item()}, step=self.global_step)
 
         scaled_fvu_loss_non_sparse = self.cfg.fvu_loss_coeff * fvu_loss_non_sparse_val
         total_loss += scaled_fvu_loss_non_sparse
-        if self.rank == 0: wb.log({"train/fvu_loss_non_sparse_scaled": scaled_fvu_loss_non_sparse.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/fvu_loss_non_sparse_scaled": scaled_fvu_loss_non_sparse.item()}, step=self.global_step)
 
         # Sparse losses
         scaled_ce_loss_sparse = self.cfg.ce_loss_sparse_coeff * ce_loss_sparse_val
         total_loss += scaled_ce_loss_sparse
-        if self.rank == 0: wb.log({"train/ce_loss_sparse_scaled": scaled_ce_loss_sparse.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/ce_loss_sparse_scaled": scaled_ce_loss_sparse.item()}, step=self.global_step)
         
         scaled_fvu_loss_sparse = self.cfg.fvu_loss_sparse_coeff * fvu_loss_sparse_val
         total_loss += scaled_fvu_loss_sparse
-        if self.rank == 0: wb.log({"train/fvu_loss_sparse_scaled": scaled_fvu_loss_sparse.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/fvu_loss_sparse_scaled": scaled_fvu_loss_sparse.item()}, step=self.global_step)
 
         # Feature Activation FVU loss
         scaled_feature_act_fvu = self.cfg.feature_act_fvu_coeff * feature_act_fvu_val
         total_loss += scaled_feature_act_fvu
-        if self.rank == 0: wb.log({"train/feature_act_fvu_scaled": scaled_feature_act_fvu.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/feature_act_fvu_scaled": scaled_feature_act_fvu.item()}, step=self.global_step)
         
         # Mask Loss
         scaled_mask_loss = self.cfg.mask_loss_coeff * mask_loss_val
         total_loss += scaled_mask_loss
-        if self.rank == 0: wb.log({"train/total_mask_loss_scaled": scaled_mask_loss.item()}, step=self.global_step)
+        # if self.rank == 0: wb.log({"train/total_mask_loss_scaled": scaled_mask_loss.item()}, step=self.global_step)
 
         # AuxK is currently ignored as per instruction.
         # If it were to be added, its calculation would need to consider which pass (sparse/non-sparse)
