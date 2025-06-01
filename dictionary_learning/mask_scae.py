@@ -233,6 +233,45 @@ class SCAEAttention(SCAEModule):
 
         return initial_contrib
 
+    def get_virtual_weights(
+        self,
+        up_name: str,
+        up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
+        down_enc: t.Tensor,
+        connection_mask: Optional[t.Tensor],
+    ) -> t.Tensor:
+        effective_up_dec_matrix = None
+
+        if isinstance(up_ae, AutoEncoderTopK):
+            effective_up_dec_matrix = up_ae.decoder.weight
+        elif isinstance(up_ae, CrosscoderTopK):
+            up_sm_name = SubmoduleName.from_str(up_name)
+            target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae.n_outputs))
+            relevant_indices = [
+                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae)
+                if target_layer < self.name.layer
+            ]
+
+            if relevant_indices:
+                summed_dec_transposed = up_ae.decoder_weight[:, relevant_indices, :].sum(dim=1)
+                effective_up_dec_matrix = summed_dec_transposed.transpose(-1,-2)
+            else:
+                effective_up_dec_matrix = t.zeros(
+                    (self.model.cfg.d_model, up_ae.dict_size),
+                    device=up_ae.decoder_weight.device,
+                    dtype=up_ae.decoder_weight.dtype
+                )
+
+        virtual_weights = t.einsum(
+            "d o, h i o, i u -> h d u",
+            down_enc,
+            self.W_OV,
+            effective_up_dec_matrix,
+        )
+        if connection_mask is not None:
+            virtual_weights = virtual_weights * connection_mask
+        return virtual_weights
+
     def get_pruned_contribs(
         self,
         cache: ActivationCache,
@@ -243,38 +282,8 @@ class SCAEAttention(SCAEModule):
     ) -> t.Tensor:
         down_enc = self.ae.encoder.weight
         
-        effective_up_dec_matrix = None
-
-        if isinstance(up_ae, AutoEncoderTopK):
-            effective_up_dec_matrix = up_ae.decoder.weight
-        elif isinstance(up_ae, CrosscoderTopK):
-            up_sm_name = SubmoduleName.from_str(up_name)
-            target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae.n_outputs))
-            relevant_indices = [
-                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
-                if target_layer < self.name.layer 
-            ]
-            
-            if relevant_indices:
-                summed_dec_transposed = up_ae.decoder_weight[:, relevant_indices, :].sum(dim=1) 
-                effective_up_dec_matrix = summed_dec_transposed.transpose(-1,-2)
-            else:
-                effective_up_dec_matrix = t.zeros(
-                    (self.model.cfg.d_model, up_ae.dict_size), 
-                    device=up_ae.decoder_weight.device, 
-                    dtype=up_ae.decoder_weight.dtype
-                )
+        virtual_weights = self.get_virtual_weights(up_name, up_ae, down_enc, connection_mask)
  
-        virtual_weights = t.einsum(
-            "d o, h i o, i u -> h d u",
-            down_enc,
-            self.W_OV,
-            effective_up_dec_matrix,
-        )
-
-        if connection_mask is not None:
-            virtual_weights = virtual_weights * connection_mask.unsqueeze(0)
-
         up_facts_post_ln = (
             up_pruned_features
             / cache[f"blocks.{self.name.layer}.ln1.hook_scale"]
@@ -359,16 +368,13 @@ class SCAECrossCoder(SCAEModule):
 
         return initial_act_input @ down_enc.T
 
-    def get_pruned_contribs(
+    def get_virtual_weights(
         self,
-        cache: ActivationCache,
         up_name: str,
         up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
-        connection_mask: t.Tensor,
-        up_pruned_features: t.Tensor,
+        down_enc: t.Tensor,
+        connection_mask: Optional[t.Tensor],
     ) -> t.Tensor:
-        down_enc = self.ae.encoder.weight
-
         effective_up_dec_matrix = None
 
         if isinstance(up_ae, AutoEncoderTopK):
@@ -377,10 +383,10 @@ class SCAECrossCoder(SCAEModule):
             up_sm_name = SubmoduleName.from_str(up_name)
             target_mlp_layers_for_up_ae = list(range(up_sm_name.layer, up_sm_name.layer + up_ae.n_outputs))
             relevant_indices = [
-                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae) 
+                idx for idx, target_layer in enumerate(target_mlp_layers_for_up_ae)
                 if target_layer < self.name.layer
             ]
-            
+
             if relevant_indices:
                 summed_dec_transposed = up_ae.decoder_weight[:, relevant_indices, :].sum(dim=1)
                 effective_up_dec_matrix = summed_dec_transposed.transpose(-1,-2)
@@ -392,10 +398,22 @@ class SCAECrossCoder(SCAEModule):
                 )
         
         virtual_weights = down_enc @ effective_up_dec_matrix
-        
         if connection_mask is not None:
             virtual_weights = virtual_weights * connection_mask
+        return virtual_weights
 
+    def get_pruned_contribs(
+        self,
+        cache: ActivationCache,
+        up_name: str,
+        up_ae: Union[AutoEncoderTopK, CrosscoderTopK],
+        connection_mask: t.Tensor,
+        up_pruned_features: t.Tensor,
+    ) -> t.Tensor:
+        down_enc = self.ae.encoder.weight
+
+        virtual_weights = self.get_virtual_weights(up_name, up_ae, down_enc, connection_mask)
+        
         up_facts_post_ln = (
             up_pruned_features
         )
