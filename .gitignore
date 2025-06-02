@@ -4,13 +4,10 @@ interp/output_activations_pile
 sae_checkpoints/
 noteboooks/importance_scores
 
-tinystories_connections
-
-# Saved connections tensor
-connections_100.pkl
-connections_TinyStories-33M_100.pkl
-/root/dictionary_learning/connections_100.pkl
-/root/dictionary_learning/connections_TinyStories-33M_100.pkl
+# Histograms
+downstream_connection_histograms/
+feature_activation_histograms/
+soft_mask_value_histograms/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

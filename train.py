@@ -63,7 +63,7 @@ if __name__ == "__main__":
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val
-        CFG.wb_run_name = f"k{CFG.k} mask{CFG.mask_loss_coeff} fact_fvu{CFG.feature_act_fvu_coeff} fvu_sparse{CFG.fvu_loss_sparse_coeff} fvu{CFG.fvu_loss_coeff} lr{CFG.base_lr}"
+        CFG.wb_run_name = f"allstart k{CFG.k} mask{CFG.mask_loss_coeff} fact_fvu{CFG.feature_act_fvu_coeff} fvu_sparse{CFG.fvu_loss_sparse_coeff} fvu{CFG.fvu_loss_coeff} lr{CFG.base_lr}"
 
         mp.spawn(
             SCAETrainer,

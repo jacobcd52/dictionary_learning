@@ -781,7 +781,7 @@ class SCAETrainer:
 
             data_to_plot = total_connections_per_downstream_feature.detach().cpu().numpy()
             fig, ax = plt.subplots(figsize=(10, 6))
-            ax.hist(data_to_plot, bins=100, alpha=0.75, color='coral', edgecolor='black')
+            ax.hist(data_to_plot, bins=300, alpha=0.75, color='coral', edgecolor='black')
             del data_to_plot # Memory cleanup
             del total_connections_per_downstream_feature # Memory cleanup
             
@@ -869,7 +869,7 @@ class SCAETrainer:
             del all_sampled_soft_mask_values_for_ds_module # Memory cleanup: list is now an array
 
             fig, ax = plt.subplots(figsize=(10, 6))
-            ax.hist(all_sampled_soft_mask_values_np, bins=100, alpha=0.75, color='mediumpurple', edgecolor='black', range=(0,1)) # Soft mask values are between 0 and 1
+            ax.hist(all_sampled_soft_mask_values_np, bins=100, alpha=0.75, color='mediumpurple', edgecolor='black') # Soft mask values are between 0 and 1
             del all_sampled_soft_mask_values_np # Memory cleanup
             
             ax.set_title(f"Soft Mask Values Distribution: {ds_module_name}\nStep: {current_global_step}, Temp: {temperature}", fontsize=12)
@@ -877,7 +877,7 @@ class SCAETrainer:
             ax.set_ylabel("Frequency", fontsize=10)
             ax.grid(True, linestyle='--', alpha=0.6)
             # ax.set_yscale('log') # Optional: use log scale if distribution is very skewed
-            ax.set_xlim(0, 1)
+            # ax.set_xlim(0, 1)
 
             fig.tight_layout()
             plot_filename = f"{ds_module_name}_step{current_global_step}_soft_mask_values_hist.png"
@@ -977,7 +977,7 @@ class SCAETrainer:
             wb.log({"train/fvu_loss_non_sparse_unscaled": fvu_loss_non_sparse_val.item()}, step=self.global_step)
 
             # Log histograms for non-sparse features
-            if self.global_step in [0, 10, 20, 50, 100, 150, 200, 400, 800, 1200, 1600, 2000, 2400, 2800, 3200]:
+            if self.global_step in [0, 10, 20, 50, 100, 150, 200, 250, 300, 350, 400, 600, 800, 1200, 1600, 2000, 2400, 2800, 3200]:
                 b_size, s_len = input_ids.shape[0], input_ids.shape[1]
                 self._log_feature_activation_histograms(
                     pruned_features_non_sparse,
