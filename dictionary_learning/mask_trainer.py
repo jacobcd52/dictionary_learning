@@ -206,9 +206,13 @@ class SCAETrainer:
         self.world_size = world_size
 
         # Histogram directory setup
-        self.histogram_dir = "feature_activation_histograms"
+        self.feature_act_histogram_dir = "feature_activation_histograms"
+        self.downstream_conn_histogram_dir = "downstream_connection_histograms"
+        self.soft_mask_histogram_dir = "soft_mask_value_histograms"
         if self.rank == 0:
-            os.makedirs(self.histogram_dir, exist_ok=True)
+            os.makedirs(self.feature_act_histogram_dir, exist_ok=True)
+            os.makedirs(self.downstream_conn_histogram_dir, exist_ok=True)
+            os.makedirs(self.soft_mask_histogram_dir, exist_ok=True)
 
         # Prepare optimizer and distributed dataloader
         self.dataset = dataset
@@ -711,15 +715,182 @@ class SCAETrainer:
             fig.tight_layout()
 
             plot_filename = f"{module_name}_step{current_global_step}_{log_suffix}_act_hist.png"
-            plot_filepath = os.path.join(self.histogram_dir, plot_filename)
+            plot_filepath = os.path.join(self.feature_act_histogram_dir, plot_filename)
             
             try:
                 fig.savefig(plot_filepath)
             except Exception as e:
                 print(f"Rank 0: Failed to save histogram {plot_filepath}. Error: {e}")
             plt.close(fig) # Close the figure to free memory
+            del log_proportions_np # Memory cleanup
+            del feature_acts_cpu # Memory cleanup
         if self.rank == 0:
-            print(f"Rank 0: Saved feature activation histograms for step {current_global_step} to {self.histogram_dir}")
+            print(f"Rank 0: Saved feature activation histograms for step {current_global_step} to {self.feature_act_histogram_dir}")
+
+    def _log_downstream_connection_histograms(
+        self,
+        current_global_step: int,
+    ):
+        if self.rank != 0:
+            return
+
+        if not hasattr(self.model.module, 'scae_suite') or not hasattr(self.model.module.scae_suite, 'module_dict'):
+            print("Rank 0: SCAE suite or module_dict not found. Skipping downstream connection histograms.")
+            return
+
+        scae_suite = self.model.module.scae_suite
+        ordered_downstream_module_names = list(scae_suite.module_dict.keys())
+
+        for ds_module_name in ordered_downstream_module_names:
+            downstream_module_instance = scae_suite.module_dict[ds_module_name]
+            if downstream_module_instance is None or not hasattr(downstream_module_instance, 'connection_masks') or not downstream_module_instance.connection_masks:
+                print(f"Rank 0: No connection masks for downstream module {ds_module_name}. Skipping.")
+                continue
+
+            if not hasattr(downstream_module_instance.ae, 'dict_size'):
+                print(f"Rank 0: Downstream module {ds_module_name} AE has no dict_size. Skipping.")
+                continue
+            
+            num_downstream_features = downstream_module_instance.ae.dict_size
+            if num_downstream_features == 0:
+                print(f"Rank 0: Downstream module {ds_module_name} has 0 features. Skipping histogram.")
+                continue
+            
+            total_connections_per_downstream_feature = t.zeros(num_downstream_features, device='cpu')
+
+            for _up_mask_name, learnable_mask_instance in downstream_module_instance.connection_masks.items():
+                # Get hard mask
+                hard_mask = learnable_mask_instance(temperature=0.0, hard=True) # Expected shape [f_down, f_up]
+                
+                if hard_mask.numel() == 0:
+                    # print(f"Rank 0: Empty hard_mask for {ds_module_name} from {_up_mask_name}. Skipping this upstream mask.")
+                    continue
+                
+                if hard_mask.shape[0] != num_downstream_features:
+                    print(f"Rank 0: Shape mismatch for {ds_module_name} from {_up_mask_name}. Expected {num_downstream_features} downstream features, got {hard_mask.shape[0]}. Skipping.")
+                    continue
+
+                # Sum connections for each downstream feature from this upstream mask
+                # Ensure hard_mask is on CPU before summing for accumulation on CPU tensor
+                connections_from_this_upstream = hard_mask.sum(dim=1).float().cpu()
+                total_connections_per_downstream_feature += connections_from_this_upstream
+            
+            if total_connections_per_downstream_feature.numel() == 0:
+                print(f"Rank 0: No connection data for {ds_module_name} after processing all upstreams. Skipping histogram.")
+                continue
+
+            data_to_plot = total_connections_per_downstream_feature.detach().cpu().numpy()
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(data_to_plot, bins=100, alpha=0.75, color='coral', edgecolor='black')
+            del data_to_plot # Memory cleanup
+            del total_connections_per_downstream_feature # Memory cleanup
+            
+            ax.set_title(f"Downstream Feature Connections: {ds_module_name}\nStep: {current_global_step}", fontsize=12)
+            ax.set_xlabel("Number of Non-Zero Upstream Connections to a Downstream Feature", fontsize=10)
+            ax.set_ylabel("Count of Downstream Features", fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            ax.set_yscale('log')
+            
+            # Adjust x-axis limits if needed, e.g., based on max possible connections or observed data
+            # ax.set_xlim(0, total_connections_per_downstream_feature.max().item() + 1)
+
+            fig.tight_layout()
+            plot_filename = f"{ds_module_name}_step{current_global_step}_downstream_connections_hist.png"
+            plot_filepath = os.path.join(self.downstream_conn_histogram_dir, plot_filename)
+            
+            try:
+                fig.savefig(plot_filepath)
+            except Exception as e:
+                print(f"Rank 0: Failed to save downstream connection histogram {plot_filepath}. Error: {e}")
+            plt.close(fig)
+            
+        if self.rank == 0:
+            print(f"Rank 0: Saved downstream connection histograms for step {current_global_step} to {self.downstream_conn_histogram_dir}")
+
+    def _log_soft_mask_value_histograms(
+        self,
+        current_global_step: int,
+        num_samples_per_mask: int = 1000,
+        temperature: float = 1.0,
+    ):
+        if self.rank != 0:
+            return
+
+        if not hasattr(self.model.module, 'scae_suite') or not hasattr(self.model.module.scae_suite, 'module_dict'):
+            print("Rank 0: SCAE suite or module_dict not found. Skipping soft mask value histograms.")
+            return
+
+        scae_suite = self.model.module.scae_suite
+        ordered_downstream_module_names = list(scae_suite.module_dict.keys())
+
+        for ds_module_name in ordered_downstream_module_names:
+            downstream_module_instance = scae_suite.module_dict[ds_module_name]
+            if downstream_module_instance is None or not hasattr(downstream_module_instance, 'connection_masks') or not downstream_module_instance.connection_masks:
+                print(f"Rank 0: No connection masks for downstream module {ds_module_name}. Skipping soft mask histogram.")
+                continue
+
+            all_sampled_soft_mask_values_for_ds_module = []
+
+            for _up_mask_name, learnable_mask_instance in downstream_module_instance.connection_masks.items():
+                soft_mask = learnable_mask_instance(temperature=temperature, hard=False) # Expected shape [f_down, f_up]
+
+                if soft_mask.numel() == 0:
+                    # print(f"Rank 0: Empty soft_mask for {ds_module_name} from {_up_mask_name}. Skipping sampling for this upstream mask.")
+                    continue
+                
+                # Flatten the mask and sample
+                soft_mask_flat = soft_mask.flatten()
+                num_elements_to_sample = min(num_samples_per_mask, soft_mask_flat.numel())
+                
+                if num_elements_to_sample == 0:
+                    continue
+
+                # Efficiently sample random indices without replacement if num_elements_to_sample is small relative to numel()
+                # otherwise, sample with replacement might be fine or just take all if num_elements_to_sample == soft_mask_flat.numel()
+                if num_elements_to_sample == soft_mask_flat.numel():
+                    sampled_indices = t.arange(soft_mask_flat.numel(), device=soft_mask_flat.device)
+                else:
+                    # Ensure we don't ask for more samples than available unique elements for `choice` without replacement
+                    # For large tensors, `torch.randperm` and slicing is efficient for sampling without replacement.
+                    # For smaller `num_elements_to_sample` relative to `soft_mask_flat.numel()`, `torch.multinomial` can be used if we want to sample indices
+                    # but `torch.randperm` is generally good for this use case.
+                    perm = t.randperm(soft_mask_flat.numel(), device=soft_mask_flat.device)
+                    sampled_indices = perm[:num_elements_to_sample]
+                
+                sampled_values = soft_mask_flat[sampled_indices].detach().float().cpu().numpy()
+                all_sampled_soft_mask_values_for_ds_module.extend(sampled_values)
+                del sampled_values # Memory cleanup
+
+            if not all_sampled_soft_mask_values_for_ds_module:
+                print(f"Rank 0: No soft mask values sampled for {ds_module_name}. Skipping histogram.")
+                continue
+            
+            all_sampled_soft_mask_values_np = np.array(all_sampled_soft_mask_values_for_ds_module)
+            del all_sampled_soft_mask_values_for_ds_module # Memory cleanup: list is now an array
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.hist(all_sampled_soft_mask_values_np, bins=100, alpha=0.75, color='mediumpurple', edgecolor='black', range=(0,1)) # Soft mask values are between 0 and 1
+            del all_sampled_soft_mask_values_np # Memory cleanup
+            
+            ax.set_title(f"Soft Mask Values Distribution: {ds_module_name}\nStep: {current_global_step}, Temp: {temperature}", fontsize=12)
+            ax.set_xlabel("Sampled Soft Mask Connection Strength", fontsize=10)
+            ax.set_ylabel("Frequency", fontsize=10)
+            ax.grid(True, linestyle='--', alpha=0.6)
+            # ax.set_yscale('log') # Optional: use log scale if distribution is very skewed
+            ax.set_xlim(0, 1)
+
+            fig.tight_layout()
+            plot_filename = f"{ds_module_name}_step{current_global_step}_soft_mask_values_hist.png"
+            plot_filepath = os.path.join(self.soft_mask_histogram_dir, plot_filename)
+            
+            try:
+                fig.savefig(plot_filepath)
+            except Exception as e:
+                print(f"Rank 0: Failed to save soft mask value histogram {plot_filepath}. Error: {e}")
+            plt.close(fig)
+
+        if self.rank == 0:
+            print(f"Rank 0: Saved soft mask value histograms for step {current_global_step} to {self.soft_mask_histogram_dir}")
 
     def get_mask_loss_and_log_c_metric(self, temperature: float) -> t.Tensor:
         total_mask_loss = t.tensor(0.0, device=self.device) # Ensure tensor is on correct device
@@ -815,6 +986,8 @@ class SCAETrainer:
                     s_len,
                     log_suffix="non_sparse"
                 )
+                self._log_downstream_connection_histograms(self.global_step)
+                self._log_soft_mask_value_histograms(self.global_step)
 
         # Second Pass: sparse_connections = True
         # Note: This reuses the input_ids and temperature. If the model or cache needs to be reset or handled differently,

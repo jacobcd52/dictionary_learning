@@ -10,7 +10,7 @@ import os
 
 
 from .top_k import AutoEncoderTopK, CrosscoderTopK
-from .utils import LearnableMask, SimpleBinaryMask
+from .utils import SimpleBinaryMask
 
 from utils import set_seed
 
@@ -531,20 +531,14 @@ class SCAESuite(nn.Module):
                     n_down_features = down_ae_instance.dict_size
                     n_up_features = up_ae_instance.dict_size
 
-                    if self.mask_type == "learnable":
-                        mask_instance = LearnableMask(
-                            n_features_down=n_down_features,
-                            n_features_up=n_up_features,
-                            target_C=self.target_C,
-                        )
-                    elif self.mask_type == "simple":
+                    if self.mask_type == "simple":
                         mask_instance = SimpleBinaryMask(
                             n_features_down=n_down_features,
                             n_features_up=n_up_features,
                             target_C=self.target_C,
                         )
                     else:
-                        raise ValueError(f"Unsupported mask_type: {self.mask_type}. Choose 'learnable' or 'simple'.")
+                        raise ValueError(f"Unsupported mask_type: {self.mask_type}. Choose 'simple'.")
                     
                     mask_components[up_key_loop_var] = mask_instance.to(self.device).to(self.dtype)
                 connection_masks_for_module = nn.ModuleDict(mask_components)
@@ -667,7 +661,7 @@ class SCAESuite(nn.Module):
             k=config["k"],
             target_C=config.get("target_C", -1),
             n_features=config["n_features"],
-            mask_type=config.get("mask_type", "learnable"),
+            mask_type=config.get("mask_type", "simple"),
             device=device,
             dtype=dtype,
         )
@@ -758,8 +752,6 @@ class MergedSCAESuite(nn.Module):
         for module in self.scae_suite.module_dict.values():
             for submodule in module.modules():
                 if isinstance(submodule, (AutoEncoderTopK, CrosscoderTopK)):
-                    params.extend(submodule.parameters())
-                elif isinstance(submodule, LearnableMask):
                     params.extend(submodule.parameters())
                 elif isinstance(submodule, SimpleBinaryMask):
                     params.extend(submodule.parameters())

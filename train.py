@@ -15,7 +15,7 @@ set_seed(42)
 N_CPUS = mp.cpu_count() // 2
 
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 100_000_000
+N_TOKENS = 10_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_cc_sweep",
