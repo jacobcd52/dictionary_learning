@@ -74,6 +74,8 @@ class SCAEConfig:
     feature_act_fvu_coeff: float = 0.0
     mask_loss_coeff: float = 1e-5
 
+    sparse_warmup: float = 0.1 # New config for sparse loss warmup proportion
+
     warmup_ratio: float = 0.05
     decay_start_ratio: float = 0.7
     epochs: int = 1
@@ -101,6 +103,7 @@ class SCAEConfig:
             "fvu_loss_sparse_coeff": self.fvu_loss_sparse_coeff,
             "feature_act_fvu_coeff": self.feature_act_fvu_coeff,
             "mask_loss_coeff": self.mask_loss_coeff,
+            "sparse_warmup": self.sparse_warmup,
         }
 
 
@@ -646,7 +649,7 @@ class SCAETrainer:
             l2_loss = (features_non_sparse - features_sparse).pow(2).sum()
             variance = (features_non_sparse - features_non_sparse.mean(dim=(0, 1), keepdim=True)).pow(2).sum() + 1e-8
             
-            current_fvu = l2_loss / variance
+            current_fvu = l2_loss / variance.detach() # detach to avoid encouraging feature acts to be higher-variance
             total_feature_fvu += current_fvu
             
             if self.rank == 0:
@@ -963,6 +966,26 @@ class SCAETrainer:
     def train_step(self, model: MergedSCAESuite, input_ids: t.Tensor):
         temperature = self._get_temperature()
         
+        # Calculate sparse loss warmup coefficient
+        sparse_warmup_steps = int(self.cfg.sparse_warmup * self.total_training_steps)
+        sparse_loss_warmup_coeff = 1.0 # Default to 1.0
+
+        if sparse_warmup_steps > 0: # Only apply warmup if there are steps configured for it
+            if self.global_step < sparse_warmup_steps:
+                if sparse_warmup_steps == 1: # If warmup is for a single step
+                    sparse_loss_warmup_coeff = 1.0 
+                else:
+                    # Linearly ramp from 0 at global_step 0 to 1 at global_step (sparse_warmup_steps - 1)
+                    sparse_loss_warmup_coeff = self.global_step / (sparse_warmup_steps - 1.0)
+            else: # After warmup period
+                sparse_loss_warmup_coeff = 1.0
+        
+        # Clamp to ensure it's within [0, 1]
+        sparse_loss_warmup_coeff = min(1.0, max(0.0, sparse_loss_warmup_coeff))
+
+        if self.rank == 0:
+            wb.log({"train/sparse_loss_warmup_coeff": sparse_loss_warmup_coeff}, step=self.global_step)
+
         # First Pass: sparse_connections = False
         reconstructions_non_sparse, pruned_features_non_sparse, cache_non_sparse = model(
             input_ids, temperature, runtime_use_sparse_connections_override=False
@@ -1022,30 +1045,24 @@ class SCAETrainer:
         # Non-sparse losses
         scaled_ce_loss_non_sparse = self.cfg.ce_loss_coeff * ce_loss_non_sparse_val
         total_loss += scaled_ce_loss_non_sparse
-        # if self.rank == 0: wb.log({"train/ce_loss_non_sparse_scaled": scaled_ce_loss_non_sparse.item()}, step=self.global_step)
 
         scaled_fvu_loss_non_sparse = self.cfg.fvu_loss_coeff * fvu_loss_non_sparse_val
         total_loss += scaled_fvu_loss_non_sparse
-        # if self.rank == 0: wb.log({"train/fvu_loss_non_sparse_scaled": scaled_fvu_loss_non_sparse.item()}, step=self.global_step)
 
-        # Sparse losses
+        # Sparse losses - apply warmup coefficient
         scaled_ce_loss_sparse = self.cfg.ce_loss_sparse_coeff * ce_loss_sparse_val
-        total_loss += scaled_ce_loss_sparse
-        # if self.rank == 0: wb.log({"train/ce_loss_sparse_scaled": scaled_ce_loss_sparse.item()}, step=self.global_step)
+        total_loss += sparse_loss_warmup_coeff * scaled_ce_loss_sparse
         
         scaled_fvu_loss_sparse = self.cfg.fvu_loss_sparse_coeff * fvu_loss_sparse_val
-        total_loss += scaled_fvu_loss_sparse
-        # if self.rank == 0: wb.log({"train/fvu_loss_sparse_scaled": scaled_fvu_loss_sparse.item()}, step=self.global_step)
+        total_loss += sparse_loss_warmup_coeff * scaled_fvu_loss_sparse
 
-        # Feature Activation FVU loss
+        # Feature Activation FVU loss - apply warmup coefficient
         scaled_feature_act_fvu = self.cfg.feature_act_fvu_coeff * feature_act_fvu_val
-        total_loss += scaled_feature_act_fvu
-        # if self.rank == 0: wb.log({"train/feature_act_fvu_scaled": scaled_feature_act_fvu.item()}, step=self.global_step)
+        total_loss += sparse_loss_warmup_coeff * scaled_feature_act_fvu
         
-        # Mask Loss
+        # Mask Loss - apply warmup coefficient
         scaled_mask_loss = self.cfg.mask_loss_coeff * mask_loss_val
-        total_loss += scaled_mask_loss
-        # if self.rank == 0: wb.log({"train/total_mask_loss_scaled": scaled_mask_loss.item()}, step=self.global_step)
+        total_loss += sparse_loss_warmup_coeff * scaled_mask_loss
 
         # AuxK is currently ignored as per instruction.
         # If it were to be added, its calculation would need to consider which pass (sparse/non-sparse)
@@ -1057,8 +1074,9 @@ class SCAETrainer:
         pass
 
     def train(self):
+        self.total_training_steps = len(self.loader) * self.cfg.epochs # Calculate total training steps
         optimizer, scheduler = prepare_optim_and_scheduler(
-            self.model, len(self.loader), self.cfg
+            self.model, self.total_training_steps, self.cfg
         )
 
         self.model = DDP(

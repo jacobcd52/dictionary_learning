@@ -4,6 +4,7 @@ from datasets import load_dataset
 import torch as t
 import torch.multiprocessing as mp
 from transformers import AutoTokenizer
+from transformer_lens import utils
 
 from dictionary_learning.buffer import chunk_and_tokenize
 from dictionary_learning.mask_trainer import SCAETrainer, SCAEConfig
@@ -22,7 +23,7 @@ CFG = SCAEConfig(
     save_to_hf=True,
     hf_username="jacobcd52",
     warmup_ratio=0.00,
-    decay_start_ratio=0.7,
+    decay_start_ratio=0.9,
     epochs=1,
     batch_size=128,
     k=16,
@@ -38,7 +39,8 @@ CFG = SCAEConfig(
     fvu_loss_coeff = 1.0,
     fvu_loss_sparse_coeff=1.0,
     feature_act_fvu_coeff=0.2,
-    mask_loss_coeff=0,
+    mask_loss_coeff=3e-4,
+    sparse_warmup=0.3,
 )
 
 if __name__ == "__main__":
@@ -46,12 +48,13 @@ if __name__ == "__main__":
     # t.backends.cudnn.deterministic = True
 
     tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
-    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer = utils.get_tokenizer_with_bos(tokenizer)
     dataset = load_dataset(
         PATH_TO_PILE,
         split="train[:20%]",
         num_proc=N_CPUS,
     )
+    dataset = dataset.shuffle(seed=42)
 
     dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length, num_proc=N_CPUS)
     dataset = dataset.select(range(N_TOKENS // CFG.sample_length))
@@ -59,11 +62,11 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    mask_loss_coeffs_sweep = [1e-3, 1e-2, 1e-4]
+    mask_loss_coeffs_sweep = [3e-4]
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val
-        CFG.wb_run_name = f"allstart k{CFG.k} mask{CFG.mask_loss_coeff} fact_fvu{CFG.feature_act_fvu_coeff} fvu_sparse{CFG.fvu_loss_sparse_coeff} fvu{CFG.fvu_loss_coeff} lr{CFG.base_lr}"
+        CFG.wb_run_name = f"warmup{CFG.sparse_warmup} k{CFG.k} mask{CFG.mask_loss_coeff} fact_fvu{CFG.feature_act_fvu_coeff} fvu_sparse{CFG.fvu_loss_sparse_coeff} fvu{CFG.fvu_loss_coeff} lr{CFG.base_lr}"
 
         mp.spawn(
             SCAETrainer,
