@@ -15,7 +15,7 @@ set_seed(42)
 N_CPUS = mp.cpu_count() // 2
 
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"
-N_TOKENS = 10_000_000
+N_TOKENS = 30_000_000
 CFG = SCAEConfig(
     model_name="EleutherAI/pythia-70m",
     wb_project="pythia_scae_cc_sweep",
@@ -37,7 +37,7 @@ CFG = SCAEConfig(
     ce_loss_sparse_coeff=0,
     fvu_loss_coeff = 1.0,
     fvu_loss_sparse_coeff=1.0,
-    feature_act_fvu_coeff=0.1,
+    feature_act_fvu_coeff=0.2,
     mask_loss_coeff=0,
 )
 
@@ -59,7 +59,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    mask_loss_coeffs_sweep = [1e-3, 3e-4, 1e-4, 3e-5]
+    mask_loss_coeffs_sweep = [1e-3, 1e-2, 1e-4]
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val

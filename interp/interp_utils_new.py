@@ -10,6 +10,7 @@ import shutil
 from typing import List, Dict, Tuple, Optional, Union, Any
 from IPython.display import display, HTML
 import numpy as np
+import html # Added import
 # import matplotlib.colors # No longer needed for token display
 # import matplotlib.pyplot as plt # No longer needed for token display, keep for future hist if any
 
@@ -290,8 +291,16 @@ def create_logit_lens_html(top_ind, top_val, bot_ind, bot_val, tokenizer: PreTra
     """
     
     # Decode tokens
-    top_text = [tokenizer.decode(tok).replace(" ", "&nbsp;").replace("\\n", "<br>") for tok in top_ind[:k]]
-    bot_text = [tokenizer.decode(tok).replace(" ", "&nbsp;").replace("\\n", "<br>") for tok in bot_ind[:k]]
+    def format_token_for_logit_lens(token_id_list, tokenizer_ref):
+        # tokenizer.decode can take a list of a single id
+        decoded = tokenizer_ref.decode(token_id_list)
+        # Escape HTML special characters first to prevent misinterpretation
+        escaped = html.escape(decoded)
+        # Then, replace spaces with underscores and actual newlines with '\n' string
+        return escaped.replace(" ", "_").replace("\n", "\\n")
+
+    top_text = [format_token_for_logit_lens([tok], tokenizer) for tok in top_ind[:k]]
+    bot_text = [format_token_for_logit_lens([tok], tokenizer) for tok in bot_ind[:k]]
     
     # Create HTML template with direct background color attributes
     html_template = """
@@ -367,32 +376,39 @@ def _get_context_html(
     for token_id in tokens:
         # Use decode for single tokens to get the string representation, including prefixes like 'Ġ'
         # or handle special tokens.
-        # The .replace(' ', '&nbsp;') part should apply to the decoded string.
-        # The .replace('\\n', '<br>') makes actual newlines for HTML.
-        # The original interp_utils.py uses tokenizer.decode(t).replace('Ġ', '&nbsp').replace('\\n', '\\n')
-        # The \\n might be for display in a context that interprets it. For direct HTML, <br> is better.
-        # Let's stick to making spaces non-breaking and newlines as <br> for direct HTML.
         
         # Decode a single token ID. Pass as a list to decode for robustness with some tokenizers.
         tok_str = tokenizer.decode([token_id])
 
+        display_token: str
         if tok_str == tokenizer.eos_token or tok_str == tokenizer.bos_token or tok_str == tokenizer.pad_token:
-            display_token = f"[{tok_str.upper()}]"
+            # For special tokens, escape them and then wrap in brackets
+            display_token = f"[{html.escape(tok_str.upper())}]"
         else:
-            # Standardize space handling: 'Ġ' (GPT-style) or leading space (other models) -> &nbsp;
-            # BPE pieces (not starting with space marker) are kept as is.
-            if tok_str.startswith('Ġ'): # GPT2/RoBERTa BPE
-                display_token = '&nbsp;' + tok_str[1:]
-            elif tok_str.startswith(' '): # SentencePiece / WordPiece (leading space)
-                 display_token = '&nbsp;' + tok_str[1:]
-            else: # Part of a word or special token not caught above
-                display_token = tok_str
+            # For regular tokens:
+            # 1. Handle space prefixes (like 'Ġ' or leading ' ') by converting to '&nbsp;'
+            #    and separating the rest of the token.
+            # 2. HTML escape the rest of the token.
+            # 3. Replace newline characters in the escaped part with the string '\n'.
             
-            display_token = display_token.replace("\\n", "<br>").replace("\n", "<br>") # Handle escaped and actual newlines
-            # Further sanitization
-            display_token = display_token.replace("<", "&lt;").replace(">", "&gt;")
+            temp_tok_str = tok_str
+            prefix = ""
 
-
+            if temp_tok_str.startswith('Ġ'): # GPT2/RoBERTa BPE
+                prefix = '&nbsp;'
+                temp_tok_str = temp_tok_str[1:]
+            elif temp_tok_str.startswith(' '): # SentencePiece / WordPiece (leading space)
+                 prefix = '&nbsp;'
+                 temp_tok_str = temp_tok_str[1:]
+            
+            # Escape the main part of the token string
+            escaped_token_part = html.escape(temp_tok_str)
+            
+            # Replace newlines in the (now escaped) token part with '\n'
+            processed_token_part = escaped_token_part.replace("\n", "\\n")
+            
+            display_token = prefix + processed_token_part
+            
         decoded_tokens.append(display_token)
 
     for token_str, act_val in zip(decoded_tokens, activations_in_context):
@@ -497,14 +513,23 @@ def generate_feature_dashboard(
     # Wrap in a body style similar to interp_utils.py for the token display part
     html_output_parts = ['<body style="background-color:black; color: white; padding: 10px; font-family: monospace;">']
     
-    html_output_parts.append(f"<h3 style='color: #eee;'>Top {len(top_k_contexts_info)} contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
+    html_output_parts.append(f"<h3 style='color: #eee;'>Top {k_top_contexts} unique contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
     
     # Add color bar using the overall min/max activations
     colorbar_html = make_colorbar(min_overall_activation, max_overall_activation, positive_threshold=positive_threshold, negative_threshold=negative_threshold)
     html_output_parts.append(f"<div style='margin-bottom: 10px;'>Token Activations: {colorbar_html}</div>")
 
+    printed_contexts = set()
+    displayed_contexts_count = 0
 
     for rank, (act_val, batch_dir_path, sample_idx_in_batch, token_idx_in_sample) in enumerate(top_k_contexts_info):
+        if displayed_contexts_count >= k_top_contexts:
+            break
+
+        context_identifier = (batch_dir_path, sample_idx_in_batch)
+        if context_identifier in printed_contexts:
+            continue
+
         try:
             tokens_file = os.path.join(batch_dir_path, "tokens.pt")
             all_tokens_in_batch = torch.load(tokens_file, map_location='cpu')
@@ -537,7 +562,9 @@ def generate_feature_dashboard(
                 min_overall_activation, max_overall_activation,
                 positive_threshold, negative_threshold
             )
-            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 10px; margin-bottom: 10px; border-radius: 5px;'><b>Context {rank+1} (Peak Act: {act_val:.4f} at original token)</b><br><div style='margin-top: 5px; white-space: pre-wrap; line-height: 1.5;'>{context_html}</div></div>")
+            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 10px; margin-bottom: 10px; border-radius: 5px;'><b>Max act: {act_val:.4f}</b><br><div style='margin-top: 5px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: break-word;'>{context_html}</div></div>")
+            printed_contexts.add(context_identifier)
+            displayed_contexts_count += 1
 
         except Exception as e:
             html_output_parts.append(f"<div style='border: 1px solid #444; padding: 5px; margin-bottom: 10px; color: #ffaaaa;'>Error processing context {rank+1}: {e}</div>")

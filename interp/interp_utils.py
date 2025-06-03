@@ -122,8 +122,8 @@ def create_logit_lens_html(top_ind, top_val, bot_ind, bot_val, tokenizer, k=10):
     """
     
     # Decode tokens
-    top_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\newline") for tok in top_ind[:k]]
-    bot_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\newline") for tok in bot_ind[:k]]
+    top_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\n") for tok in top_ind[:k]]
+    bot_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\n") for tok in bot_ind[:k]]
     
     # Create HTML template with direct background color attributes
     html_template = """
@@ -234,7 +234,7 @@ def tokens_and_activations_to_html(toks, activations, tokenizer, logit_diffs=Non
     toks = convert_token_array_to_list(toks)
     activations = convert_token_array_to_list(activations)
     # toks = [[tokenizer.decode(t).replace('Ġ', '&nbsp').replace('\n', '↵') for t in tok] for tok in toks]
-    toks = [[tokenizer.decode(t).replace('Ġ', '&nbsp').replace('\n', '\\n') for t in tok] for tok in toks]
+    toks = [[tokenizer.decode(t).replace('Ġ', '&nbsp;').replace('\n', '\\n') for t in tok] for tok in toks]
     highlighted_text = []
     # Make background black
     # highlighted_text.append('<body style="background-color:black; color: white;">')
