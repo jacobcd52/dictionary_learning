@@ -391,8 +391,8 @@ class SCAETrainer:
                     
                     if hasattr(actual_ae_instance, 'encoder') and actual_ae_instance.encoder.bias is not None:
                         with t.no_grad():
-                            actual_ae_instance.encoder.bias.copy_(-mean_F_for_module)
-                        if self.rank == 0 and module_idx < 5:
+                            actual_ae_instance.encoder.bias.copy_(-mean_F_for_module + t.ones_like(mean_F_for_module) * 0.5) # start all activations at 0
+                        if self.rank == 0:
                              print(f"Rank 0: Initialized bias for {module_name} using -F method.")
                     elif self.rank == 0:
                         print(f"Rank 0: Module {module_name} AE has no encoder with bias, skipping -F init for it.")
@@ -1102,8 +1102,24 @@ class SCAETrainer:
                 loss = self.train_step(self.model, input_ids)
                 loss.backward()
 
+                # Project gradients for all AEs/CCs in the suite
+                if self.model.module.scae_suite is not None and hasattr(self.model.module.scae_suite, 'module_dict'):
+                    for scae_module_wrapper in self.model.module.scae_suite.module_dict.values():
+                        actual_ae_instance = scae_module_wrapper.ae
+                        if hasattr(actual_ae_instance, 'remove_gradient_parallel_to_decoder_directions'):
+                            actual_ae_instance.remove_gradient_parallel_to_decoder_directions()
+                
                 self.model.module.clip_grad_norm()
                 optimizer.step()
+
+                # Normalize decoders for all AEs/CCs in the suite
+                if self.model.module.scae_suite is not None and hasattr(self.model.module.scae_suite, 'module_dict'):
+                    with t.no_grad(): # Methods are @t.no_grad decorated, this is for extra safety/clarity
+                        for scae_module_wrapper in self.model.module.scae_suite.module_dict.values():
+                            actual_ae_instance = scae_module_wrapper.ae
+                            if hasattr(actual_ae_instance, 'set_decoder_norm_to_unit_norm'):
+                                actual_ae_instance.set_decoder_norm_to_unit_norm()
+
                 scheduler.step()
 
                 if self.rank == 0:

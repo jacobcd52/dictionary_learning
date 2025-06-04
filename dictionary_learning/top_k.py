@@ -326,7 +326,7 @@ class CrosscoderTopK(Dictionary, nn.Module):
     def set_decoder_norm_to_unit_norm(self):
         eps = t.finfo(self.decoder_weight.dtype).eps
         # Normalize along the activation_dim (last dimension)
-        norm = t.norm(self.decoder_weight.data, dim=-1, keepdim=True)
+        norm = self.decoder_weight.data.pow(2).sum([-1, -2], keepdim=True).sqrt()
         self.decoder_weight.data /= (norm + eps)
 
     @t.no_grad()

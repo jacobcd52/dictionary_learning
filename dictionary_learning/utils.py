@@ -14,7 +14,7 @@ class SimpleBinaryMask(nn.Module):
         n_features_down,
         n_features_up, 
         target_C,
-        init_mean=0.1, # this is weirdly important... might indicate that something is set up wrong
+        init_mean=0.1,
         init_std=0.001,
     ):
         """
