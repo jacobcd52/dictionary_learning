@@ -11,6 +11,7 @@ from typing import List, Dict, Tuple, Optional, Union, Any
 from IPython.display import display, HTML
 import numpy as np
 import html # Added import
+import matplotlib.pyplot as plt
 # import matplotlib.colors # No longer needed for token display
 # import matplotlib.pyplot as plt # No longer needed for token display, keep for future hist if any
 
@@ -389,7 +390,7 @@ def _get_context_html(
             # 1. Handle space prefixes (like 'Ġ' or leading ' ') by converting to '&nbsp;'
             #    and separating the rest of the token.
             # 2. HTML escape the rest of the token.
-            # 3. Replace newline characters in the escaped part with the string '\n'.
+            # 3. Replace newline characters in the escaped part with '\n'.
             
             temp_tok_str = tok_str
             prefix = ""
@@ -423,6 +424,169 @@ def _get_context_html(
     return "".join(html_parts)
 
 
+def _generate_connections_html(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    suite: SCAESuite,
+    k_top_connections: int = 10,
+) -> str:
+    """Generates HTML for the connections section of the dashboard."""
+    try:
+        # 1. Get all module names and parse them
+        parsed_modules = []
+        for name in suite.module_dict.keys():
+            try:
+                parts = name.split('_')
+                type = parts[0]
+                layer = int(parts[1])
+                parsed_modules.append({'name': name, 'type': type, 'layer': layer})
+            except (IndexError, ValueError):
+                continue
+
+        current_module_info = next((m for m in parsed_modules if m['name'] == module_name_str), None)
+        
+        if current_module_info is None:
+            return "<p>Could not parse current module name.</p>"
+
+        current_module_layer = current_module_info['layer']
+        current_module_type = current_module_info['type']
+        current_module = suite.module_dict[module_name_str]
+
+        # 2. UPSTREAM connections (current module is DOWNSTREAM)
+        all_upstream_connections = []
+        down_module = current_module
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < current_module_layer]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+            
+            if up_module_name not in down_module.connection_masks:
+                continue
+                
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+
+            if current_module_type == "attn":
+                vw = vw.sum(0)
+
+            if vw.ndim == 2 and feature_idx_in_module < vw.shape[0]:
+                feature_connections = vw[feature_idx_in_module]
+                non_zero_indices = feature_connections.nonzero(as_tuple=False).squeeze(-1)
+                
+                # Handle case where nonzero returns a single-element tensor that is not 1-D
+                if non_zero_indices.dim() == 0 and non_zero_indices.numel() == 1:
+                    non_zero_indices = non_zero_indices.unsqueeze(0)
+
+                for ind in non_zero_indices:
+                    val = feature_connections[ind].item()
+                    if abs(val) > 1e-4:
+                        all_upstream_connections.append({'strength': val, 'module': up_module_name, 'feature_idx': ind.item()})
+        
+        total_upstream = len(all_upstream_connections)
+        top_upstream = sorted([c for c in all_upstream_connections if c['strength'] > 0], key=lambda x: x['strength'], reverse=True)[:k_top_connections]
+        bottom_upstream = sorted([c for c in all_upstream_connections if c['strength'] < 0], key=lambda x: x['strength'])[:k_top_connections]
+
+
+        # 3. DOWNSTREAM connections (current module is UPSTREAM)
+        all_downstream_connections = []
+        up_module = current_module
+        up_module_name = module_name_str
+        
+        downstream_modules_info = [m for m in parsed_modules if m['layer'] > current_module_layer]
+
+        for down_module_info in downstream_modules_info:
+            down_module_name = down_module_info['name']
+            down_module = suite.module_dict[down_module_name]
+            down_module_type = down_module_info['type']
+            
+            if up_module_name not in down_module.connection_masks:
+                continue
+
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            
+            if down_module_type == "attn":
+                vw = vw.sum(0)
+            
+            if vw.ndim == 2 and feature_idx_in_module < vw.shape[1]:
+                feature_connections = vw[:, feature_idx_in_module]
+                non_zero_indices = feature_connections.nonzero(as_tuple=False).squeeze(-1)
+
+                if non_zero_indices.dim() == 0 and non_zero_indices.numel() == 1:
+                    non_zero_indices = non_zero_indices.unsqueeze(0)
+
+                for ind in non_zero_indices:
+                    val = feature_connections[ind].item()
+                    if abs(val) > 1e-4:
+                         all_downstream_connections.append({'strength': val, 'module': down_module_name, 'feature_idx': ind.item()})
+
+        total_downstream = len(all_downstream_connections)
+        top_downstream = sorted([c for c in all_downstream_connections if c['strength'] > 0], key=lambda x: x['strength'], reverse=True)[:k_top_connections]
+        bottom_downstream = sorted([c for c in all_downstream_connections if c['strength'] < 0], key=lambda x: x['strength'])[:k_top_connections]
+
+        # 4. Format into HTML
+        html_parts = ['<div style="display: flex; flex-direction: row; justify-content: space-around; width: 100%; background-color: #f2f2f2; color: black; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 5px;">']
+        
+        # Column 1: Top Upstream
+        html_parts.append(f'<div style="width: 24%;"><h4>Top Upstream ({total_upstream})</h4><ul style="list-style: none; padding-left: 0;">')
+        if top_upstream:
+            for conn in top_upstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+        
+        # Column 2: Bottom Upstream
+        html_parts.append('<div style="width: 24%;"><h4>Bottom Upstream</h4><ul style="list-style: none; padding-left: 0;">')
+        if bottom_upstream:
+            for conn in bottom_upstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+        # Column 3: Top Downstream
+        html_parts.append(f'<div style="width: 24%;"><h4>Top Downstream ({total_downstream})</h4><ul style="list-style: none; padding-left: 0;">')
+        if top_downstream:
+            for conn in top_downstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+        # Column 4: Bottom Downstream
+        html_parts.append('<div style="width: 24%;"><h4>Bottom Downstream</h4><ul style="list-style: none; padding-left: 0;">')
+        if bottom_downstream:
+            for conn in bottom_downstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+
+        html_parts.append('</div>')
+        return "".join(html_parts)
+
+    except Exception as e:
+        # Also print to console for debugging
+        print(f"Error generating connections view for {module_name_str}/{feature_idx_in_module}: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"<div style='border: 1px solid #444; padding: 5px; margin-bottom: 10px; color: #ffaaaa;'>Error generating connections display: {e}</div>"
+
+
 def generate_feature_dashboard(
     module_name_str: str,
     feature_idx_in_module: int,
@@ -431,6 +595,7 @@ def generate_feature_dashboard(
     model: HookedTransformer, # Added model for logit lens
     suite: SCAESuite,         # Added suite for AE decoder weights
     k_top_contexts: int = 10,
+    k_top_connections: int = 10,
     context_window_size: int = 20,
     positive_threshold: float = 0.01, # Thresholds for coloring
     negative_threshold: float = 0.01
@@ -513,7 +678,14 @@ def generate_feature_dashboard(
     # Wrap in a body style similar to interp_utils.py for the token display part
     html_output_parts = ['<body style="background-color:black; color: white; padding: 10px; font-family: monospace;">']
     
-    html_output_parts.append(f"<h3 style='color: #eee;'>Top {k_top_contexts} unique contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
+    # --- Connections Section ---
+    connections_html_content = _generate_connections_html(
+        module_name_str, feature_idx_in_module, suite, k_top_connections=k_top_connections
+    )
+    html_output_parts.append(connections_html_content)
+    
+    # removed this to reduce clutter
+    # html_output_parts.append(f"<h3 style='color: #eee;'>Top {k_top_contexts} unique contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
     
     # Add color bar using the overall min/max activations
     colorbar_html = make_colorbar(min_overall_activation, max_overall_activation, positive_threshold=positive_threshold, negative_threshold=negative_threshold)
@@ -626,3 +798,388 @@ def generate_feature_dashboard(
     html_output_parts.append(logit_lens_html_content)
     html_output_parts.append('</body>')
     display(HTML("".join(html_output_parts)))
+
+
+def find_non_dead_features(activations_dir: str) -> Dict[str, Dict[str, List[int]]]:
+    """
+    Finds non-dead features by scanning saved activation files.
+
+    A feature is considered non-dead if it has at least one non-zero activation
+    value across all processed batches for a given mode (sparse/non-sparse).
+
+    Args:
+        activations_dir: The base directory where activation batches were saved by
+                         `collect_activations_and_tokens`. This directory should contain
+                         subdirectories like 'sparse_true' and 'sparse_false'.
+
+    Returns:
+        A dictionary with keys 'sparse_true' and 'sparse_false'. Each of these
+        contains a dictionary mapping module names to a sorted list of their
+        non-dead feature indices.
+        Example:
+        {
+            'sparse_true': {'attn_0': [1, 5, ...], 'cc_1': [10, 23, ...]},
+            'sparse_false': {'attn_0': [0, 1, 2, ...], 'cc_1': [5, 12, ...]}
+        }
+    """
+    results = {}
+    modes = ['sparse_true', 'sparse_false']
+
+    for mode in modes:
+        mode_path = os.path.join(activations_dir, mode)
+        if not os.path.isdir(mode_path):
+            print(f"Directory for mode '{mode}' not found at {mode_path}. Skipping.")
+            continue
+
+        non_dead_features_for_mode = {} 
+
+        batch_dirs = sorted([d for d in os.listdir(mode_path) if d.startswith("batch_") and os.path.isdir(os.path.join(mode_path, d))])
+        if not batch_dirs:
+            print(f"No batch data found in {mode_path}.")
+            results[mode] = {}
+            continue
+            
+        print(f"Processing mode: {mode}...")
+        for batch_dir_name in batch_dirs:
+            batch_dir_path = os.path.join(mode_path, batch_dir_name)
+            
+            activation_files = [f for f in os.listdir(batch_dir_path) if f.startswith("activations_") and f.endswith(".pt")]
+
+            for activation_file in activation_files:
+                module_name = activation_file.replace("activations_", "").replace(".pt", "")
+                
+                if module_name not in non_dead_features_for_mode:
+                    non_dead_features_for_mode[module_name] = set()
+
+                file_path = os.path.join(batch_dir_path, activation_file)
+                try:
+                    data = torch.load(file_path, map_location='cpu')
+                    feature_indices_with_activation = data['indices'][2]
+                    
+                    if feature_indices_with_activation.numel() > 0:
+                        non_dead_features_for_mode[module_name].update(feature_indices_with_activation.tolist())
+                except Exception as e:
+                    print(f"Error loading or processing {file_path}: {e}")
+        
+        sorted_non_dead_features = {
+            module: sorted(list(features))
+            for module, features in non_dead_features_for_mode.items()
+        }
+        results[mode] = sorted_non_dead_features
+    
+    print("Finished finding non-dead features.")
+    return results
+
+
+def plot_alive_feature_percentage(
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    suite: SCAESuite
+):
+    """
+    Generates and displays a bar chart showing the percentage of alive features
+    for each module, separated by sparse and non-sparse modes.
+
+    Args:
+        non_dead_features_dict: The dictionary returned by `find_non_dead_features`.
+        suite: The SCAESuite object, used to get the total number of features per module.
+    """
+    
+    # 1. Get module names and sort them: attn_0, attn_1, ..., cc_0, cc_1, ...
+    def sort_key(name: str):
+        parts = name.split('_')
+        module_type = parts[0]
+        layer = int(parts[1])
+        # 'attn' comes before 'cc'
+        type_priority = 0 if module_type == 'attn' else 1
+        return (type_priority, layer)
+
+    module_names = sorted(suite.module_dict.keys(), key=sort_key)
+
+    vanilla_percentages = []
+    sparsely_connected_percentages = []
+    
+    # 2. Calculate percentages for each module
+    for name in module_names:
+        scae_module_wrapper = suite.module_dict[name]
+        if not scae_module_wrapper or not hasattr(scae_module_wrapper, 'ae'):
+            continue
+        
+        ae_instance = scae_module_wrapper.ae
+        total_features = 0
+        if isinstance(ae_instance, AutoEncoderTopK):
+            total_features = ae_instance.decoder.weight.shape[1]
+        elif isinstance(ae_instance, CrosscoderTopK):
+            total_features = ae_instance.decoder_weight.shape[0]
+
+        if total_features == 0:
+            vanilla_percentages.append(0)
+            sparsely_connected_percentages.append(0)
+            continue
+            
+        # Get alive counts from the input dictionary
+        num_alive_sparsely_connected = len(non_dead_features_dict.get('sparse_true', {}).get(name, []))
+        num_alive_vanilla = len(non_dead_features_dict.get('sparse_false', {}).get(name, []))
+        
+        sparsely_connected_percentages.append((num_alive_sparsely_connected / total_features) * 100)
+        vanilla_percentages.append((num_alive_vanilla / total_features) * 100)
+
+    # 3. Plotting
+    x = np.arange(len(module_names))  # the label locations
+    width = 0.35  # the width of the bars
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    rects1 = ax.bar(x - width/2, vanilla_percentages, width, label='Vanilla', color='royalblue')
+    rects2 = ax.bar(x + width/2, sparsely_connected_percentages, width, label='Sparsely-connected', color='skyblue')
+
+    # Add some text for labels, title and axes ticks
+    ax.set_ylabel('Percentage of Alive Features (%)')
+    ax.set_title('Percentage of Alive Features by Module and Mode')
+    ax.set_xticks(x)
+    ax.set_xticklabels(module_names, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_upstream_connection_histograms(
+    suite: SCAESuite,
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    mode: str = 'sparse_true'
+):
+    """
+    Computes and plots histograms of the number of upstream connections for each
+    alive feature in each module.
+
+    Args:
+        suite: The SCAESuite object.
+        non_dead_features_dict: Dictionary from find_non_dead_features.
+        mode: The mode to analyze ('sparse_true' or 'sparse_false').
+              Defaults to 'sparse_true' as connections are most relevant there.
+    """
+    print(f"Generating upstream connection histograms for mode: {mode}")
+
+    # 1. Parse and sort all module names
+    parsed_modules = []
+    for name in suite.module_dict.keys():
+        try:
+            parts = name.split('_')
+            parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+        except (IndexError, ValueError):
+            continue
+    
+    def sort_key(mod):
+        return (0 if mod['type'] == 'attn' else 1, mod['layer'])
+    
+    parsed_modules.sort(key=sort_key)
+    
+    all_module_counts = {}
+
+    # 2. Iterate through each module as the downstream module to calculate connection counts
+    for down_module_info in parsed_modules:
+        down_module_name = down_module_info['name']
+        down_module = suite.module_dict[down_module_name]
+        
+        alive_features = non_dead_features_dict.get(mode, {}).get(down_module_name, [])
+        if not alive_features:
+            all_module_counts[down_module_name] = []
+            continue
+
+        ae_instance_down = down_module.ae
+        total_features_down = 0
+        if isinstance(ae_instance_down, AutoEncoderTopK):
+            total_features_down = ae_instance_down.decoder.weight.shape[1]
+        elif isinstance(ae_instance_down, CrosscoderTopK):
+            total_features_down = ae_instance_down.decoder_weight.shape[0]
+
+        if total_features_down == 0:
+            continue
+            
+        total_upstream_connections = torch.zeros(total_features_down, dtype=torch.int32)
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < down_module_info['layer']]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+
+            if up_module_name not in down_module.connection_masks:
+                continue
+            
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            if down_module_info['type'] == "attn":
+                vw = vw.sum(0)
+            
+            non_zero_per_row = (vw.abs() > 1e-4).sum(dim=1)
+            total_upstream_connections += non_zero_per_row.cpu().int()
+
+        alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
+        counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        all_module_counts[down_module_name] = counts_for_alive_features
+    
+    # 3. Plotting Preparation
+    all_module_counts.pop('attn_0', None)
+    all_module_counts.pop('cc_0', None)  # Assuming mlp_0 is cc_0
+    
+    attn_module_names = sorted([name for name in all_module_counts.keys() if name.startswith('attn')])
+    cc_module_names = sorted([name for name in all_module_counts.keys() if name.startswith('cc')])
+
+    if not attn_module_names and not cc_module_names:
+        print("No data to plot after filtering.")
+        return
+
+    # 4. Plotting
+    nrows = max(len(attn_module_names), len(cc_module_names))
+    ncols = 2
+    
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, nrows * 4), constrained_layout=True, squeeze=False)
+    
+    fig.suptitle('Histogram of Upstream Counts per Alive Feature', fontsize=16)
+
+    # Plot attn modules in the left column
+    for i, module_name in enumerate(attn_module_names):
+        ax = axes[i, 0]
+        counts = all_module_counts[module_name]
+        
+        if counts:
+            log_counts = np.log10([c + 0.1 for c in counts])
+            ax.hist(log_counts, bins=30, color='c', edgecolor='k', alpha=0.7)
+            ax.set_title(f"{module_name} (n={len(counts)})")
+            ax.set_xlabel("log_10(Num Connections + 0.1)")
+            ax.set_ylabel("Number of Features")
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+            ax.set_xlim(left=-1)
+            ax.set_xlim(right=4)
+            start, _ = ax.get_xlim()
+            ax.xaxis.set_ticks(np.arange(np.ceil(start), 5, 1))
+        else:
+            ax.set_title(f"{module_name}")
+            ax.text(0.5, 0.5, "No alive features", ha='center', va='center', transform=ax.transAxes)
+
+    # Plot mlp/cc modules in the right column
+    for i, module_name in enumerate(cc_module_names):
+        ax = axes[i, 1]
+        counts = all_module_counts[module_name]
+        
+        if counts:
+            log_counts = np.log10([c + 0.1 for c in counts])
+            ax.hist(log_counts, bins=30, color='m', edgecolor='k', alpha=0.7)
+            ax.set_title(f"{module_name} (n={len(counts)})")
+            ax.set_xlabel("log_10(Num Connections + 0.1)")
+            ax.set_ylabel("Number of Features")
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+            ax.set_xlim(right=4)
+            start, _ = ax.get_xlim()
+            ax.xaxis.set_ticks(np.arange(np.ceil(start), 5, 1))
+        else:
+            ax.set_title(f"{module_name}")
+            ax.text(0.5, 0.5, "No alive features", ha='center', va='center', transform=ax.transAxes)
+
+    # Hide unused subplots
+    for i in range(len(attn_module_names), nrows):
+        axes[i, 0].set_visible(False)
+    for i in range(len(cc_module_names), nrows):
+        axes[i, 1].set_visible(False)
+
+    plt.show()
+
+
+def calculate_global_connection_stats(
+    suite: SCAESuite,
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    mode: str = 'sparse_true'
+) -> Tuple[float, float]:
+    """
+    Computes the mean and median number of upstream connections across all
+    alive features in all relevant modules.
+
+    Args:
+        suite: The SCAESuite object.
+        non_dead_features_dict: Dictionary from find_non_dead_features.
+        mode: The mode to analyze ('sparse_true' or 'sparse_false').
+
+    Returns:
+        A tuple containing (mean, median) of the upstream connection counts.
+    """
+    print(f"Calculating global connection stats for mode: {mode}...")
+
+    parsed_modules = []
+    for name in suite.module_dict.keys():
+        try:
+            parts = name.split('_')
+            parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+        except (IndexError, ValueError):
+            continue
+    
+    all_connection_counts = []
+
+    for down_module_info in parsed_modules:
+        down_module_name = down_module_info['name']
+
+        if down_module_name in ['attn_0', 'cc_0']:
+            continue
+            
+        down_module = suite.module_dict[down_module_name]
+        
+        alive_features = non_dead_features_dict.get(mode, {}).get(down_module_name, [])
+        if not alive_features:
+            continue
+
+        ae_instance_down = down_module.ae
+        total_features_down = 0
+        if isinstance(ae_instance_down, AutoEncoderTopK):
+            total_features_down = ae_instance_down.decoder.weight.shape[1]
+        elif isinstance(ae_instance_down, CrosscoderTopK):
+            total_features_down = ae_instance_down.decoder_weight.shape[0]
+
+        if total_features_down == 0:
+            continue
+            
+        total_upstream_connections = torch.zeros(total_features_down, dtype=torch.int32)
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < down_module_info['layer']]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+
+            if up_module_name not in down_module.connection_masks:
+                continue
+            
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            if down_module_info['type'] == "attn":
+                vw = vw.sum(0)
+            
+            non_zero_per_row = (vw.abs() > 1e-4).sum(dim=1)
+            total_upstream_connections += non_zero_per_row.cpu().int()
+
+        alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
+        counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        all_connection_counts.extend(counts_for_alive_features)
+
+    if not all_connection_counts:
+        print("No alive features with connections found to calculate stats on.")
+        return 0.0, 0.0
+
+    mean_connections = np.mean(all_connection_counts)
+    median_connections = np.median(all_connection_counts)
+
+    print(f"\n--- Global Connection Statistics ---")
+    print(f"Total alive features analyzed (from modules > layer 0): {len(all_connection_counts)}")
+    print(f"Mean upstream connections per feature: {mean_connections:.2f}")
+    print(f"Median upstream connections per feature: {median_connections:.2f}")
+    
+    return mean_connections, median_connections
