@@ -37,8 +37,8 @@ CFG = SCAEConfig(
     ce_loss_coeff=0,
     ce_loss_sparse_coeff=0,
     fvu_loss_coeff = 1.0,
-    fvu_loss_sparse_coeff=1.0,
-    feature_act_fvu_coeff=0.2,
+    fvu_loss_sparse_coeff=0.,
+    feature_act_fvu_coeff=0.,
     mask_loss_coeff=1e-4,
     sparse_warmup=0.3,
 )
@@ -62,7 +62,7 @@ if __name__ == "__main__":
     world_size = t.cuda.device_count()
     print(f"Using {world_size} GPUs")
 
-    mask_loss_coeffs_sweep = [3e-4]
+    mask_loss_coeffs_sweep = [0]
 
     for mask_loss_val in mask_loss_coeffs_sweep:
         CFG.mask_loss_coeff = mask_loss_val
