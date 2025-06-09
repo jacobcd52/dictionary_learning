@@ -1,5 +1,6 @@
 # saved acts for interp
 interp/output_activations_pile
+*.pt
 # SAE checkpoints
 sae_checkpoints/
 noteboooks/importance_scores

@@ -1,183 +1,252 @@
-from datasets import load_dataset
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-# from baukit import Trace
-from tqdm import tqdm
-import einops
-
-# from baukit import TraceDict  
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-def prepare_streaming_dataset(tokenizer, dataset_name, max_length, batch_size, num_datapoints=None, num_cpu_cores=6):
-    """Create a generator that streams batches from the dataset"""
-    split = "train"
-    split_text = f"{split}[:{num_datapoints}]" if num_datapoints else split
-    
-    # Load the dataset
-    dataset = load_dataset(dataset_name, split=split_text)
-    current_batch = []
-    
-    def process_text(text):
-        """Helper function to tokenize text"""
-        return tokenizer(tokenizer.bos_token + text)['input_ids']
-    
-    for item in dataset:
-        # Tokenize the text
-        input_ids = process_text(item['text'])
-        
-        # Only keep sequences that are long enough
-        if len(input_ids) > max_length:
-            input_ids = input_ids[:max_length]  # Truncate if necessary
-            current_batch.append(torch.tensor(input_ids))
-            
-            # When we have enough samples, yield a batch
-            if len(current_batch) == batch_size:
-                # Pad the sequences in the batch to the same length
-                # padded_batch = pad_sequence(current_batch, batch_first=True)
-                yield torch.stack(current_batch)
-                current_batch = []
-    
-    # Yield any remaining samples in the last batch
-    if current_batch:
-        yield torch.stack(current_batch)
-
-
-
-
-
-
+from datasets import load_dataset, Dataset
+from transformers import PreTrainedTokenizerBase, AutoTokenizer
+from dictionary_learning.scae import SCAESuite, MergedSCAESuite, SubmoduleName, AutoEncoderTopK, CrosscoderTopK # Added AE an CCK
+from transformer_lens import HookedTransformer
+import os
+import gc
+import shutil
+from typing import List, Dict, Tuple, Optional, Union, Any
+from IPython.display import display, HTML
+import numpy as np
+import html # Added import
 import matplotlib.pyplot as plt
-import numpy as np
-import io
-import base64
-from IPython.display import display, HTML
+# import matplotlib.colors # No longer needed for token display
+# import matplotlib.pyplot as plt # No longer needed for token display, keep for future hist if any
 
-def display_matplotlib_figure(fig, width=None, height=None):
+
+# --- 1. Data Loading ---
+def load_tokenized_dataset(
+    dataset_name_or_path: str,
+    tokenizer: PreTrainedTokenizerBase,
+    seq_len: int,
+    num_samples: int = 1000,
+    split: str = "train",
+    text_column: str = "text",
+    streaming: bool = False,
+    data_files: Optional[Union[str, List[str]]] = None,
+) -> Dataset:
     """
-    Convert a matplotlib figure to an HTML img tag for display in Jupyter notebooks
-    
-    Parameters:
-    - fig: matplotlib figure to display
-    - width: optional width (in pixels)
-    - height: optional height (in pixels)
+    Loads a dataset, tokenizes it, and formats it for processing.
+    The tokenizer will be used with return_tensors="pt".
     """
-    # Save the figure to a PNG in memory
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    
-    # Encode the PNG as base64
-    img_str = base64.b64encode(buf.read()).decode('utf-8')
-    
-    # Set the width and height attributes if provided
-    style = ""
-    if width is not None:
-        style += f"width:{width}px;"
-    if height is not None:
-        style += f"height:{height}px;"
-    
-    style_attr = f' style="{style}"' if style else ''
-    
-    # Generate the HTML
-    html = f'<img src="data:image/png;base64,{img_str}"{style_attr}/>'
-    
-    # return HTML(html)
-    return html
+    if streaming and data_files: # Streaming from local files
+         dataset = load_dataset("json", data_files=data_files, split=split, streaming=streaming)
+    elif streaming: # Streaming from HF
+        dataset = load_dataset(dataset_name_or_path, split=split, streaming=streaming)
+    elif data_files: # Non-streaming from local files
+        dataset = load_dataset("json", data_files=data_files, split=f"{split}[:{num_samples}]")
+    else: # Non-streaming from HF
+        dataset = load_dataset(dataset_name_or_path, split=f"{split}[:{num_samples}]")
 
-# Example usage with a histogram
-def create_histogram_html(data, bins=30, title="Histogram", width=600, height=400):
-    # Create a histogram
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.hist(data, bins=bins, alpha=0.7, color='skyblue', edgecolor='black')
-    ax.set_title(title)
-    ax.set_xlabel('Value')
-    ax.set_ylabel('Frequency')
-    ax.grid(alpha=0.3)
-    
-    # Convert to HTML and display
-    plt.close(fig)  # Close the figure to prevent it from displaying twice
-    return display_matplotlib_figure(fig, width=width, height=height)
+    def tokenize_and_chunk(examples): # examples[text_column] is List[str]
+        list_of_1d_token_tensors = []
+        for text in examples[text_column]:
+            # Tokenize each text individually to avoid cross-text padding from tokenizer
+            token_ids_tensor = tokenizer(text, return_attention_mask=False, return_tensors="pt")["input_ids"]
+            
+            # Squeeze if tokenizer returns (1, N) for single text
+            if token_ids_tensor.ndim == 2 and token_ids_tensor.shape[0] == 1:
+                token_ids_tensor = token_ids_tensor.squeeze(0)
+            
+            # Ensure it's 1D; skip if empty (e.g., from empty string)
+            if token_ids_tensor.ndim != 1:
+                if token_ids_tensor.numel() == 0:
+                    continue 
+                else:
+                    raise ValueError(f"Tokenizer produced unexpected tensor shape {token_ids_tensor.shape} for single text input: '{text[:100]}...'")
+            list_of_1d_token_tensors.append(token_ids_tensor)
+
+        if not list_of_1d_token_tensors: # All texts in batch were empty or resulted in no tokens
+            return {"input_ids": []} # Return empty list of chunks
+
+        # Concatenate all token tensors. Assuming tokenizer outputs CPU tensors.
+        # If they can be on other devices, ensure they are moved to a consistent device (e.g., CPU) before cat.
+        try:
+            concatenated_tokens_tensor = torch.cat(list_of_1d_token_tensors, dim=0)
+        except Exception as e:
+            # For debugging if cat fails (e.g. list_of_1d_token_tensors is empty when it shouldn't be, or tensors are on different devices)
+            print(f"Error during torch.cat of token tensors: {e}")
+            # for i, t in enumerate(list_of_1d_token_tensors):
+            #     print(f"Tensor {i}: shape {t.shape}, device {t.device}, dtype {t.dtype}")
+            raise
+
+        current_device = concatenated_tokens_tensor.device
+        
+        current_length = concatenated_tokens_tensor.size(0)
+        padding_length = (seq_len - (current_length % seq_len)) % seq_len
+
+        if padding_length > 0:
+            if tokenizer.pad_token_id is None:
+                # Attempt to use eos_token_id if pad_token_id is None, common for some models like GPT-2
+                if tokenizer.eos_token_id is not None:
+                    print(f"Warning: tokenizer.pad_token_id is None. Using tokenizer.eos_token_id ({tokenizer.eos_token_id}) for padding.")
+                    pad_token_id_to_use = int(tokenizer.eos_token_id)
+                else:
+                    raise ValueError("Tokenizer does not have a pad_token_id or eos_token_id set, which is required for padding.")
+            else:
+                pad_token_id_to_use = int(tokenizer.pad_token_id)
+            
+            pad_values = torch.full((padding_length,), pad_token_id_to_use,
+                                    dtype=concatenated_tokens_tensor.dtype, device=current_device)
+            concatenated_tokens_tensor = torch.cat([concatenated_tokens_tensor, pad_values], dim=0)
+
+        num_chunks = concatenated_tokens_tensor.size(0) // seq_len
+        if num_chunks == 0:
+            return {"input_ids": []} 
+
+        chunked_tokens_2d_tensor = concatenated_tokens_tensor.reshape(num_chunks, seq_len)
+        # map expects the function to return a dict of lists, where each element in the list is a sample
+        list_of_chunk_tensors = [chunk for chunk in chunked_tokens_2d_tensor] 
+        
+        return {"input_ids": list_of_chunk_tensors}
+
+    if streaming:
+        tokenized_dataset = dataset.map(
+            tokenize_and_chunk,
+            batched=True,
+            remove_columns=[text_column] 
+        )
+    else: # Not streaming
+        tokenized_dataset = dataset.map(
+            tokenize_and_chunk,
+            batched=True,
+            remove_columns=[text_column], 
+            num_proc=max(1, os.cpu_count() // 2)
+        )
+        # The number of samples is already limited by the initial load_dataset split.
+        # No further sub-selection of chunks based on original num_samples here.
+        
+        # set_format ensures that when an item is accessed, 'input_ids' is a tensor.
+        # With the new tokenize_and_chunk, it's already a list of tensors,
+        # so this will ensure individual items are tensors if not already.
+        tokenized_dataset.set_format(type="torch", columns=["input_ids"])
+
+    return tokenized_dataset
 
 
-
-
-
-from IPython.display import display, HTML
-import torch
-
-def create_logit_lens_html(top_ind, top_val, bot_ind, bot_val, tokenizer, k=10):
+# --- 2. Activation Collection & Saving ---
+def collect_activations_and_tokens(
+    suite: SCAESuite,
+    model: HookedTransformer,
+    tokenizer: PreTrainedTokenizerBase, # Added tokenizer for consistency, though not directly used in merged_suite.forward
+    dataset: Dataset,
+    device: Union[str, torch.device],
+    output_dir: str,
+    run_mode_sparse: bool,
+    batch_size: int = 8,
+    temperature: float = 1.0, # For learnable masks if used
+    max_batches_to_process: Optional[int] = None,
+):
     """
-    Create an HTML display of top and bottom tokens with their values.
-    
-    Parameters:
-    - top_ind: indices of top tokens
-    - top_val: values of top tokens
-    - bot_ind: indices of bottom tokens
-    - bot_val: values of bottom tokens
-    - tokenizer: tokenizer to decode indices
-    - k: number of tokens to display (default 10)
+    Runs the SCAESuite on the provided data, collects sparse feature activations 
+    and tokens, and saves them to disk.
+
+    Args:
+        suite: The SCAESuite object.
+        model: The HookedTransformer model associated with the suite.
+        tokenizer: The tokenizer.
+        dataset: A tokenized Hugging Face Dataset (each item is {"input_ids": tensor}).
+        device: Torch device.
+        output_dir: Directory to save activations and tokens.
+        run_mode_sparse: Boolean, if True, runs suite in sparse connection mode.
+        batch_size: Batch size for processing.
+        temperature: Temperature for learnable masks.
+        max_batches_to_process: Optional limit on the number of batches.
     """
     
-    # Decode tokens
-    top_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\n") for tok in top_ind[:k]]
-    bot_text = [tokenizer.decode(tok).replace(" ", "_").replace("\n", "\\n") for tok in bot_ind[:k]]
+    mode_str = "sparse_true" if run_mode_sparse else "sparse_false"
+    current_output_path = os.path.join(output_dir, mode_str)
+    if os.path.exists(current_output_path):
+        print(f"Warning: Output path {current_output_path} already exists. Clearing it.")
+        shutil.rmtree(current_output_path)
+    os.makedirs(current_output_path, exist_ok=True)
+
+    merged_suite = MergedSCAESuite(model, suite).to(device)
+    merged_suite.eval()
+
+    data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
     
-    # Create HTML template with direct background color attributes
-    html_template = """
-    <style>
-        .token-table {{
-            font-family: Arial, sans-serif;
-            border-collapse: collapse;
-            width: 100%;
-            margin-top: 10px;
-        }}
-        .token-table td {{
-            padding: 8px;
-            border-bottom: 1px solid #ddd;
-        }}
-        .title {{
-            font-size: 20px;
-            font-weight: bold;
-            text-align: center;
-            margin-bottom: 10px;
-        }}
-    </style>
-    
-    <div class="title">Logit Lens</div>
-    
-    <table class="token-table">
-        <tr>
-            <td><b>Top Token</b></td>
-            <td><b>Value</b></td>
-            <td><b>Bottom Token</b></td>
-            <td><b>Value</b></td>
-        </tr>
-    """
-    
-    # Add rows with colored backgrounds applied to spans instead of cells
-    for i in range(k):
-        html_template += f"""
-        <tr>
-            <td>{top_text[i]}</td>
-            <td><span style="background-color: #0000FF; color: white; padding: 2px 4px; display: inline-block;"><b>{top_val[i].item():.3f}</b></span></td>
-            <td>{bot_text[i]}</td>
-            <td><span style="background-color: #FF0000; color: white; padding: 2px 4px; display: inline-block;"><b>{bot_val[i].item():.3f}</b></span></td>
-        </tr>
-        """
-    
-    html_template += "</table>"
-    
-    # return HTML(html_template)
-    return html_template
+    print(f"Starting activation collection. Mode: {'Sparse' if run_mode_sparse else 'Non-sparse'}")
+    print(f"Saving to: {current_output_path}")
+
+    for batch_idx, batch_data in enumerate(data_loader):
+        if max_batches_to_process is not None and batch_idx >= max_batches_to_process:
+            print(f"Reached max_batches_to_process: {max_batches_to_process}. Stopping.")
+            break
+
+        input_ids_from_batch = batch_data["input_ids"] # Expected: Tensor from DataLoader
+
+        if not isinstance(input_ids_from_batch, torch.Tensor):
+            # This should ideally not be hit if data pipeline is correct
+            raise TypeError(
+                f"batch_data['input_ids'] (type: {type(input_ids_from_batch)}) is not a torch.Tensor as expected. "
+                "There might be an issue in the tokenize_and_chunk or DataLoader's collate_fn."
+            )
+        
+        input_ids = input_ids_from_batch.to(device) # Should be (batch_size, seq_len)
+
+        # Ensure input_ids has a batch dimension. DataLoader usually ensures this.
+        if input_ids.ndim == 1:
+            # This might occur if dataset somehow yields 1D tensors and batch_size=1
+            # and collate_fn doesn't add batch dim. merged_suite needs batch dim.
+            # Or if somehow input_ids_from_batch was a single 1D tensor before .to(device)
+            print(f"Warning: input_ids had 1 dimension (shape {input_ids.shape}). Unsqueezing dim 0 to create batch dimension.")
+            input_ids = input_ids.unsqueeze(0)
+        
+        # Check for empty batches or batches of empty sequences
+        if input_ids.shape[0] == 0 : # Dataloader yielded an empty batch (e.g. batch_size > 0 but no data)
+            if batch_size > 0: # We expected a batch
+                 print(f"Skipping empty batch {batch_idx} (input_ids shape: {input_ids.shape})")
+            continue
+        
+        # This check might be relevant if seq_len could be 0, but our chunking logic ensures seq_len > 0 for chunks.
+        # So, if num_chunks > 0, then shape[1] will be seq_len.
+        # The main concern is if input_ids.shape[0] (batch dimension from dataloader) is 0.
+        # If input_ids.numel() == 0 but input_ids.shape[0] > 0, it means batch_size > 0 but seq_len = 0. (e.g. shape [8,0])
+        # This should not happen due to chunking logic.
+
+        with torch.no_grad():
+            reconstructions, pruned_features, cache = merged_suite(
+                input_ids,
+                temperature=temperature,
+                runtime_use_sparse_connections_override=run_mode_sparse
+            )
+
+        batch_output_dir = os.path.join(current_output_path, f"batch_{batch_idx:05d}")
+        os.makedirs(batch_output_dir, exist_ok=True)
+
+        # Save tokens
+        torch.save(input_ids.cpu(), os.path.join(batch_output_dir, "tokens.pt"))
+
+        # Save sparse activations
+        for module_name, activation_tensor in pruned_features.items():
+            # activation_tensor is the scatter_buffer (batch, seq, n_features_module)
+            # Find non-zero elements
+            non_zero_indices = activation_tensor.nonzero(as_tuple=True) # (batch_indices, seq_indices, feat_indices)
+            non_zero_values = activation_tensor[non_zero_indices]
+            
+            save_path = os.path.join(batch_output_dir, f"activations_{module_name}.pt")
+            torch.save({
+                'indices': tuple(idx.cpu() for idx in non_zero_indices),
+                'values': non_zero_values.cpu(),
+                'shape': activation_tensor.shape
+            }, save_path)
+            del activation_tensor, non_zero_indices, non_zero_values
+
+        del reconstructions, pruned_features, cache, input_ids
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+        
+        if batch_idx % 10 == 0:
+            print(f"Processed and saved batch {batch_idx}")
+
+    print(f"Finished activation collection for mode: {'Sparse' if run_mode_sparse else 'Non-sparse'}.")
 
 
-
-import numpy as np
-from IPython.display import display, HTML
-from einops import rearrange
+# --- Helper functions from interp_utils.py (for styling and logit lens) ---
 
 def make_colorbar(min_value, max_value, white = 255, red_blue_ness = 250, positive_threshold = 0.01, negative_threshold = 0.01):
     # Add color bar
@@ -202,11 +271,13 @@ def make_colorbar(min_value, max_value, white = 255, red_blue_ness = 250, positi
 
 def value_to_color(activation, max_value, min_value, white = 255, red_blue_ness = 250, positive_threshold = 0.01, negative_threshold = 0.01):
     if activation > positive_threshold:
-        ratio = activation/max_value
+        ratio = activation/max_value if max_value != 0 else 1 # Avoid division by zero
+        ratio = min(1, max(0, ratio)) # Clamp ratio to [0,1]
         text_color = "0,0,0" if ratio <= 0.5 else "255,255,255"  
         background_color = f'rgba({int(red_blue_ness-(red_blue_ness*ratio))},{int(red_blue_ness-(red_blue_ness*ratio))},255,1)'
     elif activation < -negative_threshold:
-        ratio = activation/min_value
+        ratio = activation/min_value if min_value != 0 else 1 # Avoid division by zero
+        ratio = min(1, max(0, ratio)) # Clamp ratio to [0,1]
         text_color = "0,0,0" if ratio <= 0.5 else "255,255,255"  
         background_color = f'rgba(255, {int(red_blue_ness-(red_blue_ness*ratio))},{int(red_blue_ness-(red_blue_ness*ratio))},1)'
     else:
@@ -214,1219 +285,901 @@ def value_to_color(activation, max_value, min_value, white = 255, red_blue_ness 
         background_color = f'rgba({white},{white},{white},1)'
     return text_color, background_color
 
-def convert_token_array_to_list(array):
-    if isinstance(array, torch.Tensor):
-        if array.dim() == 1:
-            array = [array.tolist()]
-        elif array.dim()==2:
-            array = array.tolist()
-        else: 
-            raise NotImplementedError("tokens must be 1 or 2 dimensional")
-    elif isinstance(array, list):
-        # ensure it's a list of lists
-        if isinstance(array[0], int):
-            array = [array]
-    return array
-
-def tokens_and_activations_to_html(toks, activations, tokenizer, logit_diffs=None, model_type="causal", text_above_each_act=None):
-    # text_spacing = "0.07em"
-    text_spacing = "0.00em"
-    toks = convert_token_array_to_list(toks)
-    activations = convert_token_array_to_list(activations)
-    # toks = [[tokenizer.decode(t).replace('Ġ', '&nbsp').replace('\n', '↵') for t in tok] for tok in toks]
-    toks = [[tokenizer.decode(t).replace('Ġ', '&nbsp;').replace('\n', '\\n') for t in tok] for tok in toks]
-    highlighted_text = []
-    # Make background black
-    # highlighted_text.append('<body style="background-color:black; color: white;">')
-    highlighted_text.append("""
-<body style="background-color: black; color: white;">
-""")
-    max_value = max([max(activ) for activ in activations])
-    min_value = min([min(activ) for activ in activations])
-    if(logit_diffs is not None and model_type != "reward_model"):
-        logit_max_value = max([max(activ) for activ in logit_diffs])
-        logit_min_value = min([min(activ) for activ in logit_diffs])
-
-    # Add color bar
-    highlighted_text.append("Token Activations: " + make_colorbar(min_value, max_value))
-    if(logit_diffs is not None and model_type != "reward_model"):
-        highlighted_text.append('<div style="margin-top: 0.1em;"></div>')
-        highlighted_text.append("Logit Diff: " + make_colorbar(logit_min_value, logit_max_value))
-    
-    highlighted_text.append('<div style="margin-top: 0.5em;"></div>')
-    for seq_ind, (act, tok) in enumerate(zip(activations, toks)):
-        if(text_above_each_act is not None):
-            highlighted_text.append(f'<span>{text_above_each_act[seq_ind]}</span>')
-        for act_ind, (a, t) in enumerate(zip(act, tok)):
-            if(logit_diffs is not None and model_type != "reward_model"):
-                highlighted_text.append('<div style="display: inline-block;">')
-            text_color, background_color = value_to_color(a, max_value, min_value)
-            highlighted_text.append(f'<span style="background-color:{background_color};margin-right: {text_spacing}; color:rgb({text_color})">{t.replace(" ", "&nbsp")}</span>')
-            if(logit_diffs is not None and model_type != "reward_model"):
-                logit_diffs_act = logit_diffs[seq_ind][act_ind]
-                _, logit_background_color = value_to_color(logit_diffs_act, logit_max_value, logit_min_value)
-                highlighted_text.append(f'<div style="display: block; margin-right: {text_spacing}; height: 10px; background-color:{logit_background_color}; text-align: center;"></div></div>')
-        if(logit_diffs is not None and model_type=="reward_model"):
-            reward_change = logit_diffs[seq_ind].item()
-            text_color, background_color = value_to_color(reward_change, 10, -10)
-            highlighted_text.append(f'<br><span>Reward: </span><span style="background-color:{background_color};margin-right: {text_spacing}; color:rgb({text_color})">{reward_change:.2f}</span>')
-        highlighted_text.append('<div style="margin-top: 0.2em;"></div>')
-        # highlighted_text.append('<br><br>')
-    # highlighted_text.append('</body>')
-    highlighted_text = ''.join(highlighted_text)
-    return highlighted_text
-def save_token_display(tokens, activations, tokenizer, path, save=True, logit_diffs=None, show=False, model_type="causal"):
-    html = tokens_and_activations_to_html(tokens, activations, tokenizer, logit_diffs, model_type=model_type)
-    # if(save):
-    #     imgkit.from_string(html, path)
-    # if(show):
-    return display(HTML(html))
-
-def get_feature_indices(feature_activations, k=10, setting="max"):
-    # Sort the features by activation, get the indices
-    batch_size, seq_len = feature_activations.shape
-    feature_activations = rearrange(feature_activations, 'b s -> (b s)')
-    if setting=="max":
-        found_indices = torch.argsort(feature_activations, descending=True)[:k]
-    elif setting=="uniform":
-        # min_value = torch.min(feature_activations)
-        min_value = torch.min(feature_activations)
-        max_value = torch.max(feature_activations)
-
-        # Define the number of bins
-        num_bins = k
-
-        # Calculate the bin boundaries as linear interpolation between min and max
-        bin_boundaries = torch.linspace(min_value, max_value, num_bins + 1)
-
-        # Assign each activation to its respective bin
-        bins = torch.bucketize(feature_activations, bin_boundaries)
-
-        # Initialize a list to store the sampled indices
-        sampled_indices = []
-
-        # Sample from each bin
-        for bin_idx in torch.unique(bins):
-            if(bin_idx==0): # Skip the first one. This is below the median
-                continue
-            # Get the indices corresponding to the current bin
-            bin_indices = torch.nonzero(bins == bin_idx, as_tuple=False).squeeze(dim=1)
-            
-            # Randomly sample from the current bin
-            sampled_indices.extend(np.random.choice(bin_indices, size=1, replace=False))
-
-        # Convert the sampled indices to a PyTorch tensor & reverse order
-        found_indices = torch.tensor(sampled_indices).long().flip(dims=[0])
-    else: # random
-        # get nonzero indices
-        nonzero_indices = torch.nonzero(feature_activations)[:, 0]
-        # shuffle
-        shuffled_indices = nonzero_indices[torch.randperm(nonzero_indices.shape[0])]
-        found_indices = shuffled_indices[:k]
-    d_indices = found_indices // seq_len
-    s_indices = found_indices % seq_len
-    return d_indices, s_indices
-
-def get_feature_datapoints(d_idx, seq_pos_idx, all_activations, all_tokens, tokenizer):
-    full_activations = []
-    partial_activations = []
-    text_list = []
-    full_text = []
-    token_list = []
-    full_token_list = []
-    for md, s_ind in zip(d_idx, seq_pos_idx):
-        md = int(md)
-        s_ind = int(s_ind)
-        # full_tok = torch.tensor(dataset[md]["input_ids"])
-        
-        full_tok = all_tokens[md]
-        # [tokenizer.decode(t) for t in tokens[0]]
-
-        full_text.append(tokenizer.decode(full_tok))
-        tok = full_tok[:s_ind+1]
-        # tok = dataset[md]["input_ids"][:s_ind+1]
-        full_activations.append(all_activations[md].tolist())
-        partial_activations.append(all_activations[md][:s_ind+1].tolist())
-        text = tokenizer.decode(tok)
-        text_list.append(text)
-        token_list.append(tok)
-        full_token_list.append(full_tok)
-    return text_list, full_text, token_list, full_token_list, partial_activations, full_activations
-
-
-
-
-
-import json
-import os
-import re
-import torch
-
-def generate_enhanced_viewer(keys, features_to_save,  saved_feature_act_list, saved_token_list, tokenizer, model, aes, connections, connection_vals, output_dir="llm_feature_viewer", model_save_name="",CHUNK_SIZE = 100):
+def create_logit_lens_html(top_ind, top_val, bot_ind, bot_val, tokenizer: PreTrainedTokenizerBase, k=10):
     """
-    Generate an enhanced HTML viewer with separate data files for each feature.
-    
-    This creates:
-    1. A main index.html viewer file
-    2. Separate JavaScript data files for each feature to avoid CORS issues
-    3. Connection data betweekzn features with links that support ctrl+click to open in new tabs
-    
-    Args:
-        keys: List of model keys or identifiers
-        features_to_save: Dictionary mapping keys to lists of feature indices
-        saved_feature_act_list: Dictionary mapping keys to feature activation tensors
-        saved_token_list: List of tokens for each example
-        tokenizer: The tokenizer used to convert tokens to text
-        model: The model object (for logit lens)
-        suite: The suite object containing feature decoders
-        connections: Dictionary of module-to-module connections (indices)
-        connection_vals: Dictionary of module-to-module connection values
-        output_dir: Directory where the viewer files will be saved
-        model_save_name: Optional prefix for the output directory
-        
-    Returns:
-        The path to the generated index.html file
+    Create an HTML display of top and bottom tokens with their values.
+    Adapted from interp_utils.py
     """
     
-    # Number of examples to show per feature
-    num_feature_datapoints = 10
-    
-    # Prepare output directory
-    if model_save_name:
-        output_dir = f"{model_save_name}_{output_dir}"
-    
-    # Create directory structure
-    os.makedirs(output_dir, exist_ok=True)
-    data_dir = os.path.join(output_dir, "data")
-    os.makedirs(data_dir, exist_ok=True)
-    
-    # Create manifest data
-    manifest = {
-        "keys": keys,
-        "features": {}
-    }
-    
-    # Prepare string versions of features for manifest
-    for key in keys:
-        manifest["features"][key] = [str(f) for f in features_to_save[key]]
-        # Create directory for each key
-        key_dir = os.path.join(data_dir, key)
-        os.makedirs(key_dir, exist_ok=True)
-    # Function to get connections for a specific feature
-    def get_feature_connections(source_key, source_feature_idx):
-        feature_connections = []
-        
-        # Check if this key is in connections
-        if source_key not in connections:
-            return feature_connections
-            
-        # Check connections to all other modules
-        for target_key in connections[source_key]:
-            # Get connection indices tensor for this module pair
-            connection_tensor = connections[source_key][target_key]
-            
-            # Get connection values tensor for this module pair
-            value_tensor = connection_vals[source_key][target_key][source_feature_idx]
-            
-            # Ensure the feature index is valid
-            if source_feature_idx >= connection_tensor.shape[0]:
-                continue
-                
-            # Get row for this feature's connections
-            connection_row = connection_tensor[source_feature_idx]
-            
-            # Find non-zero connections (where connected)
-            # e.g. [0,1,4,6] for idx over the top-c connections (so 0-c indexed)
-            non_zero_indices = (connection_row > 0).nonzero()[:, 0]
-            
-            # Handle various tensor dimensions
-            if non_zero_indices.dim() == 0 and non_zero_indices.nelement() > 0:
-                # Single non-zero value case
-                non_zero_indices = [non_zero_indices.item()]
-            elif non_zero_indices.nelement() > 0:
-                non_zero_indices = non_zero_indices.tolist()
-            else:
-                non_zero_indices = []
-                
-            # For each connected feature, get the connection value
-            for nz_idx in non_zero_indices:
-                # Get the connection value from value_tensor
-                target_feature_idx = int(connection_row[nz_idx].item())
-                connection_value = float(value_tensor[nz_idx].item())
-                
-                # Only add if target feature is in features_to_save
-                # if target_feature_idx in features_to_save.get(target_key, []):
-                feature_connections.append({
-                    "target_key": target_key,
-                    "target_feature": target_feature_idx,
-                    "value": connection_value
-                })
-        
-        # Sort connections by strength (absolute value) in descending order
-        feature_connections.sort(key=lambda x: abs(x["value"]), reverse=True)
-        return feature_connections
-    
-    # Generate HTML for feature connections with URL links
-    def generate_connections_html(connections_list):
-        if not connections_list:
-            return "<div class='no-connections'>No significant connections found</div>"
-            
-        html = ["<div class='connections-container'>",
-                "<h3>Feature Connections</h3>",
-                "<table class='connections-table'>",
-                "<tr><th>Connected Feature</th><th>Connection Strength</th></tr>"]
-                
-        for conn in connections_list:
-            target_key = conn["target_key"]
-            target_feature = conn["target_feature"]
-            conn_value = conn["value"]
-            
-            # Determine CSS class based on connection value
-            if conn_value > 0:
-                value_class = "positive-connection"
-            else:
-                value_class = "negative-connection"
-                
-            # Create link to target feature with URL parameters
-            # This supports ctrl+click to open in new tab
-            html.append(f"<tr>")
-            html.append(f"<td><a href='index.html?key={target_key}&feature={target_feature}' class='feature-link'>{target_key} - Feature {target_feature}</a></td>")
-            html.append(f"<td class='{value_class}'>{conn_value:.4f}</td>")
-            html.append(f"</tr>")
-            
-        html.append("</table></div>")
-        return "\n".join(html)
-    
-    
-    
-#     # Function to safely save feature chunk data (preserving existing data)
-#     def save_feature_chunk(key, chunk_idx, new_chunk_data, data_dir):
-#         chunk_path = os.path.join(data_dir, key, f"chunk_{chunk_idx}.js")
-#         existing_data = {}
-        
-#         # Check if chunk file already exists
-#         if os.path.exists(chunk_path):
-#             try:
-#                 # Read existing chunk file
-#                 with open(chunk_path, 'r') as f:
-#                     content = f.read()
-#                     # Extract JSON data between markers
-#                     data_match = re.search(r'window\.featureChunk\s*=\s*(\{.*?\});', content, re.DOTALL)
-#                     if data_match:
-#                         existing_data = json.loads(data_match.group(1))
-#             except Exception as e:
-#                 print(f"Warning: Could not read existing chunk file: {e}")
-        
-#         # Merge existing data with new data
-#         merged_data = {**existing_data, **new_chunk_data}
-        
-#         # Write updated chunk file
-#         chunk_js = f'''// Features chunk {chunk_idx} data for {key}
-# window.featureChunk = {json.dumps(merged_data)};
-# '''
-#         with open(chunk_path, 'w') as f:
-#             f.write(chunk_js)
-    
-    def save_feature_chunk(key, chunk_idx, new_chunk_data, data_dir):
-        chunk_path = os.path.join(data_dir, key, f"chunk_{chunk_idx}.js")
-        existing_data = {}
-        
-        # Check if chunk file already exists
-        if os.path.exists(chunk_path):
-            try:
-                # Read existing chunk file
-                with open(chunk_path, 'r') as f:
-                    content = f.read()
-                    
-                # Use bracket counting approach instead of regex
-                start_marker = "window.featureChunk = "
-                start_pos = content.find(start_marker)
-                if start_pos != -1:
-                    start_pos += len(start_marker)
-                    # Find the end of the JSON object by tracking braces
-                    open_braces = 0
-                    for i in range(start_pos, len(content)):
-                        if content[i] == '{':
-                            open_braces += 1
-                        elif content[i] == '}':
-                            open_braces -= 1
-                            if open_braces == 0 and i + 1 < len(content) and content[i+1:].lstrip().startswith(';'):
-                                # Found the closing brace, extract the JSON
-                                json_str = content[start_pos-1:i+1]  # Include opening brace
-                                try:
-                                    existing_data = json.loads(json_str)
-                                    break
-                                except json.JSONDecodeError as e:
-                                    print(f"Warning: Invalid JSON in chunk file: {e}")
-                                    break
-            except Exception as e:
-                print(f"Warning: Could not read existing chunk file: {e}")
-        
-        # Merge existing data with new data
-        merged_data = {**existing_data, **new_chunk_data}
-        
-        # Write updated chunk file
-        chunk_js = f'''// Features chunk {chunk_idx} data for {key}
-    window.featureChunk = {json.dumps(merged_data)};
-    '''
-        with open(chunk_path, 'w') as f:
-            f.write(chunk_js)
+    # Decode tokens
+    def format_token_for_logit_lens(token_id_list, tokenizer_ref):
+        # tokenizer.decode can take a list of a single id
+        decoded = tokenizer_ref.decode(token_id_list)
+        # Escape HTML special characters first to prevent misinterpretation
+        escaped = html.escape(decoded)
+        # Then, replace spaces with underscores and actual newlines with '\n' string
+        return escaped.replace(" ", "_").replace("\n", "\\n")
 
-    # Generate chunked data files for each key
-    for key in keys:
-        features_for_this_key = features_to_save[key]
-        
-        # Group features into chunks
-        feature_chunks = {}
-        
-        for feature_local_idx, feature_global_idx in enumerate(features_for_this_key):
-            # Cast feature to int if it's a string
-            feature_global_idx = int(feature_global_idx) if isinstance(feature_global_idx, str) else feature_global_idx
-            feature_str = str(feature_global_idx)
-            
-            # Calculate chunk index
-            chunk_idx = feature_global_idx // CHUNK_SIZE
-            
-            # Initialize chunk if not exists
-            if chunk_idx not in feature_chunks:
-                feature_chunks[chunk_idx] = {}
-            
-            # Initialize content container for this feature
-            feature_data = {
-                "tokenActivations": "",
-                "logitLens": "",
-                "histogram": "",
-                "connections": ""
+    top_text = [format_token_for_logit_lens([tok], tokenizer) for tok in top_ind[:k]]
+    bot_text = [format_token_for_logit_lens([tok], tokenizer) for tok in bot_ind[:k]]
+    
+    # Create HTML template with direct background color attributes
+    html_template = """
+    <div style="margin-top: 20px;">
+        <style>
+            .logit-lens-table {
+                font-family: Arial, sans-serif;
+                border-collapse: collapse;
+                width: 100%;
+                margin-top: 10px;
+                color: #333; /* Default text color for table */
             }
+            .logit-lens-table th, .logit-lens-table td {
+                padding: 8px;
+                border: 1px solid #ddd;
+                text-align: left;
+            }
+            .logit-lens-table th {
+                background-color: #f2f2f2;
+            }
+            .logit-lens-title {
+                font-size: 18px;
+                font-weight: bold;
+                text-align: center;
+                margin-bottom: 10px;
+                color: #ccc; /* Light text color for title if on dark background */
+            }
+        </style>
+        
+        <div class="logit-lens-title">Logit Lens</div>
+        
+        <table class="logit-lens-table">
+            <tr>
+                <th>Top Token</th>
+                <th>Value</th>
+                <th>Bottom Token</th>
+                <th>Value</th>
+            </tr>
+    """
+    
+    for i in range(k):
+        html_template += f"""
+        <tr>
+            <td>{top_text[i]}</td>
+            <td><span style="background-color: #e6f7ff; color: #005f80; padding: 2px 4px; border-radius: 3px; display: inline-block;"><b>{top_val[i].item():.3f}</b></span></td>
+            <td>{bot_text[i]}</td>
+            <td><span style="background-color: #ffe6e6; color: #800000; padding: 2px 4px; border-radius: 3px; display: inline-block;"><b>{bot_val[i].item():.3f}</b></span></td>
+        </tr>
+        """
+    
+    html_template += "</table></div>"
+    return html_template
+
+
+# --- 3. Feature Dashboard ---
+
+def _get_context_html(
+    tokens: List[int],
+    activations_in_context: List[float], 
+    tokenizer: PreTrainedTokenizerBase,
+    min_act_for_norm: float,
+    max_act_for_norm: float,
+    positive_threshold: float = 0.01, # Added thresholds
+    negative_threshold: float = 0.01
+) -> str:
+    """Generates HTML for a single context window with highlighted tokens, styled like interp_utils.py."""
+    html_parts = []
+    # Token string processing similar to interp_utils.py
+    # However, interp_utils.py decodes token by token. Here we get a list of token_ids.
+    # We should decode them one by one to correctly handle special tokens and spaces.
+    
+    decoded_tokens = []
+    for token_id in tokens:
+        # Use decode for single tokens to get the string representation, including prefixes like 'Ġ'
+        # or handle special tokens.
+        
+        # Decode a single token ID. Pass as a list to decode for robustness with some tokenizers.
+        tok_str = tokenizer.decode([token_id])
+
+        display_token: str
+        if tok_str == tokenizer.eos_token or tok_str == tokenizer.bos_token or tok_str == tokenizer.pad_token:
+            # For special tokens, escape them and then wrap in brackets
+            display_token = f"[{html.escape(tok_str.upper())}]"
+        else:
+            # For regular tokens:
+            # 1. Handle space prefixes (like 'Ġ' or leading ' ') by converting to '&nbsp;'
+            #    and separating the rest of the token.
+            # 2. HTML escape the rest of the token.
+            # 3. Replace newline characters in the escaped part with '\n'.
             
-            # Get feature activations for this feature
-            feature_activations = saved_feature_act_list[key][..., feature_local_idx]
+            temp_tok_str = tok_str
+            prefix = ""
+
+            if temp_tok_str.startswith('Ġ'): # GPT2/RoBERTa BPE
+                prefix = '&nbsp;'
+                temp_tok_str = temp_tok_str[1:]
+            elif temp_tok_str.startswith(' '): # SentencePiece / WordPiece (leading space)
+                 prefix = '&nbsp;'
+                 temp_tok_str = temp_tok_str[1:]
             
-            # Get indices of examples with highest activations
-            d_idx, seq_idx = get_feature_indices(feature_activations, k=num_feature_datapoints, setting="max")
+            # Escape the main part of the token string
+            escaped_token_part = html.escape(temp_tok_str)
             
-            # Get data for these examples
-            text_list, full_text, token_list, full_token_list, partial_activations, full_activations = get_feature_datapoints(
-                d_idx, seq_idx, feature_activations, saved_token_list, tokenizer
+            # Replace newlines in the (now escaped) token part with '\n'
+            processed_token_part = escaped_token_part.replace("\n", "\\n")
+            
+            display_token = prefix + processed_token_part
+            
+        decoded_tokens.append(display_token)
+
+    for token_str, act_val in zip(decoded_tokens, activations_in_context):
+        text_color_rgb, background_color_rgba = value_to_color(
+            act_val, max_act_for_norm, min_act_for_norm,
+            positive_threshold=positive_threshold, negative_threshold=negative_threshold
+        )
+        
+        html_parts.append(
+            f'<span style="background-color:{background_color_rgba}; color:rgb({text_color_rgb}); margin-right: 0.00em; padding: 1px; border-radius: 3px;" title="Act: {act_val:.4f}">{token_str}</span>'
+        )
+    return "".join(html_parts)
+
+
+def _generate_connections_html(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    suite: SCAESuite,
+    k_top_connections: int = 10,
+) -> str:
+    """Generates HTML for the connections section of the dashboard."""
+    try:
+        # 1. Get all module names and parse them
+        parsed_modules = []
+        for name in suite.module_dict.keys():
+            try:
+                parts = name.split('_')
+                type = parts[0]
+                layer = int(parts[1])
+                parsed_modules.append({'name': name, 'type': type, 'layer': layer})
+            except (IndexError, ValueError):
+                continue
+
+        current_module_info = next((m for m in parsed_modules if m['name'] == module_name_str), None)
+        
+        if current_module_info is None:
+            return "<p>Could not parse current module name.</p>"
+
+        current_module_layer = current_module_info['layer']
+        current_module_type = current_module_info['type']
+        current_module = suite.module_dict[module_name_str]
+
+        # 2. UPSTREAM connections (current module is DOWNSTREAM)
+        all_upstream_connections = []
+        down_module = current_module
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < current_module_layer]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+            
+            if up_module_name not in down_module.connection_masks:
+                continue
+                
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+
+            if current_module_type == "attn":
+                vw = vw.sum(0)
+
+            if vw.ndim == 2 and feature_idx_in_module < vw.shape[0]:
+                feature_connections = vw[feature_idx_in_module]
+                non_zero_indices = feature_connections.nonzero(as_tuple=False).squeeze(-1)
+                
+                # Handle case where nonzero returns a single-element tensor that is not 1-D
+                if non_zero_indices.dim() == 0 and non_zero_indices.numel() == 1:
+                    non_zero_indices = non_zero_indices.unsqueeze(0)
+
+                for ind in non_zero_indices:
+                    val = feature_connections[ind].item()
+                    if abs(val) > 1e-4:
+                        all_upstream_connections.append({'strength': val, 'module': up_module_name, 'feature_idx': ind.item()})
+        
+        total_upstream = len(all_upstream_connections)
+        top_upstream = sorted([c for c in all_upstream_connections if c['strength'] > 0], key=lambda x: x['strength'], reverse=True)[:k_top_connections]
+        bottom_upstream = sorted([c for c in all_upstream_connections if c['strength'] < 0], key=lambda x: x['strength'])[:k_top_connections]
+
+
+        # 3. DOWNSTREAM connections (current module is UPSTREAM)
+        all_downstream_connections = []
+        up_module = current_module
+        up_module_name = module_name_str
+        
+        downstream_modules_info = [m for m in parsed_modules if m['layer'] > current_module_layer]
+
+        for down_module_info in downstream_modules_info:
+            down_module_name = down_module_info['name']
+            down_module = suite.module_dict[down_module_name]
+            down_module_type = down_module_info['type']
+            
+            if up_module_name not in down_module.connection_masks:
+                continue
+
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
             )
             
-            # Generate token activations HTML
-            token_html = tokens_and_activations_to_html(token_list, partial_activations, tokenizer)
-            feature_data["tokenActivations"] = token_html
+            if down_module_type == "attn":
+                vw = vw.sum(0)
             
-            # Generate logit lens HTML
-            try:
-                feature_decoder = aes[key].decoder.weight[:, feature_global_idx]
-                unembd = model.W_U
-                final_ln = model.ln_final
-                logit_lens = final_ln(feature_decoder) @ unembd
-                top_val, top_ind = torch.topk(logit_lens, k=10, dim=-1)
-                bot_val, bot_ind = torch.topk(logit_lens, k=10, dim=-1, largest=False)
-                
-                # Create logit lens HTML
-                logit_lens_html = create_logit_lens_html(top_ind, top_val, bot_ind, bot_val, tokenizer)
-                feature_data["logitLens"] = logit_lens_html
-            except Exception as e:
-                print(f"Error in logit lens: {e}")
-                feature_data["logitLens"] = f"<div class='error-panel'>Logit lens visualization unavailable: {str(e)}</div>"
-            
-            # Generate histogram HTML
-            try:
-                nz_feature_act = feature_activations[feature_activations != 0]
-                frequency = nz_feature_act.numel() / feature_activations.numel()
-                
-                # Create histogram HTML
-                hist_html = create_histogram_html(nz_feature_act.numpy(), 
-                                               title=f"Activation Frequency {frequency*100:.2f}%")
-                feature_data["histogram"] = hist_html
-            except Exception as e:
-                print(f"Error in hist: {e}")
+            if vw.ndim == 2 and feature_idx_in_module < vw.shape[1]:
+                feature_connections = vw[:, feature_idx_in_module]
+                non_zero_indices = feature_connections.nonzero(as_tuple=False).squeeze(-1)
 
-                feature_data["histogram"] = f"<div class='error-panel'>Histogram visualization unavailable: {str(e)}</div>"
-            
-            # Get feature connections
-            feature_connections = get_feature_connections(key, feature_global_idx)
-            
-            # Generate connections HTML
-            connections_html = generate_connections_html(feature_connections)
-            feature_data["connections"] = connections_html
-            
-            # Add feature data to chunk
-            feature_chunks[chunk_idx][feature_str] = {
-                "tokenActivations": feature_data["tokenActivations"],
-                "logitLens": feature_data["logitLens"],
-                "histogram": feature_data["histogram"],
-                "connections": connections_html
-            }
-        
-        # Save each chunk as a separate JS file, preserving existing data
-        for chunk_idx, chunk_data in feature_chunks.items():
-            save_feature_chunk(key, chunk_idx, chunk_data, data_dir)
-    
-    # Save manifest as a JavaScript file to avoid CORS issues
-    manifest_js = f'''// Feature manifest data
-const manifestData = {json.dumps(manifest)};
-// Configuration
-const CHUNK_SIZE = {CHUNK_SIZE};
-'''
-    
-    manifest_path = os.path.join(output_dir, "manifest.js")
-    with open(manifest_path, 'w') as f:
-        f.write(manifest_js)
-    
-    # Create main viewer HTML file
-    viewer_html = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Feature Viewer</title>
-    <style>
-        /* Reset and base styles */
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-        
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            background-color: #f5f5f5;
-            padding: 20px;
-        }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background-color: #fff;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
-            overflow: hidden;
-        }
-        
-        /* Header styles */
-        .header {
-            background-color: #2c3e50;
-            color: white;
-            padding: 20px;
-            text-align: center;
-        }
-        
-        .header h1 {
-            margin: 0;
-            font-size: 24px;
-        }
-        
-        /* Controls section */
-        .controls {
-            background-color: #f8f9fa;
-            padding: 20px;
-            border-bottom: 1px solid #e9ecef;
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
-        }
-        
-        .control-group {
-            flex: 1;
-            min-width: 200px;
-        }
-        
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-weight: 600;
-            color: #495057;
-        }
-        
-        select, input[type="number"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ced4da;
-            border-radius: 4px;
-            background-color: #fff;
-            font-size: 16px;
-        }
-        
-        .feature-input-container {
-            display: flex;
-            gap: 10px;
-        }
-        
-        .feature-input-container input {
-            flex: 1;
-        }
-        
-        .feature-input-container button {
-            padding: 10px 15px;
-            background-color: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        
-        /* Navigation section */
-        .navigation {
-            display: flex;
-            justify-content: space-between;
-            padding: 15px 20px;
-            background-color: #f8f9fa;
-            border-bottom: 1px solid #e9ecef;
-        }
-        
-        .button {
-            padding: 8px 16px;
-            background-color: #007bff;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-weight: 500;
-        }
-        
-        .button:hover {
-            background-color: #0069d9;
-        }
-        
-        .button:disabled {
-            background-color: #cccccc;
-            cursor: not-allowed;
-        }
-        
-        /* Multi-panel layout */
-        .upper-panels-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin: 20px 0;
-        }
-        
-        .panel-cell {
-            width: 50%;
-            padding: 0 10px;
-            vertical-align: top;
-        }
-        
-        .panel {
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            height: 100%;
-        }
-        
-        .panel-header {
-            background-color: #f1f1f1;
-            padding: 10px;
-            font-weight: bold;
-            border-bottom: 1px solid #ddd;
-        }
-        
-        .panel-content {
-            padding: 15px;
-            overflow: auto;
-            min-height: 225px;
-        }
-        
-        /* Content section */
-        .token-activations-container {
-            background-color: black;
-            color: white;
-            min-height: 400px;
-            padding: 20px;
-            overflow: auto;
-            margin: 0 20px 20px 20px;
-            border-radius: 4px;
-        }
-        
-        /* Connections section */
-        .connections-section {
-            margin: 0 20px 20px 20px;
-        }
-        
-        /* Loading indicator */
-        .loading {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 300px;
-            font-size: 18px;
-            color: #6c757d;
-        }
-        
-        /* Footer section */
-        .footer {
-            background-color: #f8f9fa;
-            text-align: center;
-            padding: 15px;
-            color: #6c757d;
-            border-top: 1px solid #e9ecef;
-        }
-        
-        /* Content styles for token activations */
-        .content {
-            font-family: monospace;
-            line-height: 1.4;
-            white-space: pre-wrap;
-        }
+                if non_zero_indices.dim() == 0 and non_zero_indices.numel() == 1:
+                    non_zero_indices = non_zero_indices.unsqueeze(0)
 
-        /* Error panel */
-        .error-panel {
-            background-color: #ffe6e6;
-            border: 1px solid #ffcccc;
-            color: #990000;
-            padding: 15px;
-            border-radius: 4px;
-            text-align: center;
-        }
+                for ind in non_zero_indices:
+                    val = feature_connections[ind].item()
+                    if abs(val) > 1e-4:
+                         all_downstream_connections.append({'strength': val, 'module': down_module_name, 'feature_idx': ind.item()})
+
+        total_downstream = len(all_downstream_connections)
+        top_downstream = sorted([c for c in all_downstream_connections if c['strength'] > 0], key=lambda x: x['strength'], reverse=True)[:k_top_connections]
+        bottom_downstream = sorted([c for c in all_downstream_connections if c['strength'] < 0], key=lambda x: x['strength'])[:k_top_connections]
+
+        # 4. Format into HTML
+        html_parts = ['<div style="display: flex; flex-direction: row; justify-content: space-around; width: 100%; background-color: #f2f2f2; color: black; border: 1px solid #ddd; padding: 10px; margin-bottom: 10px; border-radius: 5px;">']
         
-        /* Show/hide elements */
-        .hidden {
-            display: none !important;
-        }
+        # Column 1: Top Upstream
+        html_parts.append(f'<div style="width: 24%;"><h4>Top Upstream ({total_upstream})</h4><ul style="list-style: none; padding-left: 0;">')
+        if top_upstream:
+            for conn in top_upstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
         
-        /* Token table (for logit lens) */
-        .token-table {
-            font-family: Arial, sans-serif;
-            border-collapse: collapse;
-            width: 100%;
-            margin-top: 10px;
-        }
-        
-        .token-table td {
-            padding: 8px;
-            border-bottom: 1px solid #ddd;
-        }
-        
-        .title {
-            font-size: 20px;
-            font-weight: bold;
-            text-align: center;
-            margin-bottom: 10px;
-        }
-        
-        /* Fix for histogram images */
-        .histogram-container {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-        }
-        
-        .histogram-container img {
-            max-width: 100%;
-            max-height: 280px;
-            width: auto;
-            height: auto;
-            object-fit: contain;
-        }
-        
-        /* Connections styles */
-        .connections-container {
-            margin-top: 20px;
-            padding: 15px;
-            background-color: #f8f9fa;
-            border-radius: 4px;
-            border: 1px solid #e9ecef;
-        }
-        
-        .connections-container h3 {
-            margin-top: 0;
-            margin-bottom: 10px;
-            font-size: 18px;
-            color: #495057;
-        }
-        
-        .connections-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-family: Arial, sans-serif;
-        }
-        
-        .connections-table th {
-            background-color: #e9ecef;
-            padding: 8px;
-            text-align: left;
-            border-bottom: 2px solid #dee2e6;
-        }
-        
-        .connections-table td {
-            padding: 8px;
-            border-bottom: 1px solid #dee2e6;
-        }
-        
-        .feature-link {
-            color: #007bff;
-            text-decoration: none;
-        }
-        
-        .feature-link:hover {
-            text-decoration: underline;
-        }
-        
-        .positive-connection {
-            color: #28a745;
-            font-weight: bold;
-        }
-        
-        .negative-connection {
-            color: #dc3545;
-            font-weight: bold;
-        }
-        
-        .no-connections {
-            font-style: italic;
-            color: #6c757d;
-            padding: 10px;
-            text-align: center;
-        }
-    </style>
-    <!-- Load manifest data -->
-    <script src="manifest.js"></script>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Feature Viewer</h1>
-        </div>
-        
-        <div class="controls">
-            <div class="control-group">
-                <label for="keySelect">Select Model/Key:</label>
-                <select id="keySelect">
-                    <option value="" disabled selected>Choose a model/key</option>
-                    <!-- Options will be populated by JavaScript -->
-                </select>
-            </div>
-            <div class="control-group">
-                <label for="featureInput">Go to Feature #:</label>
-                <div class="feature-input-container">
-                    <input type="number" id="featureInput" min="0" placeholder="Enter feature number">
-                    <button id="goToFeature" class="button">Go</button>
-                </div>
-            </div>
-        </div>
-        
-        <div class="navigation">
-            <button id="prevFeature" class="button" disabled>Previous Feature</button>
-            <div>
-                <span id="featureInfo">No feature selected</span>
-            </div>
-            <button id="nextFeature" class="button" disabled>Next Feature</button>
-        </div>
-        
-        <!-- Upper panels for logit lens and histogram -->
-        <table class="upper-panels-table">
-            <tr>
-                <!-- Logit lens panel -->
-                <td class="panel-cell">
-                    <div class="panel">
-                        <div class="panel-header">Logit Lens</div>
-                        <div id="logitLensPanel" class="panel-content">
-                            <div class="loading">Select a feature to view logit lens</div>
-                        </div>
-                    </div>
-                </td>
-                
-                <!-- Histogram panel -->
-                <td class="panel-cell">
-                    <div class="panel">
-                        <div class="panel-header">Activation Histogram</div>
-                        <div id="histogramPanel" class="panel-content">
-                            <div class="loading">Select a feature to view histogram</div>
-                        </div>
-                    </div>
-                </td>
-            </tr>
-        </table>
-        
-        <!-- Token activations section -->
-        <div class="token-activations-container">
-            <div id="loadingIndicator" class="loading">
-                <p>Select a model/key and feature to view token activations</p>
-            </div>
-            <div id="contentDisplay" class="content hidden"></div>
-        </div>
-        
-        <!-- Connections section -->
-        <div class="connections-section">
-            <div id="connectionsPanel"></div>
-        </div>
-        
-        <div class="footer">
-            <p>Feature Viewer | Features Explorer</p>
-        </div>
-    </div>
+        # Column 2: Bottom Upstream
+        html_parts.append('<div style="width: 24%;"><h4>Bottom Upstream</h4><ul style="list-style: none; padding-left: 0;">')
+        if bottom_upstream:
+            for conn in bottom_upstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+        # Column 3: Top Downstream
+        html_parts.append(f'<div style="width: 24%;"><h4>Top Downstream ({total_downstream})</h4><ul style="list-style: none; padding-left: 0;">')
+        if top_downstream:
+            for conn in top_downstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+        # Column 4: Bottom Downstream
+        html_parts.append('<div style="width: 24%;"><h4>Bottom Downstream</h4><ul style="list-style: none; padding-left: 0;">')
+        if bottom_downstream:
+            for conn in bottom_downstream:
+                html_parts.append(f"<li>{conn['strength']:.2f}&nbsp;&nbsp;{conn['module']} / {conn['feature_idx']}</li>")
+        else:
+            html_parts.append("<li>None found</li>")
+        html_parts.append('</ul></div>')
+
+
+        html_parts.append('</div>')
+        return "".join(html_parts)
+
+    except Exception as e:
+        # Also print to console for debugging
+        print(f"Error generating connections view for {module_name_str}/{feature_idx_in_module}: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"<div style='border: 1px solid #444; padding: 5px; margin-bottom: 10px; color: #ffaaaa;'>Error generating connections display: {e}</div>"
+
+
+def generate_feature_dashboard(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    activations_base_dir: str, 
+    tokenizer: PreTrainedTokenizerBase,
+    model: HookedTransformer, # Added model for logit lens
+    suite: SCAESuite,         # Added suite for AE decoder weights
+    k_top_contexts: int = 10,
+    k_top_connections: int = 10,
+    context_window_size: int = 20,
+    positive_threshold: float = 0.01, # Thresholds for coloring
+    negative_threshold: float = 0.01
+):
+    """
+    Generates an HTML dashboard displaying top-k contexts and logit lens for a given feature.
+    Styling is adapted from interp_utils.py.
+    """
+    print(f"Generating dashboard for: {module_name_str}, Feature Index: {feature_idx_in_module}")
     
-    <script>
-        // ===== DOM ELEMENTS =====
-        // Get references to DOM elements
-        const keySelect = document.getElementById('keySelect');
-        const featureInput = document.getElementById('featureInput');
-        const goToFeatureBtn = document.getElementById('goToFeature');
-        const prevFeatureBtn = document.getElementById('prevFeature');
-        const nextFeatureBtn = document.getElementById('nextFeature');
-        const featureInfo = document.getElementById('featureInfo');
-        const loadingIndicator = document.getElementById('loadingIndicator');
-        const contentDisplay = document.getElementById('contentDisplay');
-        const logitLensPanel = document.getElementById('logitLensPanel');
-        const histogramPanel = document.getElementById('histogramPanel');
-        const connectionsPanel = document.getElementById('connectionsPanel');
-     
-        // Current feature data
-        let currentFeatureData = null;
-        
-        // ===== URL PARAMETER HANDLING =====
-        // Parse URL parameters
-        function getUrlParams() {
-            const params = {};
-            const searchParams = new URLSearchParams(window.location.search);
+    all_feature_activations = [] 
+
+    batch_dirs = sorted([os.path.join(activations_base_dir, d) for d in os.listdir(activations_base_dir) if d.startswith("batch_")])
+
+    if not batch_dirs:
+        print(f"No batch data found in {activations_base_dir}")
+        display(HTML("<p>No batch data found.</p>"))
+        return
+
+    min_overall_activation = float('inf')
+    max_overall_activation = float('-inf')
+
+    for batch_dir_path in batch_dirs:
+        activations_file = os.path.join(batch_dir_path, f"activations_{module_name_str}.pt")
+        if not os.path.exists(activations_file):
+            continue
+
+        try:
+            data = torch.load(activations_file, map_location='cpu')
+            indices_tuple, values, shape = data['indices'], data['values'], data['shape']
             
-            for (const [key, value] of searchParams) {
-                params[key] = value;
-            }
+            b_idx_local, s_idx, f_idx = indices_tuple
             
-            return params;
-        }
-        
-        // ===== DATA LOADING =====
-        // Calculate which chunk contains a feature
-        function getChunkIndex(feature) {
-            // const CHUNK_SIZE = 100;
-            return Math.floor(parseInt(feature) / CHUNK_SIZE);
-        }
-        
-        // Load feature data from chunk (avoids CORS issues)
-        function loadFeatureData(key, feature) {
-            return new Promise((resolve, reject) => {
-                // Set up a timeout for loading
-                const timeout = setTimeout(() => {
-                    reject(new Error('Timeout loading feature data'));
-                }, 10000); // 10 second timeout
-                
-                // Calculate which chunk contains this feature
-                const chunkIndex = getChunkIndex(feature);
-                
-                // Remove existing script if any
-                const existingScript = document.getElementById('featureChunkScript');
-                if (existingScript) {
-                    document.head.removeChild(existingScript);
-                }
-                
-                // Reset window.featureChunk
-                window.featureChunk = null;
-                
-                // Create new script element
-                const script = document.createElement('script');
-                script.id = 'featureChunkScript';
-                script.src = `data/${key}/chunk_${chunkIndex}.js`;
-                
-                script.onload = () => {
-                    clearTimeout(timeout);
-                    if (window.featureChunk && window.featureChunk[feature]) {
-                        resolve(window.featureChunk[feature]);
-                    } else {
-                        reject(new Error(`Feature ${feature} not found in chunk ${chunkIndex}`));
-                    }
-                };
-                
-                script.onerror = () => {
-                    clearTimeout(timeout);
-                    reject(new Error(`Failed to load chunk ${chunkIndex} for ${key}`));
-                };
-                
-                // Add script to document
-                document.head.appendChild(script);
-            });
-        }
-        
-        // ===== INITIALIZATION =====
-        // Initialize the viewer
-        function initViewer() {
-            // Check if manifest data is available
-            if (!manifestData || !manifestData.keys || !manifestData.features) {
-                showError('Failed to load manifest data. Please refresh the page.');
-                return;
-            }
+            feature_match_mask = (f_idx == feature_idx_in_module)
             
-            // Populate the keys dropdown
-            manifestData.keys.forEach(key => {
-                const option = document.createElement('option');
-                option.value = key;
-                option.textContent = key;
-                keySelect.appendChild(option);
-            });
+            vals_for_feat = values[feature_match_mask]
+            b_idx_local_for_feat = b_idx_local[feature_match_mask]
+            s_idx_for_feat = s_idx[feature_match_mask]
+
+            if vals_for_feat.numel() > 0:
+                min_overall_activation = min(min_overall_activation, vals_for_feat.min().item())
+                max_overall_activation = max(max_overall_activation, vals_for_feat.max().item())
+
+            for val, b_local, s_local in zip(vals_for_feat.tolist(), b_idx_local_for_feat.tolist(), s_idx_for_feat.tolist()):
+                all_feature_activations.append((val, batch_dir_path, b_local, s_local))
+        except Exception as e:
+            print(f"Error loading or processing {activations_file}: {e}")
+            continue
             
-            // Set up event listeners
-            keySelect.addEventListener('change', handleKeyChange);
-            goToFeatureBtn.addEventListener('click', handleGoToFeature);
-            featureInput.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') {
-                    handleGoToFeature();
-                }
-            });
-            prevFeatureBtn.addEventListener('click', showPreviousFeature);
-            nextFeatureBtn.addEventListener('click', showNextFeature);
+    if not all_feature_activations:
+        print(f"No activations found for feature {module_name_str}/{feature_idx_in_module} across all batches.")
+        display(HTML("<p>No activations found for this feature.</p>"))
+        return
+
+    all_feature_activations.sort(key=lambda x: x[0], reverse=True)
+    top_k_contexts_info = all_feature_activations[:k_top_contexts]
+
+    if not top_k_contexts_info:
+        print(f"No top-k contexts to display.")
+        display(HTML("<p>No top-k contexts found.</p>"))
+        return
+
+    # Use min/max overall activation for color bar normalization
+    # If only one value (or all same), add some buffer for make_colorbar
+    if min_overall_activation == max_overall_activation:
+        if min_overall_activation == 0:
+            min_overall_activation = -0.1
+            max_overall_activation = 0.1
+        else:
+            buffer = abs(min_overall_activation * 0.1) if min_overall_activation != 0 else 0.1
+            min_overall_activation -= buffer
+            max_overall_activation += buffer
+    
+    # Ensure min is less than max if they became equal due to buffer logic for zero
+    if min_overall_activation >= max_overall_activation:
+        max_overall_activation = min_overall_activation + 0.1
+
+
+    # --- Main HTML Structure ---
+    # Wrap in a body style similar to interp_utils.py for the token display part
+    html_output_parts = ['<body style="background-color:black; color: white; padding: 10px; font-family: monospace;">']
+    
+    # --- Connections Section ---
+    connections_html_content = _generate_connections_html(
+        module_name_str, feature_idx_in_module, suite, k_top_connections=k_top_connections
+    )
+    html_output_parts.append(connections_html_content)
+    
+    # removed this to reduce clutter
+    # html_output_parts.append(f"<h3 style='color: #eee;'>Top {k_top_contexts} unique contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
+    
+    # Add color bar using the overall min/max activations
+    colorbar_html = make_colorbar(min_overall_activation, max_overall_activation, positive_threshold=positive_threshold, negative_threshold=negative_threshold)
+    html_output_parts.append(f"<div style='margin-bottom: 10px;'>Token Activations: {colorbar_html}</div>")
+
+    printed_contexts = set()
+    displayed_contexts_count = 0
+
+    for rank, (act_val, batch_dir_path, sample_idx_in_batch, token_idx_in_sample) in enumerate(top_k_contexts_info):
+        if displayed_contexts_count >= k_top_contexts:
+            break
+
+        context_identifier = (batch_dir_path, sample_idx_in_batch)
+        if context_identifier in printed_contexts:
+            continue
+
+        try:
+            tokens_file = os.path.join(batch_dir_path, "tokens.pt")
+            all_tokens_in_batch = torch.load(tokens_file, map_location='cpu')
+            sample_tokens_full = all_tokens_in_batch[sample_idx_in_batch].tolist() 
             
-            // Check URL parameters for direct feature loading
-            const params = getUrlParams();
-            const urlKey = params.key;
-            const urlFeature = params.feature;
+            half_window = context_window_size // 2
+            start_idx = max(0, token_idx_in_sample - half_window)
+            end_idx = min(len(sample_tokens_full), token_idx_in_sample + half_window + (context_window_size % 2))
+            context_token_ids = sample_tokens_full[start_idx:end_idx]
+
+            current_batch_activations_file = os.path.join(batch_dir_path, f"activations_{module_name_str}.pt")
+            act_data = torch.load(current_batch_activations_file, map_location='cpu')
+            idx_tuple, val_tensor, shp = act_data['indices'], act_data['values'], act_data['shape']
             
-            if (urlKey && urlFeature && 
-                manifestData.keys.includes(urlKey) && 
-                manifestData.features[urlKey]) {
+            dense_sample_feature_activations = torch.zeros(shp[1], dtype=val_tensor.dtype) # Use dtype from loaded tensor
+            mask_for_sample_and_feature = (idx_tuple[0] == sample_idx_in_batch) & (idx_tuple[2] == feature_idx_in_module)
+            seq_indices_for_s_f = idx_tuple[1][mask_for_sample_and_feature]
+            vals_for_s_f = val_tensor[mask_for_sample_and_feature]
+            
+            if seq_indices_for_s_f.numel() > 0:
+                 dense_sample_feature_activations.scatter_(0, seq_indices_for_s_f, vals_for_s_f)
+            else: # Handle case where there are no activations for this specific sample and feature
+                 dense_sample_feature_activations = torch.zeros(shp[1], dtype=val_tensor.dtype) # Still need to define it
+            
+            activations_for_context_window = dense_sample_feature_activations[start_idx:end_idx].tolist()
+
+            # Use overall min/max for normalization in _get_context_html for consistency with colorbar
+            context_html = _get_context_html(
+                context_token_ids, activations_for_context_window, tokenizer, 
+                min_overall_activation, max_overall_activation,
+                positive_threshold, negative_threshold
+            )
+            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 10px; margin-bottom: 10px; border-radius: 5px;'><b>Max act: {act_val:.4f}</b><br><div style='margin-top: 5px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: break-word;'>{context_html}</div></div>")
+            printed_contexts.add(context_identifier)
+            displayed_contexts_count += 1
+
+        except Exception as e:
+            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 5px; margin-bottom: 10px; color: #ffaaaa;'>Error processing context {rank+1}: {e}</div>")
+            print(f"Error processing context {rank+1} for feature {module_name_str}/{feature_idx_in_module}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # --- Logit Lens Section ---
+    logit_lens_html_content = ""
+    try:
+        # Correctly access ModuleDict element
+        if module_name_str in suite.module_dict:
+            scae_module = suite.module_dict[module_name_str]
+            if hasattr(scae_module, 'ae'):
+                ae_instance = scae_module.ae
+                feature_vector_for_logit_lens = None
+
+                if isinstance(ae_instance, AutoEncoderTopK):
+                    if feature_idx_in_module < ae_instance.decoder.weight.shape[1]:
+                        feature_vector_for_logit_lens = ae_instance.decoder.weight[:, feature_idx_in_module]
+                    else:
+                        logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for AutoEncoderTopK decoder.</p>"
                 
-                // Select the key from URL
-                keySelect.value = urlKey;
-                handleKeyChange();
-                
-                // Allow a small delay for the feature dropdown to update
-                setTimeout(() => {
-                    // Try to load the feature directly
-                    loadFeature(urlKey, urlFeature);
-                }, 100);
-            }
-            // If no URL params, select first key and feature if available
-            else if (manifestData.keys.length > 0) {
-                // Select first key
-                keySelect.value = manifestData.keys[0];
-                handleKeyChange();
-                
-                                // New code:
-                if (manifestData.features[manifestData.keys[0]] && manifestData.features[manifestData.keys[0]].length > 0) {
-                    setTimeout(() => {
-                        const firstFeature = manifestData.features[manifestData.keys[0]][0];
-                        featureInput.value = firstFeature;
-                        loadFeature(manifestData.keys[0], firstFeature);
-                    }, 100);
-                }
-            }
-        }
-        
-        // Show error message
-        function showError(message) {
-            loadingIndicator.classList.remove('hidden');
-            loadingIndicator.innerHTML = `<p class="error-panel">${message}</p>`;
-            contentDisplay.classList.add('hidden');
-        }
-        
-        // ===== EVENT HANDLERS =====
-        // Handle key selection change
-        function handleKeyChange() {
-            const selectedKey = keySelect.value;
-            
-            if (selectedKey) {
-                // Clear content display
-                contentDisplay.classList.add('hidden');
-                loadingIndicator.classList.remove('hidden');
-                loadingIndicator.innerHTML = '<p>Please enter a feature number to view</p>';
-                
-                // Reset feature info
-                featureInfo.textContent = 'No feature selected';
-                
-                // Clear panels
-                logitLensPanel.innerHTML = '<div class="loading">Enter a feature number to view logit lens</div>';
-                histogramPanel.innerHTML = '<div class="loading">Enter a feature number to view histogram</div>';
-                connectionsPanel.innerHTML = '';
-                
-                // Disable navigation buttons
-                prevFeatureBtn.disabled = true;
-                nextFeatureBtn.disabled = true;
-                
-                // Reset current feature data
-                currentFeatureData = null;
-                
-                // Load first feature by default
-                if (manifestData.features[selectedKey] && manifestData.features[selectedKey].length > 0) {
-                    setTimeout(() => {
-                        const firstFeature = manifestData.features[selectedKey][0];
-                        featureInput.value = firstFeature;
-                        loadFeature(selectedKey, firstFeature);
-                    }, 100);
-                }
-            }
-        }
-        
-        // Handle direct feature number input
-        function handleGoToFeature() {
-            const selectedKey = keySelect.value;
-            const featureNum = featureInput.value.trim();
-            
-            if (!selectedKey) {
-                alert('Please select a model/key first');
-                return;
-            }
-            
-            if (!featureNum) {
-                alert('Please enter a feature number');
-                return;
-            }
-            
-            loadFeature(selectedKey, featureNum);
-        }
-        
-        // Load a specific feature by key and feature number
-        async function loadFeature(key, feature) {
-            // Update feature info
-            featureInfo.textContent = `${key} - Feature ${feature}`;
-            featureInput.value = feature; // Update input to match
-            featureInput.value = feature; // Update input to match
-            
-            // Show loading indicators
-            loadingIndicator.classList.remove('hidden');
-            loadingIndicator.innerHTML = '<p>Loading content...</p>';
-            contentDisplay.classList.add('hidden');
-            
-            logitLensPanel.innerHTML = '<div class="loading">Loading logit lens...</div>';
-            histogramPanel.innerHTML = '<div class="loading">Loading histogram...</div>';
-            connectionsPanel.innerHTML = '<div class="loading">Loading connections...</div>';
-            
-            // Update URL without reloading page
-            const newUrl = new URL(window.location.href);
-            newUrl.searchParams.set('key', key);
-            newUrl.searchParams.set('feature', feature);
-            window.history.pushState({ key, feature }, '', newUrl.href);
-            
-            try {
-                // Load feature data
-                currentFeatureData = await loadFeatureData(key, feature);
-                
-                // Display the data
-                displayFeatureData();
-                
-                // Disable navigation buttons for initial state
-                const allFeatures = manifestData.features[key].map(f => parseInt(f));
-                // const minFeature = Math.min(...allFeatures);
-                const maxFeature = Math.max(...allFeatures);
-                
-                prevFeatureBtn.disabled = parseInt(feature) <= 0;
-                nextFeatureBtn.disabled = parseInt(feature) >= maxFeature;
-            } catch (error) {
-                console.error('Error loading feature data:', error);
-                showError(`Failed to load data for ${key} - Feature ${feature}`);
-            }
-        }
-        
-        
-        // Display the loaded feature data
-        function displayFeatureData() {
-            if (currentFeatureData) {
-                // Display token activations
-                contentDisplay.innerHTML = currentFeatureData.tokenActivations;
-                contentDisplay.classList.remove('hidden');
-                loadingIndicator.classList.add('hidden');
-                
-                // Display logit lens
-                logitLensPanel.innerHTML = currentFeatureData.logitLens;
-                
-                // Display histogram
-                histogramPanel.innerHTML = currentFeatureData.histogram;
-                
-                // Display connections
-                connectionsPanel.innerHTML = currentFeatureData.connections;
-            }
-        }
-        
-        // ===== NAVIGATION CONTROLS =====
-        // Show previous feature
-        function showPreviousFeature() {
-            const selectedKey = keySelect.value;
-            const currentFeature = featureInfo.textContent.split(' - Feature ')[1];
-            
-            if (selectedKey && currentFeature) {
-                const prevFeature = parseInt(currentFeature) - 1;
-                if (prevFeature >= 0) {
-                    loadFeature(selectedKey, prevFeature);
-                }
-            }
-        }
-        
-        // Show next feature
-        function showNextFeature() {
-            const selectedKey = keySelect.value;
-            const currentFeature = featureInfo.textContent.split(' - Feature ')[1];
-            
-            if (selectedKey && currentFeature) {
-                const nextFeature = parseInt(currentFeature) + 1;
-                const maxFeature = Math.max(...manifestData.features[selectedKey].map(f => parseInt(f)));
-                
-                if (nextFeature <= maxFeature) {
-                    loadFeature(selectedKey, nextFeature);
-                }
-            }
-        }
-        
-        // Update navigation button states
-        function updateNavigationButtons(key, feature) {
-            if (!key || !feature) return;
-            
-            const featureNum = parseInt(feature);
-            const allFeatures = manifestData.features[key].map(f => parseInt(f));
-            const minFeature = Math.min(...allFeatures);
-            const maxFeature = Math.max(...allFeatures);
-            
-            prevFeatureBtn.disabled = featureNum <= minFeature;
-            nextFeatureBtn.disabled = featureNum >= maxFeature;
-        }
-        
-        // Handle browser back/forward navigation
-        window.addEventListener('popstate', function(event) {
-            const params = getUrlParams();
-            
-            if (params.key && params.feature) {
-                // Only update if values actually changed
-                if (keySelect.value !== params.key) {
-                    keySelect.value = params.key;
-                    handleKeyChange();
+                elif isinstance(ae_instance, CrosscoderTopK):
+                    if feature_idx_in_module < ae_instance.decoder_weight.shape[0]:
+                        # Sum decoder_weight over the n_outputs dimension for the specific feature
+                        # decoder_weight shape: (dict_size, n_outputs, d_model)
+                        # Select for feature: (n_outputs, d_model)
+                        feature_specific_decoder_weights = ae_instance.decoder_weight[feature_idx_in_module, :, :]
+                        feature_vector_for_logit_lens = feature_specific_decoder_weights.sum(dim=0)
+                    else:
+                        logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for CrosscoderTopK decoder_weight.</p>"
+                else:
+                    logit_lens_html_content = "<p style='color: #ffcc00;'>Unknown AE type for logit lens.</p>"
+
+                if feature_vector_for_logit_lens is not None:
+                    # Ensure feature_vector matches the dtype of model.W_U for matmul
+                    feature_vector_for_logit_lens = feature_vector_for_logit_lens.to(dtype=model.W_U.dtype, device=model.W_U.device)
+                    with torch.no_grad():
+                        # ln_final typically expects float32 or the model's main working dtype
+                        # If ln_final itself is bfloat16 and W_U is bfloat16, this is fine.
+                        # If ln_final is float32, it's good feature_vector is also float32 (or compatible).
+                        logit_lens_logits = model.ln_final(feature_vector_for_logit_lens) @ model.W_U
                     
-                    setTimeout(() => {
-                        loadFeature(params.key, params.feature);
-                    }, 100);
-                } else {
-                    loadFeature(params.key, params.feature);
-                }
-            }
-        });
+                    top_val, top_ind = torch.topk(logit_lens_logits, k=10, dim=-1)
+                    bot_val, bot_ind = torch.topk(logit_lens_logits, k=10, dim=-1, largest=False)
+                    
+                    logit_lens_html_content = create_logit_lens_html(top_ind.cpu(), top_val.cpu(), bot_ind.cpu(), bot_val.cpu(), tokenizer)
+            else:
+                logit_lens_html_content = "<p style='color: #ffcc00;'>Could not find AE module for logit lens (module name not in suite.module_dict).</p>"
+        else:
+            logit_lens_html_content = "<p style='color: #ffcc00;'>Could not find AE module for logit lens (module name not in suite.module_dict).</p>"
+    except Exception as e:
+        logit_lens_html_content = f"<p style='color: #ffaaaa;'>Error generating logit lens: {e}</p>"
+        print(f"Error generating logit lens for {module_name_str}/{feature_idx_in_module}: {e}")
+        import traceback
+        traceback.print_exc()
         
-        // Initialize the viewer when the page loads
-        window.addEventListener('DOMContentLoaded', () => {
-            initViewer();
+    html_output_parts.append(logit_lens_html_content)
+    html_output_parts.append('</body>')
+    display(HTML("".join(html_output_parts)))
+
+
+def find_non_dead_features(activations_dir: str) -> Dict[str, Dict[str, List[int]]]:
+    """
+    Finds non-dead features by scanning saved activation files.
+
+    A feature is considered non-dead if it has at least one non-zero activation
+    value across all processed batches for a given mode (sparse/non-sparse).
+
+    Args:
+        activations_dir: The base directory where activation batches were saved by
+                         `collect_activations_and_tokens`. This directory should contain
+                         subdirectories like 'sparse_true' and 'sparse_false'.
+
+    Returns:
+        A dictionary with keys 'sparse_true' and 'sparse_false'. Each of these
+        contains a dictionary mapping module names to a sorted list of their
+        non-dead feature indices.
+        Example:
+        {
+            'sparse_true': {'attn_0': [1, 5, ...], 'cc_1': [10, 23, ...]},
+            'sparse_false': {'attn_0': [0, 1, 2, ...], 'cc_1': [5, 12, ...]}
+        }
+    """
+    results = {}
+    modes = ['sparse_true', 'sparse_false']
+
+    for mode in modes:
+        mode_path = os.path.join(activations_dir, mode)
+        if not os.path.isdir(mode_path):
+            print(f"Directory for mode '{mode}' not found at {mode_path}. Skipping.")
+            continue
+
+        non_dead_features_for_mode = {} 
+
+        batch_dirs = sorted([d for d in os.listdir(mode_path) if d.startswith("batch_") and os.path.isdir(os.path.join(mode_path, d))])
+        if not batch_dirs:
+            print(f"No batch data found in {mode_path}.")
+            results[mode] = {}
+            continue
             
-            // After initialization, if URL doesn't have params, open first feature of first key
-            setTimeout(() => {
-                const params = getUrlParams();
-                if (!params.key && !params.feature && manifestData.keys.length > 0) {
-                    const firstKey = manifestData.keys[0];
-                    keySelect.value = firstKey;
-                    handleKeyChange();
-                }
-            }, 200);
-        });
-    </script>
-</body>
-</html>'''
+        print(f"Processing mode: {mode}...")
+        for batch_dir_name in batch_dirs:
+            batch_dir_path = os.path.join(mode_path, batch_dir_name)
+            
+            activation_files = [f for f in os.listdir(batch_dir_path) if f.startswith("activations_") and f.endswith(".pt")]
+
+            for activation_file in activation_files:
+                module_name = activation_file.replace("activations_", "").replace(".pt", "")
+                
+                if module_name not in non_dead_features_for_mode:
+                    non_dead_features_for_mode[module_name] = set()
+
+                file_path = os.path.join(batch_dir_path, activation_file)
+                try:
+                    data = torch.load(file_path, map_location='cpu')
+                    feature_indices_with_activation = data['indices'][2]
+                    
+                    if feature_indices_with_activation.numel() > 0:
+                        non_dead_features_for_mode[module_name].update(feature_indices_with_activation.tolist())
+                except Exception as e:
+                    print(f"Error loading or processing {file_path}: {e}")
+        
+        sorted_non_dead_features = {
+            module: sorted(list(features))
+            for module, features in non_dead_features_for_mode.items()
+        }
+        results[mode] = sorted_non_dead_features
     
-    # Save main viewer HTML file
-    index_path = os.path.join(output_dir, "index.html")
-    with open(index_path, 'w') as f:
-        f.write(viewer_html)
+    print("Finished finding non-dead features.")
+    return results
+
+
+def plot_alive_feature_percentage(
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    suite: SCAESuite
+):
+    """
+    Generates and displays a bar chart showing the percentage of alive features
+    for each module, separated by sparse and non-sparse modes.
+
+    Args:
+        non_dead_features_dict: The dictionary returned by `find_non_dead_features`.
+        suite: The SCAESuite object, used to get the total number of features per module.
+    """
     
-    # print(f"Enhanced token activation viewer created at: {output_dir}")
-    # print(f"Open {index_path} in your browser to use the viewer")
+    # 1. Get module names and sort them: attn_0, attn_1, ..., cc_0, cc_1, ...
+    def sort_key(name: str):
+        parts = name.split('_')
+        module_type = parts[0]
+        layer = int(parts[1])
+        # 'attn' comes before 'cc'
+        type_priority = 0 if module_type == 'attn' else 1
+        return (type_priority, layer)
+
+    module_names = sorted(suite.module_dict.keys(), key=sort_key)
+
+    vanilla_percentages = []
+    sparsely_connected_percentages = []
     
-    # If running in notebook, provide a clickable link
-    # try:
-    #     from IPython.display import HTML, display
-    #     display(HTML(f'<a href="{index_path}" target="_blank">Open Enhanced Token Activation Viewer</a>'))
-    # except:
-    #     pass
+    # 2. Calculate percentages for each module
+    for name in module_names:
+        scae_module_wrapper = suite.module_dict[name]
+        if not scae_module_wrapper or not hasattr(scae_module_wrapper, 'ae'):
+            continue
+        
+        ae_instance = scae_module_wrapper.ae
+        total_features = 0
+        if isinstance(ae_instance, AutoEncoderTopK):
+            total_features = ae_instance.decoder.weight.shape[1]
+        elif isinstance(ae_instance, CrosscoderTopK):
+            total_features = ae_instance.decoder_weight.shape[0]
+
+        if total_features == 0:
+            vanilla_percentages.append(0)
+            sparsely_connected_percentages.append(0)
+            continue
+            
+        # Get alive counts from the input dictionary
+        num_alive_sparsely_connected = len(non_dead_features_dict.get('sparse_true', {}).get(name, []))
+        num_alive_vanilla = len(non_dead_features_dict.get('sparse_false', {}).get(name, []))
+        
+        sparsely_connected_percentages.append((num_alive_sparsely_connected / total_features) * 100)
+        vanilla_percentages.append((num_alive_vanilla / total_features) * 100)
+
+    # 3. Plotting
+    x = np.arange(len(module_names))  # the label locations
+    width = 0.35  # the width of the bars
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    rects1 = ax.bar(x - width/2, vanilla_percentages, width, label='Vanilla', color='royalblue')
+    rects2 = ax.bar(x + width/2, sparsely_connected_percentages, width, label='Sparsely-connected', color='skyblue')
+
+    # Add some text for labels, title and axes ticks
+    ax.set_ylabel('Percentage of Alive Features (%)')
+    ax.set_title('Percentage of Alive Features by Module and Mode')
+    ax.set_xticks(x)
+    ax.set_xticklabels(module_names, rotation=45, ha="right")
+    ax.legend()
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_upstream_connection_histograms(
+    suite: SCAESuite,
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    mode: str = 'sparse_true'
+):
+    """
+    Computes and plots histograms of the number of upstream connections for each
+    alive feature in each module.
+
+    Args:
+        suite: The SCAESuite object.
+        non_dead_features_dict: Dictionary from find_non_dead_features.
+        mode: The mode to analyze ('sparse_true' or 'sparse_false').
+              Defaults to 'sparse_true' as connections are most relevant there.
+    """
+    print(f"Generating upstream connection histograms for mode: {mode}")
+
+    # 1. Parse and sort all module names
+    parsed_modules = []
+    for name in suite.module_dict.keys():
+        try:
+            parts = name.split('_')
+            parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+        except (IndexError, ValueError):
+            continue
     
-    return index_path
+    def sort_key(mod):
+        return (0 if mod['type'] == 'attn' else 1, mod['layer'])
+    
+    parsed_modules.sort(key=sort_key)
+    
+    all_module_counts = {}
+
+    # 2. Iterate through each module as the downstream module to calculate connection counts
+    for down_module_info in parsed_modules:
+        down_module_name = down_module_info['name']
+        down_module = suite.module_dict[down_module_name]
+        
+        alive_features = non_dead_features_dict.get(mode, {}).get(down_module_name, [])
+        if not alive_features:
+            all_module_counts[down_module_name] = []
+            continue
+
+        ae_instance_down = down_module.ae
+        total_features_down = 0
+        if isinstance(ae_instance_down, AutoEncoderTopK):
+            total_features_down = ae_instance_down.decoder.weight.shape[1]
+        elif isinstance(ae_instance_down, CrosscoderTopK):
+            total_features_down = ae_instance_down.decoder_weight.shape[0]
+
+        if total_features_down == 0:
+            continue
+            
+        total_upstream_connections = torch.zeros(total_features_down, dtype=torch.int32)
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < down_module_info['layer']]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+
+            if up_module_name not in down_module.connection_masks:
+                continue
+            
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            if down_module_info['type'] == "attn":
+                vw = vw.sum(0)
+            
+            non_zero_per_row = (vw.abs() > 1e-4).sum(dim=1)
+            total_upstream_connections += non_zero_per_row.cpu().int()
+
+        alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
+        counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        all_module_counts[down_module_name] = counts_for_alive_features
+    
+    # 3. Plotting Preparation
+    all_module_counts.pop('attn_0', None)
+    all_module_counts.pop('cc_0', None)  # Assuming mlp_0 is cc_0
+    
+    attn_module_names = sorted([name for name in all_module_counts.keys() if name.startswith('attn')])
+    cc_module_names = sorted([name for name in all_module_counts.keys() if name.startswith('cc')])
+
+    if not attn_module_names and not cc_module_names:
+        print("No data to plot after filtering.")
+        return
+
+    # 4. Plotting
+    nrows = max(len(attn_module_names), len(cc_module_names))
+    ncols = 2
+    
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(14, nrows * 4), constrained_layout=True, squeeze=False)
+    
+    fig.suptitle('Histogram of Upstream Counts per Alive Feature', fontsize=16)
+
+    # Plot attn modules in the left column
+    for i, module_name in enumerate(attn_module_names):
+        ax = axes[i, 0]
+        counts = all_module_counts[module_name]
+        
+        if counts:
+            log_counts = np.log10([c + 0.1 for c in counts])
+            ax.hist(log_counts, bins=30, color='c', edgecolor='k', alpha=0.7)
+            ax.set_title(f"{module_name} (n={len(counts)})")
+            ax.set_xlabel("log_10(Num Connections + 0.1)")
+            ax.set_ylabel("Number of Features")
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+            ax.set_xlim(left=-1)
+            ax.set_xlim(right=4)
+            start, _ = ax.get_xlim()
+            ax.xaxis.set_ticks(np.arange(np.ceil(start), 5, 1))
+        else:
+            ax.set_title(f"{module_name}")
+            ax.text(0.5, 0.5, "No alive features", ha='center', va='center', transform=ax.transAxes)
+
+    # Plot mlp/cc modules in the right column
+    for i, module_name in enumerate(cc_module_names):
+        ax = axes[i, 1]
+        counts = all_module_counts[module_name]
+        
+        if counts:
+            log_counts = np.log10([c + 0.1 for c in counts])
+            ax.hist(log_counts, bins=30, color='m', edgecolor='k', alpha=0.7)
+            ax.set_title(f"{module_name} (n={len(counts)})")
+            ax.set_xlabel("log_10(Num Connections + 0.1)")
+            ax.set_ylabel("Number of Features")
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
+            ax.set_xlim(right=4)
+            start, _ = ax.get_xlim()
+            ax.xaxis.set_ticks(np.arange(np.ceil(start), 5, 1))
+        else:
+            ax.set_title(f"{module_name}")
+            ax.text(0.5, 0.5, "No alive features", ha='center', va='center', transform=ax.transAxes)
+
+    # Hide unused subplots
+    for i in range(len(attn_module_names), nrows):
+        axes[i, 0].set_visible(False)
+    for i in range(len(cc_module_names), nrows):
+        axes[i, 1].set_visible(False)
+
+    plt.show()
 
 
+def calculate_global_connection_stats(
+    suite: SCAESuite,
+    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
+    mode: str = 'sparse_true'
+) -> Tuple[float, float]:
+    """
+    Computes the mean and median number of upstream connections across all
+    alive features in all relevant modules.
 
+    Args:
+        suite: The SCAESuite object.
+        non_dead_features_dict: Dictionary from find_non_dead_features.
+        mode: The mode to analyze ('sparse_true' or 'sparse_false').
 
+    Returns:
+        A tuple containing (mean, median) of the upstream connection counts.
+    """
+    print(f"Calculating global connection stats for mode: {mode}...")
 
+    parsed_modules = []
+    for name in suite.module_dict.keys():
+        try:
+            parts = name.split('_')
+            parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+        except (IndexError, ValueError):
+            continue
+    
+    all_connection_counts = []
 
+    for down_module_info in parsed_modules:
+        down_module_name = down_module_info['name']
 
+        if down_module_name in ['attn_0', 'cc_0']:
+            continue
+            
+        down_module = suite.module_dict[down_module_name]
+        
+        alive_features = non_dead_features_dict.get(mode, {}).get(down_module_name, [])
+        if not alive_features:
+            continue
 
+        ae_instance_down = down_module.ae
+        total_features_down = 0
+        if isinstance(ae_instance_down, AutoEncoderTopK):
+            total_features_down = ae_instance_down.decoder.weight.shape[1]
+        elif isinstance(ae_instance_down, CrosscoderTopK):
+            total_features_down = ae_instance_down.decoder_weight.shape[0]
+
+        if total_features_down == 0:
+            continue
+            
+        total_upstream_connections = torch.zeros(total_features_down, dtype=torch.int32)
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < down_module_info['layer']]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+
+            if up_module_name not in down_module.connection_masks:
+                continue
+            
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            if down_module_info['type'] == "attn":
+                vw = vw.sum(0)
+            
+            non_zero_per_row = (vw.abs() > 1e-4).sum(dim=1)
+            total_upstream_connections += non_zero_per_row.cpu().int()
+
+        alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
+        counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        all_connection_counts.extend(counts_for_alive_features)
+
+    if not all_connection_counts:
+        print("No alive features with connections found to calculate stats on.")
+        return 0.0, 0.0
+
+    mean_connections = np.mean(all_connection_counts)
+    median_connections = np.median(all_connection_counts)
+
+    print(f"\n--- Global Connection Statistics ---")
+    print(f"Total alive features analyzed (from modules > layer 0): {len(all_connection_counts)}")
+    print(f"Mean upstream connections per feature: {mean_connections:.2f}")
+    print(f"Median upstream connections per feature: {median_connections:.2f}")
+    
+    return mean_connections, median_connections

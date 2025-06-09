@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 from transformer_lens import utils
 
 from dictionary_learning.buffer import chunk_and_tokenize
-from dictionary_learning.mask_trainer import SCAETrainer, SCAEConfig
+from dictionary_learning.trainer import SCAETrainer, SCAEConfig
 
 from utils import set_seed
 set_seed(42)
@@ -44,17 +44,13 @@ CFG = SCAEConfig(
 )
 
 if __name__ == "__main__":
-    # t.manual_seed(42)
-    # t.backends.cudnn.deterministic = True
-
     tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
     tokenizer = utils.get_tokenizer_with_bos(tokenizer)
     dataset = load_dataset(
         PATH_TO_PILE,
         split="train[:50%]",
         num_proc=N_CPUS,
-    )
-    dataset = dataset.shuffle(seed=42)
+    ).shuffle(seed=42)
 
     dataset = chunk_and_tokenize(dataset, tokenizer, "text", CFG.sample_length, num_proc=N_CPUS)
     dataset = dataset.select(range(N_TOKENS // CFG.sample_length))

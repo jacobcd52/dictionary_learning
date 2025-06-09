@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "bitsandbytes>=0.45.3",
-    "circuitsvis>=1.43.2",
     "cut-cross-entropy",
     "datasets>=2.18.0",
     "einops>=0.7.0",
@@ -14,10 +13,8 @@ dependencies = [
     "huggingface-hub[cli,hf-transfer]>=0.29.2",
     "ipykernel>=6.29.5",
     "matplotlib>=3.8.3",
-    "nnsight==0.3.7",
     "pandas>=2.2.1",
     "plotly>=5.18.0",
-    "sae_lens>=5.10.5",
     "torch>=2.1.2",
     "torchtyping>=0.1.4",
     "tqdm>=4.66.1",
