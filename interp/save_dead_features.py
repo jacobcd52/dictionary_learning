@@ -12,10 +12,11 @@ from dictionary_learning.buffer import chunk_and_tokenize
 
 # --- Constants ---
 # You can add more repository IDs to this list.
-REPO_LIST = [
-    f"jacobcd52/pythia-70m_warmup0.3_k16_mask{mask_coeff}_fact_fvu0.2_fvu_sparse1.0_fvu1.0_lr0.0005"
-    for mask_coeff in [0, 0.00003, 0.0001, 0.0003, 0.001, 0.01]
-]
+# REPO_LIST = [
+#     f"jacobcd52/pythia-70m_warmup0.3_k16_mask{mask_coeff}_fact_fvu0.2_fvu_sparse1.0_fvu1.0_lr0.0005"
+#     for mask_coeff in [0, 0.00003, 0.0001, 0.0003, 0.001, 0.01]
+# ]
+REPO_LIST = ["jacobcd52/pythia-70m_warmup0.3_k16_mask0_fact_fvu0.0_fvu_sparse0.0_fvu1.0_lr0.0005"]
 
 MODEL_NAME = "EleutherAI/pythia-70m"
 PATH_TO_PILE = "/root/dictionary_learning/pile-uncopyrighted"

@@ -11,7 +11,10 @@ from typing import List, Dict, Tuple, Optional, Union, Any
 from IPython.display import display, HTML
 import numpy as np
 import html # Added import
+import wandb
+from tqdm import tqdm
 import matplotlib.pyplot as plt
+import json
 # import matplotlib.colors # No longer needed for token display
 # import matplotlib.pyplot as plt # No longer needed for token display, keep for future hist if any
 
@@ -1183,3 +1186,267 @@ def calculate_global_connection_stats(
     print(f"Median upstream connections per feature: {median_connections:.2f}")
     
     return mean_connections, median_connections
+
+
+def get_fvu_from_wandb(run_ids, last_n=5):
+    api = wandb.Api()
+    fvu = {}
+    for run_id in tqdm(run_ids):  
+        run = api.run(f"training-saes/pythia_scae_cc_sweep/{run_id}")
+        data = run.history()
+
+        sparse_fvu = {}
+        non_sparse_fvu = {}
+
+        for layer in range(6):
+            for module in ["mlp", "attn_attn"]:
+                module_name = f"{module}_{layer}"
+                sparse_fvu[module_name] = []
+                for i in range(10):
+                    sparse_fvu[module_name] = sum(data[f"sparse_fvu_contrib/{module_name}"][-last_n:])/last_n
+                    non_sparse_fvu[module_name] = sum(data[f"non_sparse_fvu_contrib/{module_name}"][-last_n:])/last_n
+        name = run.name.replace(' ', '_')
+        fvu[name] = {
+        "sparse_fvu": sparse_fvu,
+        "non_sparse_fvu": non_sparse_fvu
+    }
+
+    return fvu
+
+
+
+
+
+def calculate_module_connection_stats_from_file(
+    non_dead_features_file: str,
+    model_name: str = "EleutherAI/pythia-70m",
+    hf_user: str = "jacobcd52",
+    mode: str = 'sparse_true'
+) -> Dict[str, Dict[str, float]]:
+    """
+    Loads a suite and its corresponding non-dead features file, then calculates
+    the mean and median number of upstream connections for each module.
+
+    Args:
+        non_dead_features_file: Path to the JSON file containing non-dead feature info.
+        model_name: The name of the base TransformerLens model to load.
+        hf_user: The Hugging Face username or organization where the suite repo is located.
+        mode: The mode to analyze ('sparse_true' or 'sparse_false').
+
+    Returns:
+        A dictionary mapping module names to their connection statistics (mean, median),
+        plus an 'overall' key with global statistics.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # --- Load Model and Suite ---
+    suite_name = os.path.basename(non_dead_features_file).replace("_non_dead_features.json", "")
+    repo_id = f"{hf_user}/{suite_name}"
+    
+    print(f"Loading base model: {model_name}...")
+    model = HookedTransformer.from_pretrained(model_name, device=device, dtype=torch.bfloat16)
+    model.eval()
+
+    print(f"Loading suite from: {repo_id}...")
+    suite = SCAESuite.from_pretrained(
+        repo_id=repo_id,
+        model=model,
+        device=device,
+        dtype=torch.bfloat16
+    )
+    
+    # --- Load Non-Dead Feature Data ---
+    print(f"Loading non-dead features from: {non_dead_features_file}")
+    with open(non_dead_features_file, 'r') as f:
+        non_dead_features_dict = json.load(f)
+
+    # --- Calculate Connection Stats per Module ---
+    print(f"Calculating connection stats for mode: {mode}...")
+    
+    # 1. Parse and sort all module names
+    parsed_modules = []
+    for name in suite.module_dict.keys():
+        try:
+            parts = name.split('_')
+            parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+        except (IndexError, ValueError):
+            continue
+            
+    def sort_key(mod):
+        return (0 if mod['type'] == 'attn' else 1, mod['layer'])
+    parsed_modules.sort(key=sort_key)
+    
+    module_stats = {}
+    all_connection_counts = []
+
+    # 2. Iterate through each module as the downstream module
+    for down_module_info in parsed_modules:
+        down_module_name = down_module_info['name']
+        
+        # Skip layer 0 as they have no upstream connections
+        if down_module_info['layer'] == 0:
+            continue
+            
+        down_module = suite.module_dict[down_module_name]
+        alive_features = non_dead_features_dict.get(mode, {}).get(down_module_name, [])
+        
+        if not alive_features:
+            module_stats[down_module_name] = {'mean': 0.0, 'median': 0.0, 'alive_features': 0}
+            continue
+
+        ae_instance_down = down_module.ae
+        total_features_down = 0
+        if isinstance(ae_instance_down, AutoEncoderTopK):
+            total_features_down = ae_instance_down.decoder.weight.shape[1]
+        elif isinstance(ae_instance_down, CrosscoderTopK):
+            total_features_down = ae_instance_down.decoder_weight.shape[0]
+
+        if total_features_down == 0:
+            continue
+            
+        total_upstream_connections = torch.zeros(total_features_down, dtype=torch.int32)
+        
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < down_module_info['layer']]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+
+            if up_module_name not in down_module.connection_masks:
+                continue
+            
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+            if down_module_info['type'] == "attn":
+                vw = vw.sum(0)
+            
+            non_zero_per_row = (vw.abs() > 1e-4).sum(dim=1)
+            total_upstream_connections += non_zero_per_row.cpu().int()
+
+        alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
+        counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        
+        all_connection_counts.extend(counts_for_alive_features)
+
+        if not counts_for_alive_features:
+            mean_conn = 0.0
+            median_conn = 0.0
+        else:
+            mean_conn = np.mean(counts_for_alive_features)
+            median_conn = np.median(counts_for_alive_features)
+            
+        module_stats[down_module_name] = {
+            'mean': mean_conn, 
+            'median': median_conn,
+            'alive_features': len(alive_features)
+        }
+
+    # --- Add Overall Stats ---
+    if not all_connection_counts:
+        overall_mean = 0.0
+        overall_median = 0.0
+    else:
+        overall_mean = np.mean(all_connection_counts)
+        overall_median = np.median(all_connection_counts)
+    
+    module_stats['overall'] = {
+        'mean': overall_mean,
+        'median': overall_median,
+        'total_alive_features_analyzed': len(all_connection_counts)
+    }
+
+    return module_stats
+
+
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+def plot_connections_vs_fvu(c_and_fvu_list, baseline_fvu=None):
+    """
+    Plots the median number of connections vs. sparse FVU and excess FVU for each module.
+    Generates separate plots for standard FVU and excess FVU.
+
+    Args:
+        c_and_fvu_list: A list of tuples, where each tuple contains:
+                        - A dict with connection stats ('median').
+                        - A dict with FVU stats ('sparse_fvu').
+        baseline_fvu (dict, optional): A dictionary mapping module names to their
+                                       baseline FVU values. If provided, a second
+                                       plot with excess FVU will be generated.
+    """
+    # 1. Extract and structure the data for plotting
+    plot_data = defaultdict(lambda: {'medians': [], 'fvus': [], 'excess_fvus': []})
+
+    for conn_stats, fvu_stats in c_and_fvu_list:
+        median_c = conn_stats.get('median')
+        sparse_fvu_dict = fvu_stats.get('sparse_fvu', {})
+
+        if median_c is None:
+            continue
+
+        for module_name, fvu_value in sparse_fvu_dict.items():
+            plot_data[module_name]['medians'].append(median_c)
+            plot_data[module_name]['fvus'].append(fvu_value)
+            if baseline_fvu:
+                base_fvu = baseline_fvu.get(module_name)
+                if base_fvu is not None:
+                    plot_data[module_name]['excess_fvus'].append(fvu_value - base_fvu)
+
+    # 2. Setup for plotting
+    plt.style.use('seaborn-v0_8-whitegrid')
+    
+    # Sort module names for a consistent legend order
+    def sort_key(name: str):
+        parts = name.replace('attn_attn', 'attn').split('_')
+        module_type = parts[0]
+        layer = int(parts[1])
+        type_priority = 0 if module_type == 'attn' else 1
+        return (layer, type_priority)
+    sorted_module_names = sorted(plot_data.keys(), key=sort_key)
+    
+    # Define distinct markers and colors
+    markers = ['o', 's', 'v', '^', '<', '>', 'D', 'p', 'X', '*', 'h', '+']
+    colors = plt.cm.tab20(range(len(sorted_module_names)))
+
+    def _plot_on_ax(ax, data_key, ylabel, title):
+        """Helper to plot data on a given axis."""
+        for i, module_name in enumerate(sorted_module_names):
+            data = plot_data[module_name]
+            if not data[data_key]:
+                continue
+            
+            # Sort the points by the median connection value to ensure lines are drawn correctly
+            sorted_points = sorted(zip(data['medians'], data[data_key]))
+            x_vals = [p[0] for p in sorted_points]
+            y_vals = [p[1] for p in sorted_points]
+            
+            label = module_name.replace('attn_attn', 'attn')
+            marker = markers[i % len(markers)]
+            
+            ax.plot(x_vals, y_vals, marker=marker, linestyle='-', label=label, color=colors[i])
+
+        ax.set_title(title, fontsize=16, pad=20)
+        ax.set_xlabel("Median Number of Upstream Connections (C)", fontsize=12)
+        ax.set_ylabel(ylabel, fontsize=12)
+        ax.set_xscale('log')
+        # ax.set_yscale('log')
+        ax.legend(title="Module", bbox_to_anchor=(1.04, 1), loc="upper left")
+
+    # Plot 1: Standard Sparse FVU
+    fig1, ax1 = plt.subplots(figsize=(12, 7))
+    _plot_on_ax(ax1, 'fvus', "Sparse FVU", "Median Connections vs. Sparse FVU per Module")
+    fig1.tight_layout(rect=[0, 0, 0.85, 1])
+    plt.show()
+
+    # Plot 2: Excess Sparse FVU (if applicable)
+    if baseline_fvu:
+        fig2, ax2 = plt.subplots(figsize=(12, 7))
+        _plot_on_ax(ax2, 'excess_fvus', "Excess Sparse FVU (Sparse - Baseline)", "Median Connections vs. Excess Sparse FVU per Module")
+        fig2.tight_layout(rect=[0, 0, 0.85, 1])
+        plt.show()
