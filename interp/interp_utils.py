@@ -427,6 +427,105 @@ def _get_context_html(
     return "".join(html_parts)
 
 
+def _get_all_upstream_connections(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    suite: SCAESuite,
+    alive_features_by_module: Optional[Dict[str, set]] = None
+) -> List[Dict[str, Any]]:
+    """Helper to compute all upstream connections to a given feature."""
+    try:
+        # 1. Get all module names and parse them
+        parsed_modules = []
+        for name in suite.module_dict.keys():
+            try:
+                parts = name.split('_')
+                parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
+            except (IndexError, ValueError):
+                continue
+
+        current_module_info = next((m for m in parsed_modules if m['name'] == module_name_str), None)
+        
+        if current_module_info is None:
+            return []
+
+        current_module_layer = current_module_info['layer']
+        current_module_type = current_module_info['type']
+        current_module = suite.module_dict[module_name_str]
+
+        # 2. UPSTREAM connections
+        all_upstream_connections = []
+        down_module = current_module
+        upstream_modules_info = [m for m in parsed_modules if m['layer'] < current_module_layer]
+
+        for up_module_info in upstream_modules_info:
+            up_module_name = up_module_info['name']
+            up_module = suite.module_dict[up_module_name]
+            
+            if up_module_name not in down_module.connection_masks:
+                continue
+                
+            mask = down_module.connection_masks[up_module_name].forward(temperature=1, hard=True)
+            vw = down_module.get_virtual_weights(
+                up_name=up_module_name,
+                up_ae=up_module.ae,
+                down_enc=down_module.ae.encoder.weight,
+                connection_mask=mask
+            )
+
+            if current_module_type == "attn":
+                vw = vw.sum(0)
+
+            if vw.ndim == 2 and feature_idx_in_module < vw.shape[0]:
+                feature_connections = vw[feature_idx_in_module]
+                non_zero_indices = feature_connections.nonzero(as_tuple=False).squeeze(-1)
+                
+                if non_zero_indices.dim() == 0 and non_zero_indices.numel() == 1:
+                    non_zero_indices = non_zero_indices.unsqueeze(0)
+
+                for ind in non_zero_indices:
+                    val = feature_connections[ind].item()
+                    if abs(val) > 1e-4:
+                        if alive_features_by_module:
+                            if ind.item() not in alive_features_by_module.get(up_module_name, set()):
+                                continue # It connects to a dead feature, so we skip it.
+                        all_upstream_connections.append({'strength': val, 'module': up_module_name, 'feature_idx': ind.item()})
+        
+        return all_upstream_connections
+
+    except Exception as e:
+        print(f"Error getting upstream connections for {module_name_str}/{feature_idx_in_module}: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+def get_top_upstream_connections(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    suite: SCAESuite,
+    k_top_connections: int = 10,
+    alive_features_by_module: Optional[Dict[str, set]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Computes and returns the k features with the strongest positive upstream connections.
+    """
+    all_conns = _get_all_upstream_connections(module_name_str, feature_idx_in_module, suite, alive_features_by_module)
+    top_upstream = sorted([c for c in all_conns if c['strength'] > 0], key=lambda x: x['strength'], reverse=True)[:k_top_connections]
+    return top_upstream
+
+
+def count_upstream_connections(
+    module_name_str: str,
+    feature_idx_in_module: int,
+    suite: SCAESuite,
+    alive_features_by_module: Optional[Dict[str, set]] = None
+) -> int:
+    """Computes the total number of upstream connections to a given feature."""
+    all_conns = _get_all_upstream_connections(module_name_str, feature_idx_in_module, suite, alive_features_by_module)
+    return len(all_conns)
+
+
 def _generate_connections_html(
     module_name_str: str,
     feature_idx_in_module: int,
@@ -440,9 +539,7 @@ def _generate_connections_html(
         for name in suite.module_dict.keys():
             try:
                 parts = name.split('_')
-                type = parts[0]
-                layer = int(parts[1])
-                parsed_modules.append({'name': name, 'type': type, 'layer': layer})
+                parsed_modules.append({'name': name, 'type': parts[0], 'layer': int(parts[1])})
             except (IndexError, ValueError):
                 continue
 
@@ -601,10 +698,18 @@ def generate_feature_dashboard(
     k_top_connections: int = 10,
     context_window_size: int = 20,
     positive_threshold: float = 0.01, # Thresholds for coloring
-    negative_threshold: float = 0.01
+    negative_threshold: float = 0.01,
+    tight_layout: bool = False,
+    return_html: bool = False,
+    show_connections: bool = True,
+    show_logit_lens: bool = True,
+    container_tag: str = 'body',
+    num_upstream_connections: Optional[int] = None,
+    extra_container_style: str = "",
+    tight_layout_context_spacing_px: int = 5
 ):
     """
-    Generates an HTML dashboard displaying top-k contexts and logit lens for a given feature.
+    Generates an HTML dashboard displaying top-k contexts and logit lenses for a given feature.
     Styling is adapted from interp_utils.py.
     """
     print(f"Generating dashboard for: {module_name_str}, Feature Index: {feature_idx_in_module}")
@@ -654,12 +759,25 @@ def generate_feature_dashboard(
         return
 
     all_feature_activations.sort(key=lambda x: x[0], reverse=True)
-    top_k_contexts_info = all_feature_activations[:k_top_contexts]
+
+    # Find the top k unique contexts based on max activation
+    top_k_contexts_info = []
+    seen_contexts = set()
+    for act_info in all_feature_activations:
+        if len(top_k_contexts_info) >= k_top_contexts:
+            break
+        context_identifier = (act_info[1], act_info[2]) # (batch_dir_path, sample_idx_in_batch)
+        if context_identifier not in seen_contexts:
+            top_k_contexts_info.append(act_info)
+            seen_contexts.add(context_identifier)
 
     if not top_k_contexts_info:
-        print(f"No top-k contexts to display.")
-        display(HTML("<p>No top-k contexts found.</p>"))
-        return
+        print(f"No activations found for feature {module_name_str}/{feature_idx_in_module} across all batches.")
+        if return_html:
+            return "<p>No activations found for this feature.</p>"
+        else:
+            display(HTML("<p>No activations found for this feature.</p>"))
+            return
 
     # Use min/max overall activation for color bar normalization
     # If only one value (or all same), add some buffer for make_colorbar
@@ -679,32 +797,30 @@ def generate_feature_dashboard(
 
     # --- Main HTML Structure ---
     # Wrap in a body style similar to interp_utils.py for the token display part
-    html_output_parts = ['<body style="background-color:black; color: white; padding: 10px; font-family: monospace;">']
+    base_style = "background-color:black; color: white; padding: 10px; font-family: monospace;"
+    html_output_parts = [f'<{container_tag} style="{base_style} {extra_container_style}">']
     
     # --- Connections Section ---
-    connections_html_content = _generate_connections_html(
-        module_name_str, feature_idx_in_module, suite, k_top_connections=k_top_connections
-    )
-    html_output_parts.append(connections_html_content)
-    
-    # removed this to reduce clutter
-    # html_output_parts.append(f"<h3 style='color: #eee;'>Top {k_top_contexts} unique contexts for {module_name_str} / Feature {feature_idx_in_module}</h3>")
-    
-    # Add color bar using the overall min/max activations
-    colorbar_html = make_colorbar(min_overall_activation, max_overall_activation, positive_threshold=positive_threshold, negative_threshold=negative_threshold)
-    html_output_parts.append(f"<div style='margin-bottom: 10px;'>Token Activations: {colorbar_html}</div>")
+    if show_connections:
+        connections_html_content = _generate_connections_html(
+            module_name_str, feature_idx_in_module, suite, k_top_connections=k_top_connections
+        )
+        html_output_parts.append(connections_html_content)
 
-    printed_contexts = set()
-    displayed_contexts_count = 0
+    # Add color bar using the overall min/max activations, unless in tight_layout
+    if not tight_layout:
+        colorbar_html = make_colorbar(min_overall_activation, max_overall_activation, positive_threshold=positive_threshold, negative_threshold=negative_threshold)
+        html_output_parts.append(f"<div style='margin-bottom: 10px;'>Token Activations: {colorbar_html}</div>")
+
+    # Open a single container for all contexts
+    html_output_parts.append("<div style='border: 1px solid #444; padding: 10px; margin-bottom: 10px; border-radius: 5px;'>")
+    # Add the title inside the container
+    title = f"{module_name_str} / {feature_idx_in_module}"
+    if num_upstream_connections is not None:
+        title += f" ({num_upstream_connections})"
+    html_output_parts.append(f"<h3 style='color: white; margin-top: 0; margin-bottom: 15px;'>{title}</h3>")
 
     for rank, (act_val, batch_dir_path, sample_idx_in_batch, token_idx_in_sample) in enumerate(top_k_contexts_info):
-        if displayed_contexts_count >= k_top_contexts:
-            break
-
-        context_identifier = (batch_dir_path, sample_idx_in_batch)
-        if context_identifier in printed_contexts:
-            continue
-
         try:
             tokens_file = os.path.join(batch_dir_path, "tokens.pt")
             all_tokens_in_batch = torch.load(tokens_file, map_location='cpu')
@@ -737,70 +853,82 @@ def generate_feature_dashboard(
                 min_overall_activation, max_overall_activation,
                 positive_threshold, negative_threshold
             )
-            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 10px; margin-bottom: 10px; border-radius: 5px;'><b>Max act: {act_val:.4f}</b><br><div style='margin-top: 5px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: break-word;'>{context_html}</div></div>")
-            printed_contexts.add(context_identifier)
-            displayed_contexts_count += 1
+            
+            # Context display depends on tight_layout
+            if tight_layout:
+                html_output_parts.append(f"<div style='margin-bottom: {tight_layout_context_spacing_px}px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: break-word;'>{context_html}</div>")
+            else:
+                html_output_parts.append(f"<div style='margin-bottom: 15px;'><b>Max act: {act_val:.4f}</b><br><div style='margin-top: 5px; white-space: pre-wrap; line-height: 1.5; overflow-wrap: break-word;'>{context_html}</div></div>")
 
         except Exception as e:
-            html_output_parts.append(f"<div style='border: 1px solid #444; padding: 5px; margin-bottom: 10px; color: #ffaaaa;'>Error processing context {rank+1}: {e}</div>")
+            error_message = f"Error processing context {rank+1}: {e}"
+            html_output_parts.append(f"<div style='color: #ffaaaa; margin-bottom: 5px;'>{error_message}</div>")
             print(f"Error processing context {rank+1} for feature {module_name_str}/{feature_idx_in_module}: {e}")
             import traceback
             traceback.print_exc()
 
+    # Close the context container
+    html_output_parts.append("</div>")
+
     # --- Logit Lens Section ---
     logit_lens_html_content = ""
-    try:
-        # Correctly access ModuleDict element
-        if module_name_str in suite.module_dict:
-            scae_module = suite.module_dict[module_name_str]
-            if hasattr(scae_module, 'ae'):
-                ae_instance = scae_module.ae
-                feature_vector_for_logit_lens = None
+    if show_logit_lens:
+        try:
+            # Correctly access ModuleDict element
+            if module_name_str in suite.module_dict:
+                scae_module = suite.module_dict[module_name_str]
+                if hasattr(scae_module, 'ae'):
+                    ae_instance = scae_module.ae
+                    feature_vector_for_logit_lens = None
 
-                if isinstance(ae_instance, AutoEncoderTopK):
-                    if feature_idx_in_module < ae_instance.decoder.weight.shape[1]:
-                        feature_vector_for_logit_lens = ae_instance.decoder.weight[:, feature_idx_in_module]
+                    if isinstance(ae_instance, AutoEncoderTopK):
+                        if feature_idx_in_module < ae_instance.decoder.weight.shape[1]:
+                            feature_vector_for_logit_lens = ae_instance.decoder.weight[:, feature_idx_in_module]
+                        else:
+                            logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for AutoEncoderTopK decoder.</p>"
+                    
+                    elif isinstance(ae_instance, CrosscoderTopK):
+                        if feature_idx_in_module < ae_instance.decoder_weight.shape[0]:
+                            # Sum decoder_weight over the n_outputs dimension for the specific feature
+                            # decoder_weight shape: (dict_size, n_outputs, d_model)
+                            # Select for feature: (n_outputs, d_model)
+                            feature_specific_decoder_weights = ae_instance.decoder_weight[feature_idx_in_module, :, :]
+                            feature_vector_for_logit_lens = feature_specific_decoder_weights.sum(dim=0)
+                        else:
+                            logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for CrosscoderTopK decoder_weight.</p>"
                     else:
-                        logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for AutoEncoderTopK decoder.</p>"
-                
-                elif isinstance(ae_instance, CrosscoderTopK):
-                    if feature_idx_in_module < ae_instance.decoder_weight.shape[0]:
-                        # Sum decoder_weight over the n_outputs dimension for the specific feature
-                        # decoder_weight shape: (dict_size, n_outputs, d_model)
-                        # Select for feature: (n_outputs, d_model)
-                        feature_specific_decoder_weights = ae_instance.decoder_weight[feature_idx_in_module, :, :]
-                        feature_vector_for_logit_lens = feature_specific_decoder_weights.sum(dim=0)
-                    else:
-                        logit_lens_html_content = "<p style='color: #ffcc00;'>Feature index out of bounds for CrosscoderTopK decoder_weight.</p>"
+                        logit_lens_html_content = "<p style='color: #ffcc00;'>Unknown AE type for logit lens.</p>"
+
+                    if feature_vector_for_logit_lens is not None:
+                        # Ensure feature_vector matches the dtype of model.W_U for matmul
+                        feature_vector_for_logit_lens = feature_vector_for_logit_lens.to(dtype=model.W_U.dtype, device=model.W_U.device)
+                        with torch.no_grad():
+                            # ln_final typically expects float32 or the model's main working dtype
+                            # If ln_final itself is bfloat16 and W_U is bfloat16, this is fine.
+                            # If ln_final is float32, it's good feature_vector is also float32 (or compatible).
+                            logit_lens_logits = model.ln_final(feature_vector_for_logit_lens) @ model.W_U
+                        
+                        top_val, top_ind = torch.topk(logit_lens_logits, k=10, dim=-1)
+                        bot_val, bot_ind = torch.topk(logit_lens_logits, k=10, dim=-1, largest=False)
+                        
+                        logit_lens_html_content = create_logit_lens_html(top_ind.cpu(), top_val.cpu(), bot_ind.cpu(), bot_val.cpu(), tokenizer)
                 else:
-                    logit_lens_html_content = "<p style='color: #ffcc00;'>Unknown AE type for logit lens.</p>"
-
-                if feature_vector_for_logit_lens is not None:
-                    # Ensure feature_vector matches the dtype of model.W_U for matmul
-                    feature_vector_for_logit_lens = feature_vector_for_logit_lens.to(dtype=model.W_U.dtype, device=model.W_U.device)
-                    with torch.no_grad():
-                        # ln_final typically expects float32 or the model's main working dtype
-                        # If ln_final itself is bfloat16 and W_U is bfloat16, this is fine.
-                        # If ln_final is float32, it's good feature_vector is also float32 (or compatible).
-                        logit_lens_logits = model.ln_final(feature_vector_for_logit_lens) @ model.W_U
-                    
-                    top_val, top_ind = torch.topk(logit_lens_logits, k=10, dim=-1)
-                    bot_val, bot_ind = torch.topk(logit_lens_logits, k=10, dim=-1, largest=False)
-                    
-                    logit_lens_html_content = create_logit_lens_html(top_ind.cpu(), top_val.cpu(), bot_ind.cpu(), bot_val.cpu(), tokenizer)
+                    logit_lens_html_content = "<p style='color: #ffcc00;'>Could not find AE module for logit lens (module name not in suite.module_dict).</p>"
             else:
                 logit_lens_html_content = "<p style='color: #ffcc00;'>Could not find AE module for logit lens (module name not in suite.module_dict).</p>"
-        else:
-            logit_lens_html_content = "<p style='color: #ffcc00;'>Could not find AE module for logit lens (module name not in suite.module_dict).</p>"
-    except Exception as e:
-        logit_lens_html_content = f"<p style='color: #ffaaaa;'>Error generating logit lens: {e}</p>"
-        print(f"Error generating logit lens for {module_name_str}/{feature_idx_in_module}: {e}")
-        import traceback
-        traceback.print_exc()
-        
+        except Exception as e:
+            logit_lens_html_content = f"<p style='color: #ffaaaa;'>Error generating logit lens: {e}</p>"
+            print(f"Error generating logit lens for {module_name_str}/{feature_idx_in_module}: {e}")
+            import traceback
+            traceback.print_exc()
+            
     html_output_parts.append(logit_lens_html_content)
-    html_output_parts.append('</body>')
-    display(HTML("".join(html_output_parts)))
+    html_output_parts.append(f'</{container_tag}>')
+
+    final_html = "".join(html_output_parts)
+    if return_html:
+        return final_html
+    display(HTML(final_html))
 
 
 def find_non_dead_features(activations_dir: str) -> Dict[str, Dict[str, List[int]]]:
@@ -875,18 +1003,32 @@ def find_non_dead_features(activations_dir: str) -> Dict[str, Dict[str, List[int
 
 
 def plot_alive_feature_percentage(
-    non_dead_features_dict: Dict[str, Dict[str, List[int]]],
-    suite: SCAESuite
+    suite: SCAESuite,
+    scae_features_path: str,
+    standard_sae_features_path: str,
 ):
     """
     Generates and displays a bar chart showing the percentage of alive features
-    for each module, separated by sparse and non-sparse modes.
+    for each module, comparing a sparsely-connected SCAE against a standard SAE.
 
     Args:
-        non_dead_features_dict: The dictionary returned by `find_non_dead_features`.
-        suite: The SCAESuite object, used to get the total number of features per module.
+        suite: The SCAESuite object, used to get total features per module.
+               Should correspond to the scae_features_path suite.
+        scae_features_path: Path to the JSON file containing non-dead feature
+                              data for the sparsely-connected SCAE.
+        standard_sae_features_path: Path to the JSON file for the standard SAE.
     """
-    
+    # 0. Load data from files
+    try:
+        with open(scae_features_path, 'r') as f:
+            scae_features_dict = json.load(f)
+        
+        with open(standard_sae_features_path, 'r') as f:
+            standard_sae_features_dict = json.load(f)
+    except FileNotFoundError as e:
+        print(f"Error: Could not find feature data file. {e}")
+        return
+        
     # 1. Get module names and sort them: attn_0, attn_1, ..., cc_0, cc_1, ...
     def sort_key(name: str):
         parts = name.split('_')
@@ -898,8 +1040,9 @@ def plot_alive_feature_percentage(
 
     module_names = sorted(suite.module_dict.keys(), key=sort_key)
 
-    vanilla_percentages = []
-    sparsely_connected_percentages = []
+    vanilla_scae_percentages = []
+    sparsely_connected_scae_percentages = []
+    standard_sae_percentages = []
     
     # 2. Calculate percentages for each module
     for name in module_names:
@@ -915,28 +1058,37 @@ def plot_alive_feature_percentage(
             total_features = ae_instance.decoder_weight.shape[0]
 
         if total_features == 0:
-            vanilla_percentages.append(0)
-            sparsely_connected_percentages.append(0)
+            vanilla_scae_percentages.append(0)
+            sparsely_connected_scae_percentages.append(0)
+            standard_sae_percentages.append(0)
             continue
             
-        # Get alive counts from the input dictionary
-        num_alive_sparsely_connected = len(non_dead_features_dict.get('sparse_true', {}).get(name, []))
-        num_alive_vanilla = len(non_dead_features_dict.get('sparse_false', {}).get(name, []))
+        # Get alive counts from the loaded dictionaries
+        # For SCAE
+        num_alive_sparsely_connected = len(scae_features_dict.get('sparse_true', {}).get(name, []))
+        num_alive_vanilla = len(scae_features_dict.get('sparse_false', {}).get(name, []))
+        # For Standard SAE (using its non-sparse mode)
+        num_alive_standard = len(standard_sae_features_dict.get('sparse_false', {}).get(name, []))
+
         
-        sparsely_connected_percentages.append((num_alive_sparsely_connected / total_features) * 100)
-        vanilla_percentages.append((num_alive_vanilla / total_features) * 100)
+        sparsely_connected_scae_percentages.append((num_alive_sparsely_connected / total_features) * 100)
+        vanilla_scae_percentages.append((num_alive_vanilla / total_features) * 100)
+        standard_sae_percentages.append((num_alive_standard / total_features) * 100)
+
 
     # 3. Plotting
     x = np.arange(len(module_names))  # the label locations
-    width = 0.35  # the width of the bars
+    width = 0.25  # the width of the bars
 
-    fig, ax = plt.subplots(figsize=(14, 7))
-    rects1 = ax.bar(x - width/2, vanilla_percentages, width, label='Vanilla', color='royalblue')
-    rects2 = ax.bar(x + width/2, sparsely_connected_percentages, width, label='Sparsely-connected', color='skyblue')
+    fig, ax = plt.subplots(figsize=(16, 7))
+    rects1 = ax.bar(x - width, vanilla_scae_percentages, width, label='Vanilla SCAE', color='royalblue')
+    rects2 = ax.bar(x, sparsely_connected_scae_percentages, width, label='Sparsely-connected SCAE', color='skyblue')
+    rects3 = ax.bar(x + width, standard_sae_percentages, width, label='Standard SAE', color='seagreen')
+
 
     # Add some text for labels, title and axes ticks
     ax.set_ylabel('Percentage of Alive Features (%)')
-    ax.set_title('Percentage of Alive Features by Module and Mode')
+    ax.set_title('Percentage of Alive Features by Module and Model Type')
     ax.set_xticks(x)
     ax.set_xticklabels(module_names, rotation=45, ha="right")
     ax.legend()
@@ -1171,6 +1323,7 @@ def calculate_global_connection_stats(
 
         alive_feature_indices = torch.tensor(alive_features, dtype=torch.long)
         counts_for_alive_features = total_upstream_connections[alive_feature_indices].tolist()
+        
         all_connection_counts.extend(counts_for_alive_features)
 
     if not all_connection_counts:
@@ -1450,3 +1603,165 @@ def plot_connections_vs_fvu(c_and_fvu_list, baseline_fvu=None):
         _plot_on_ax(ax2, 'excess_fvus', "Excess Sparse FVU (Sparse - Baseline)", "Median Connections vs. Excess Sparse FVU per Module")
         fig2.tight_layout(rect=[0, 0, 0.85, 1])
         plt.show()
+
+
+from IPython.display import display, HTML
+import interp.interp_utils as interp_utils
+from dictionary_learning.scae import SCAESuite
+from transformer_lens import HookedTransformer
+from transformers import PreTrainedTokenizerBase
+
+def display_feature_and_upstream(
+    module_name: str,
+    feature_idx: int,
+    suite: SCAESuite,
+    model: HookedTransformer,
+    tokenizer: PreTrainedTokenizerBase,
+    activations_base_dir: str,
+    non_dead_features_file_path: str,
+    k_upstream_features: int = 2,
+    depth: int = 2,
+    **kwargs 
+):
+    """
+    Displays a hierarchical dashboard of a feature and its upstream connections.
+
+    Args:
+        module_name: The module name of the primary feature (e.g., 'cc_4').
+        feature_idx: The index of the primary feature.
+        suite: The loaded SCAESuite object.
+        model: The loaded HookedTransformer model.
+        tokenizer: The loaded tokenizer.
+        activations_base_dir: Path to the directory for this suite's sparse activations.
+        non_dead_features_file_path: Path to the JSON file with alive feature data.
+        k_upstream_features: The number of upstream features to show at the first level.
+        depth: How many layers of upstream connections to show. Default is 2.
+        **kwargs: Additional keyword arguments to pass to generate_feature_dashboard.
+    """
+    # Load and process alive features first
+    try:
+        with open(non_dead_features_file_path, 'r') as f:
+            non_dead_features_dict = json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Non-dead features file not found at '{non_dead_features_file_path}'")
+        return
+        
+    # We care about the sparse mode for connections, as that's where they are pruned.
+    alive_features_sparse = non_dead_features_dict.get('sparse_true', {})
+    # Convert lists to sets for efficient lookup
+    alive_features_by_module_sets = {module: set(features) for module, features in alive_features_sparse.items()}
+    
+    # Override display options for this specific function's purpose
+    dashboard_kwargs = kwargs.copy()
+    dashboard_kwargs['show_connections'] = False
+    dashboard_kwargs['show_logit_lens'] = False
+    dashboard_kwargs['container_tag'] = 'div'
+
+    # 1. Get the dashboard HTML for the main feature
+    print(f"Generating dashboard for primary feature: {module_name}/{feature_idx}")
+    l0_conns = count_upstream_connections(module_name, feature_idx, suite, alive_features_by_module=alive_features_by_module_sets)
+    main_html = interp_utils.generate_feature_dashboard(
+        module_name_str=module_name,
+        feature_idx_in_module=feature_idx,
+        suite=suite,
+        model=model,
+        tokenizer=tokenizer,
+        activations_base_dir=activations_base_dir,
+        return_html=True,
+        tight_layout=True,
+        num_upstream_connections=l0_conns,
+        extra_container_style="max-width: 90%;",
+        **dashboard_kwargs
+    )
+
+    if depth == 0:
+        display(HTML(f'<body><div style="display: flex; justify-content: center;">{main_html}</div></body>'))
+        return
+
+    # 2. Get the dashboards for the upstream features iteratively
+    branch_columns_html = []
+    top_upstream_L1 = get_top_upstream_connections(module_name, feature_idx, suite, k_top_connections=k_upstream_features, alive_features_by_module=alive_features_by_module_sets)
+
+    for conn_L1 in top_upstream_L1:
+        current_branch_parts = []
+        
+        # Get L1 dashboard
+        l1_conns = count_upstream_connections(conn_L1['module'], conn_L1['feature_idx'], suite, alive_features_by_module=alive_features_by_module_sets)
+        html_L1 = generate_feature_dashboard(
+            module_name_str=conn_L1['module'],
+            feature_idx_in_module=conn_L1['feature_idx'],
+            suite=suite, model=model, tokenizer=tokenizer,
+            activations_base_dir=activations_base_dir,
+            return_html=True, tight_layout=True, num_upstream_connections=l1_conns, **dashboard_kwargs
+        )
+        current_branch_parts.append(html_L1)
+        
+        # Iteratively go deeper for L2, L3, ...
+        parent_module, parent_idx = conn_L1['module'], conn_L1['feature_idx']
+        for current_depth in range(1, depth):
+            connections_L_next = get_top_upstream_connections(parent_module, parent_idx, suite, k_top_connections=1, alive_features_by_module=alive_features_by_module_sets)
+            if not connections_L_next:
+                break
+            
+            conn_L_next = connections_L_next[0]
+            strength_L_next = conn_L_next['strength']
+            
+            arrow_html = (
+                f'<div style="font-size: 3em; color: white;">↑</div>'
+                f'<div style="font-size: 1.2em; color: #ccc; margin-left: 5px;">{strength_L_next:.2f}</div>'
+            )
+            current_branch_parts.append(f'<div style="display: flex; flex-direction: row; align-items: center; justify-content: center; margin: 10px 0;">{arrow_html}</div>')
+            
+            l_next_conns = count_upstream_connections(conn_L_next['module'], conn_L_next['feature_idx'], suite, alive_features_by_module=alive_features_by_module_sets)
+            html_L_next = generate_feature_dashboard(
+                module_name_str=conn_L_next['module'],
+                feature_idx_in_module=conn_L_next['feature_idx'],
+                suite=suite, model=model, tokenizer=tokenizer,
+                activations_base_dir=activations_base_dir,
+                return_html=True, tight_layout=True, num_upstream_connections=l_next_conns, **dashboard_kwargs
+            )
+            current_branch_parts.append(html_L_next)
+            
+            parent_module, parent_idx = conn_L_next['module'], conn_L_next['feature_idx']
+        
+        branch_columns_html.append("".join(current_branch_parts))
+
+    # 3. Combine all HTML into a final layout
+    body_start = '<body style="background-color:black; color: white; padding: 10px; font-family: monospace;">'
+    main_feature_div = f'<div style="display: flex; justify-content: center;">{main_html}</div>'
+    
+    # L1 -> L0 arrows
+    arrow_container_html = ""
+    if branch_columns_html:
+        arrow_container_html = '<div style="display: flex; flex-direction: row; justify-content: space-around; align-items: center; width: 100%; margin: 20px 0;">'
+        num_arrows = len(top_upstream_L1)
+        center_index = (num_arrows - 1) / 2
+        for i, conn in enumerate(top_upstream_L1):
+            strength = conn['strength']
+            rotation = 0
+            angle = 15
+            if num_arrows > 1:
+                if i < center_index:
+                    rotation = angle
+                elif i > center_index:
+                    rotation = -angle
+            
+            arrow_html = (
+                f'<div style="font-size: 3em; color: white; transform: rotate({rotation}deg);">↑</div>'
+                f'<div style="font-size: 1.2em; color: #ccc; margin-left: 5px;">{strength:.2f}</div>'
+            )
+            arrow_container_html += f'<div style="display: flex; flex-direction: row; align-items: center;">{arrow_html}</div>'
+        arrow_container_html += '</div>'
+    
+    columns_container_html = '<div style="display: flex; flex-direction: row; justify-content: space-around; align-items: flex-start; width: 100%;">'
+    if branch_columns_html:
+        width_percent = 100 // len(branch_columns_html)
+        for column_html in branch_columns_html:
+            columns_container_html += f'<div style="width: {width_percent}%; display: flex; flex-direction: column; align-items: stretch; margin: 0 5px;">'
+            columns_container_html += column_html
+            columns_container_html += '</div>'
+    columns_container_html += "</div>"
+
+    combined_html = body_start + main_feature_div + arrow_container_html + columns_container_html + "</body>"
+    
+    display(HTML(combined_html))
